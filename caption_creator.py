@@ -542,6 +542,8 @@ class CaptionApp:
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
         self._tk_img = None
+        self._preview_pil_img: Optional[Image.Image] = None
+        self._color_pick_target: Optional[str] = None
 
         # Background and text (shared globally)
         self._page_bg_color = "#f5f5f5"
@@ -575,6 +577,9 @@ class CaptionApp:
 
         # Watermark
         self._watermark_path = ""
+        # Only used when the footer is disabled — with the footer on,
+        # watermark height stays tied to 2x footer size as before.
+        self._watermark_height_var = tk.IntVar(value=120)
 
         # Warn if Aardvark Cafe not installed (deferred to after window shows)
         self._warn_aardvark = not bool(_check_aardvark())
@@ -620,15 +625,20 @@ class CaptionApp:
         self._toolbar_sep = ttk.Separator(bar, orient="vertical")
         self._toolbar_sep.pack(side="left", fill="y", padx=6, pady=4)
         # DA Login is hidden once _da_update_status confirms a cached login token;
-        # Send to DA is only shown once that same check passes.
+        # Send to DA and Log Out are only shown once that same check passes.
         self._da_login_btn = ttk.Button(bar, text="DA Login", command=self._da_login)
         self._da_login_btn.pack(side="left", padx=2)
         self._da_send_btn = ttk.Button(bar, text="Send to DA…", command=self._da_send)
+        self._da_logout_btn = ttk.Button(bar, text="Log Out", command=self._da_logout)
         self._da_settings_btn = ttk.Button(bar, text="DA Settings", command=self._da_settings)
         self._da_settings_btn.pack(side="left", padx=2)
-        self._da_status_label = ttk.Label(bar, text="DA: not logged in", foreground="#999")
-        self._da_status_label.pack(side="left", padx=(6, 2))
-        self._status = ttk.Label(bar, text="No file loaded", foreground="#888")
+
+        # ---- Status bar (bottom) — DA login state and current file info ----
+        status_bar = ttk.Frame(self.root, padding=(6, 3))
+        status_bar.pack(side="bottom", fill="x")
+        self._da_status_label = ttk.Label(status_bar, text="DA: not logged in", foreground="#999")
+        self._da_status_label.pack(side="left", padx=(0, 2))
+        self._status = ttk.Label(status_bar, text="No file loaded", foreground="#888")
         self._status.pack(side="left", padx=12)
 
         # ---- Right control panel (fixed width, packed before preview) ----
@@ -694,7 +704,8 @@ class CaptionApp:
         for v in (self._font_var, self._size_var, self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._header_font_var, self._header_size_var,
-                  self._footer_font_var, self._footer_size_var):
+                  self._footer_font_var, self._footer_size_var,
+                  self._watermark_height_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
 
@@ -715,9 +726,13 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Page BG Color:").grid(row=r, column=0, sticky="w", pady=4)
-        self._bg_btn = tk.Button(f, bg=self._page_bg_color, width=5, relief="groove",
+        bg_row = ttk.Frame(f)
+        bg_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._bg_btn = tk.Button(bg_row, bg=self._page_bg_color, width=5, relief="groove",
                                  command=self._pick_bg)
-        self._bg_btn.grid(row=r, column=1, sticky="w", padx=6)
+        self._bg_btn.pack(side="left")
+        ttk.Button(bg_row, text="Pick", width=5,
+                   command=lambda: self._start_color_pick("bg")).pack(side="left", padx=(4, 0))
         r += 1
 
         ttk.Label(f, text="Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -747,9 +762,13 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Text Color:").grid(row=r, column=0, sticky="w", pady=4)
-        self._fc_btn = tk.Button(f, bg=self._fc_color, width=5, relief="groove",
+        fc_row = ttk.Frame(f)
+        fc_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._fc_btn = tk.Button(fc_row, bg=self._fc_color, width=5, relief="groove",
                                  command=self._pick_fc)
-        self._fc_btn.grid(row=r, column=1, sticky="w", padx=6)
+        self._fc_btn.pack(side="left")
+        ttk.Button(fc_row, text="Pick", width=5,
+                   command=lambda: self._start_color_pick("fc")).pack(side="left", padx=(4, 0))
         r += 1
 
         self._cap_size_label = ttk.Label(f, text="Caption Width:")
@@ -777,9 +796,13 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Stroke Color:").grid(row=r, column=0, sticky="w", pady=4)
-        self._stroke_btn = tk.Button(f, bg=self._stroke_color, width=5, relief="groove",
+        stroke_row = ttk.Frame(f)
+        stroke_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._stroke_btn = tk.Button(stroke_row, bg=self._stroke_color, width=5, relief="groove",
                                      command=self._pick_stroke)
-        self._stroke_btn.grid(row=r, column=1, sticky="w", padx=6)
+        self._stroke_btn.pack(side="left")
+        ttk.Button(stroke_row, text="Pick", width=5,
+                   command=lambda: self._start_color_pick("stroke")).pack(side="left", padx=(4, 0))
 
     def _build_xchange_tab(self, f: ttk.Frame) -> None:
         f.columnconfigure(1, weight=1)
@@ -809,7 +832,7 @@ class CaptionApp:
         r = 0
 
         ttk.Checkbutton(f, text="Enable Footer", variable=self._footer_enabled,
-                        command=self._safe_refresh).grid(
+                        command=self._on_footer_toggle).grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 8))
         r += 1
 
@@ -849,6 +872,17 @@ class CaptionApp:
             row=r, column=0, sticky="w", pady=(0, 10))
         r += 1
 
+        # Only relevant when the footer is off — with the footer on, watermark
+        # height stays tied to 2x footer size. Visibility kept in sync by
+        # _update_watermark_height_visibility() (called from _on_footer_toggle
+        # and _on_format_change).
+        self._wm_height_label = ttk.Label(f, text="Watermark Height (px):")
+        self._wm_height_label.grid(row=r, column=0, sticky="w", pady=(6, 4))
+        self._wm_height_spin = ttk.Spinbox(f, from_=10, to=2000,
+                                           textvariable=self._watermark_height_var, width=7)
+        self._wm_height_spin.grid(row=r, column=1, sticky="w", padx=6, pady=(6, 4))
+        r += 1
+
 
     # ------------------------------------------------------------------
     # Aardvark Cafe prompt
@@ -882,6 +916,55 @@ class CaptionApp:
         if r[1]:
             self._stroke_color = r[1]; self._stroke_btn.config(bg=r[1]); self._safe_refresh()
 
+    # ------------------------------------------------------------------
+    # Eyedropper — sample a color directly from the preview image
+    # ------------------------------------------------------------------
+
+    def _start_color_pick(self, target: str) -> None:
+        """Enter eyedropper mode: the next click on the preview samples a
+        pixel color and applies it to `target` ('bg', 'fc', or 'stroke')."""
+        if not self._cache:
+            messagebox.showinfo("Nothing to Sample", "Open an image, GIF, or video first.")
+            return
+        self._color_pick_target = target
+        self._canvas.config(cursor="crosshair")
+        self._canvas.bind("<Button-1>", self._on_color_pick_click)
+        self.root.bind("<Escape>", self._cancel_color_pick)
+
+    def _cancel_color_pick(self, event=None) -> None:
+        self._color_pick_target = None
+        self._canvas.config(cursor="")
+        self._canvas.unbind("<Button-1>")
+        self.root.unbind("<Escape>")
+
+    def _on_color_pick_click(self, event) -> None:
+        target = self._color_pick_target
+        img = self._preview_pil_img
+        self._cancel_color_pick()
+        if target is None or img is None:
+            return
+        cw = max(self._canvas.winfo_width(), 10)
+        ch = max(self._canvas.winfo_height(), 10)
+        left = (cw - img.width) // 2
+        top = (ch - img.height) // 2
+        px, py = event.x - left, event.y - top
+        if not (0 <= px < img.width and 0 <= py < img.height):
+            return  # clicked outside the image itself (canvas letterboxing)
+        r, g, b = img.convert("RGB").getpixel((px, py))
+        hex_color = f"#{r:02x}{g:02x}{b:02x}"
+        if target == "bg":
+            self._page_bg_color = hex_color
+            self._bg_btn.config(bg=hex_color)
+        elif target == "fc":
+            self._fc_color = hex_color
+            self._fc_btn.config(bg=hex_color)
+        elif target == "stroke":
+            self._stroke_color = hex_color
+            self._stroke_btn.config(bg=hex_color)
+        else:
+            return
+        self._safe_refresh()
+
     def _on_dynamic_width_toggle(self) -> None:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
         self._apply_dynamic_width()
@@ -892,6 +975,20 @@ class CaptionApp:
             return
         fw = self._frames[0].size[0]
         self._width_var.set(int(round(fw * 1.25)))
+
+    def _on_footer_toggle(self) -> None:
+        self._update_watermark_height_visibility()
+        self._safe_refresh()
+
+    def _update_watermark_height_visibility(self) -> None:
+        """The manual watermark height control only matters when the footer
+        is disabled — with the footer on, height stays tied to 2x footer size."""
+        if self._footer_enabled.get():
+            self._wm_height_label.grid_remove()
+            self._wm_height_spin.grid_remove()
+        else:
+            self._wm_height_label.grid()
+            self._wm_height_spin.grid()
 
     def _apply_preset(self, bg: str, stroke: str) -> None:
         self._page_bg_color = bg
@@ -1232,12 +1329,64 @@ class CaptionApp:
                 return 1000.0 / avg_ms
         return 10.0
 
-    def _write_mp4(self, path: str, frames: list) -> None:
+    def _iter_export_frames(self):
+        """Yield PIL frames of the current file, one at a time, for export.
+        Streams directly from disk if the source is deferred — so exporting
+        a huge GIF/video never needs more than a single frame in memory at
+        once, regardless of its total length — or yields from the frames
+        already loaded in self._frames otherwise."""
+        if self._deferred_path:
+            path, kind = self._deferred_path, self._deferred_kind
+            if kind == "mp4":
+                reader = imageio.get_reader(path, "ffmpeg")
+                try:
+                    for frame in reader:
+                        yield Image.fromarray(frame).convert("RGBA")
+                finally:
+                    reader.close()
+            else:
+                img = Image.open(path)
+                for frm in ImageSequence.Iterator(img):
+                    yield frm.copy().convert("RGBA")
+        else:
+            yield from self._frames
+
+    def _stream_export(self, output_path: str, as_mp4: bool) -> None:
+        """Composite and write every frame of the current file directly to
+        output_path, one frame at a time, instead of building the full
+        source and composited frame lists first — this is what makes it
+        possible to export files too large to ever fully fit in RAM at once.
+        Updates self._status with progress as it goes; the caller is
+        responsible for restoring the status text afterward."""
+        params = self._collect_render_params()
+        if params is None:
+            raise RuntimeError("Invalid render parameters")
+
+        total = self._deferred_total_frames if self._deferred_path else len(self._frames)
         fps = self._export_fps()
-        writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=8)
+
+        if as_mp4:
+            writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        else:
+            if self._deferred_path:
+                # Streaming from disk — getting exact per-frame durations would
+                # need a second full pass just to read timing metadata, so
+                # large/deferred GIFs use one uniform duration derived from fps
+                # instead. Already-loaded files keep their exact per-frame
+                # durations below, since those are already in memory for free.
+                duration = max(1, round(1000 / fps))
+            else:
+                duration = self._durations if self._durations else max(1, round(1000 / fps))
+            writer = imageio.get_writer(output_path, mode="I", duration=duration, loop=0)
+
+        base_status = self._status.cget("text")
         try:
-            for frame in frames:
-                writer.append_data(np.array(frame.convert("RGB")))
+            for i, frame in enumerate(self._iter_export_frames()):
+                composited = build_composite(frame, **params)
+                writer.append_data(np.array(composited.convert("RGB")))
+                if i % 20 == 0 or i == total - 1:
+                    self._status.config(text=f"{base_status}  [Exporting frame {i + 1}/{total}…]")
+                    self.root.update_idletasks()
         finally:
             writer.close()
 
@@ -1245,29 +1394,6 @@ class CaptionApp:
         if not self._cache:
             messagebox.showwarning("Nothing to save", "Open an image, GIF, or video first.")
             return
-
-        # If a GIF background build is still in progress or was never completed
-        # (including a deferred large-file placeholder), cancel it and do a
-        # blocking full render now before saving.
-        if self._is_anim and (self._deferred_path or not self._cache_complete):
-            self._build_cancel.set()
-            if self._refresh_job:
-                self.root.after_cancel(self._refresh_job)
-                self._refresh_job = None
-            txt = self._status.cget("text").replace(" [Rendering…]", "")
-            self._status.config(text=txt + " [Rendering for save…]")
-            self.root.update_idletasks()
-            try:
-                if not self._materialize_deferred_source():
-                    return
-                self._refresh()
-            except Exception:
-                log.exception("SAVE_RENDER_ERROR")
-                messagebox.showerror("Render Error", "Failed to render all frames for saving.")
-                return
-            finally:
-                t = self._status.cget("text")
-                self._status.config(text=t.replace(" [Rendering for save…]", ""))
 
         if self._is_anim:
             if self._is_video:
@@ -1280,17 +1406,30 @@ class CaptionApp:
                 defaultextension=default_ext, filetypes=filetypes)
             if not path:
                 return
-            if path.lower().endswith(".mp4"):
+
+            # Streams frame-by-frame (see _stream_export) instead of building the
+            # full source and composited frame lists first, regardless of whether
+            # the source is still deferred (a large-file placeholder) or fully loaded.
+            self._build_cancel.set()
+            if self._refresh_job:
+                self.root.after_cancel(self._refresh_job)
+                self._refresh_job = None
+            base_status = self._status.cget("text").replace(" [Rendering…]", "")
+            try:
+                self._stream_export(path, as_mp4=path.lower().endswith(".mp4"))
+            except Exception:
+                log.exception("SAVE_RENDER_ERROR")
+                # A failed streaming export leaves a truncated file at the
+                # destination path rather than a separate temp file — remove it
+                # so a partial/corrupt file isn't left where a good one was expected.
                 try:
-                    self._write_mp4(path, self._cache)
-                except Exception:
-                    log.exception("MP4_SAVE_ERROR")
-                    messagebox.showerror("Save Error", "Failed to encode MP4 video.")
-                    return
-            else:
-                rgb = [f.convert("RGB") for f in self._cache]
-                rgb[0].save(path, save_all=True, append_images=rgb[1:],
-                            loop=0, duration=self._durations, optimize=False)
+                    os.unlink(path)
+                except OSError:
+                    pass
+                messagebox.showerror("Render Error", "Failed to render/export all frames for saving.")
+                return
+            finally:
+                self._status.config(text=base_status)
         else:
             path = filedialog.asksaveasfilename(
                 defaultextension=".png",
@@ -1368,6 +1507,7 @@ class CaptionApp:
         self._footer_font_var.set(ffont)
         self._footer_size_var.set(data.get("footer_size", 16))
         self._footer_enabled.set(data.get("footer_enabled", False))
+        self._update_watermark_height_visibility()
         if not self._footer_text_box.get("1.0", "end-1c").strip():
             self._footer_text_box.delete("1.0", "end")
             self._footer_text_box.insert("1.0", data.get("footer_text", ""))
@@ -1417,7 +1557,10 @@ class CaptionApp:
             pad = self._pad_var.get()
             stroke_w = self._stroke_width_var.get()
             footer_sz = self._footer_size_var.get()
-            wm_h = int(footer_sz * 2.0)
+            if self._footer_enabled.get():
+                wm_h = int(footer_sz * 2.0)
+            else:
+                wm_h = self._watermark_height_var.get()
         except tk.TclError:
             return None
 
@@ -1563,32 +1706,6 @@ class CaptionApp:
         self._update_preview_label()
         self._start_anim()
 
-    def _refresh(self) -> None:
-        """Full synchronous rebuild — used by _save when the cache is incomplete."""
-        if not self._frames:
-            return
-        self._stop_anim()
-        params = self._collect_render_params()
-        if params is None:
-            return
-        t0 = time.perf_counter()
-        try:
-            self._cache = [build_composite(f, **params) for f in self._frames]
-            self._cache_complete = True
-        except Exception:
-            log.exception("RENDER_ERROR  frames=%d", len(self._frames))
-            raise
-        elapsed = time.perf_counter() - t0
-        if elapsed > 1.0:
-            log.warning("SLOW_RENDER  frames=%d  total=%.2fs  per_frame=%.0fms",
-                        len(self._frames), elapsed, elapsed / len(self._frames) * 1000)
-        self._anim_idx = 0
-        self._update_preview_label()
-        if self._is_anim:
-            self._start_anim()
-        else:
-            self._redraw()
-
     # ------------------------------------------------------------------
     # DeviantArt integration
     # ------------------------------------------------------------------
@@ -1646,16 +1763,19 @@ class CaptionApp:
 
     def _da_update_status(self) -> None:
         """Refresh the DA login status label, and show/hide DA Login vs.
-        Send-to-DA based on cached token state. Uses winfo_manager() rather
-        than winfo_ismapped() — the latter reflects actual on-screen mapping,
-        which can read False even when packed (e.g. before the window is
-        first drawn), causing a spurious re-pack/no-op."""
+        Send-to-DA/Log-Out based on cached token state. Uses winfo_manager()
+        rather than winfo_ismapped() — the latter reflects actual on-screen
+        mapping, which can read False even when packed (e.g. before the
+        window is first drawn), causing a spurious re-pack/no-op."""
         send_packed = self._da_send_btn.winfo_manager() == "pack"
+        logout_packed = self._da_logout_btn.winfo_manager() == "pack"
         login_packed = self._da_login_btn.winfo_manager() == "pack"
         if da_client.da_has_cached_token():
             self._da_status_label.config(text="DA: logged in", foreground="#4a4")
             if not send_packed:
                 self._da_send_btn.pack(side="left", padx=2, before=self._da_settings_btn)
+            if not logout_packed:
+                self._da_logout_btn.pack(side="left", padx=2, before=self._da_settings_btn)
             if login_packed:
                 self._da_login_btn.pack_forget()
         else:
@@ -1665,6 +1785,21 @@ class CaptionApp:
                                         before=self._da_send_btn if send_packed else self._da_settings_btn)
             if send_packed:
                 self._da_send_btn.pack_forget()
+            if logout_packed:
+                self._da_logout_btn.pack_forget()
+
+    def _da_logout(self) -> None:
+        """Log out of DeviantArt — deletes the cached token so the next
+        upload requires re-authorization."""
+        if not messagebox.askyesno(
+            "Log Out",
+            "Log out of DeviantArt?\n\nYou'll need to click DA Login and "
+            "re-authorize before sending anything again."
+        ):
+            return
+        da_client.da_logout()
+        log.info("DA_LOGOUT")
+        self._da_update_status()
 
     def _da_login(self) -> None:
         """Authenticate with DeviantArt (opens browser, shows log window)."""
@@ -1819,30 +1954,7 @@ class CaptionApp:
 
         self._da_in_progress = True
 
-        # Ensure full GIF cache before uploading (including a deferred large-file placeholder)
-        if self._is_anim and (self._deferred_path or not self._cache_complete):
-            self._build_cancel.set()
-            if self._refresh_job:
-                self.root.after_cancel(self._refresh_job)
-                self._refresh_job = None
-            old_txt = self._status.cget("text").replace(" [Rendering…]", "")
-            self._status.config(text=old_txt + " [Rendering for upload…]")
-            self.root.update_idletasks()
-            try:
-                if not self._materialize_deferred_source():
-                    self._da_in_progress = False
-                    return
-                self._refresh()
-            except Exception:
-                log.exception("DA_SEND_RENDER_ERROR")
-                self._da_in_progress = False
-                messagebox.showerror("Render Error", "Failed to render all frames.")
-                return
-            finally:
-                self._status.config(
-                    text=self._status.cget("text").replace(" [Rendering for upload…]", ""))
-
-        # Ensure client_id is configured
+        # Ensure client_id is configured before doing the potentially long export below
         client_id = da_client.load_client_id()
         if not client_id:
             client_id = self._da_settings()
@@ -1850,30 +1962,38 @@ class CaptionApp:
                 self._da_in_progress = False
                 return
 
-        # Write temp file
+        # Write temp file. Animated content streams frame-by-frame (see
+        # _stream_export) instead of building the full source and composited
+        # frame lists first, regardless of whether the source is still
+        # deferred (a large-file placeholder) or fully loaded.
         import tempfile
-        if self._is_anim:
-            suffix = ".mp4" if upload_format == "mp4" else ".gif"
-        else:
-            suffix = ".png"
+        suffix = (".mp4" if upload_format == "mp4" else ".gif") if self._is_anim else ".png"
+        self._build_cancel.set()
+        if self._refresh_job:
+            self.root.after_cancel(self._refresh_job)
+            self._refresh_job = None
+        base_status = self._status.cget("text").replace(" [Rendering…]", "")
+        tmp_path = None
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             tmp_path = tmp.name
             tmp.close()
             if self._is_anim:
-                if upload_format == "mp4":
-                    self._write_mp4(tmp_path, self._cache)
-                else:
-                    rgb = [f.convert("RGB") for f in self._cache]
-                    rgb[0].save(tmp_path, save_all=True, append_images=rgb[1:],
-                                loop=0, duration=self._durations, optimize=False)
+                self._stream_export(tmp_path, as_mp4=(upload_format == "mp4"))
             else:
                 self._cache[0].save(tmp_path)
         except Exception:
             log.exception("DA_SEND_EXPORT_ERROR")
             self._da_in_progress = False
-            messagebox.showerror("Export Error", "Failed to write temp file for upload.")
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
             return
+        finally:
+            self._status.config(text=base_status)
 
         # Upload runs in a background thread; token must already be cached (use DA Login first)
         self._status.config(text=self._status.cget("text") + " [Saving draft…]")
@@ -1984,6 +2104,7 @@ class CaptionApp:
         scale = min(cw / img.width, ch / img.height, 1.0)
         disp = img.resize((max(1, int(img.width * scale)),
                            max(1, int(img.height * scale))), Image.LANCZOS)
+        self._preview_pil_img = disp  # kept for the color-eyedropper to sample from
         self._tk_img = ImageTk.PhotoImage(disp)
         self._canvas.delete("all")
         self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._tk_img)

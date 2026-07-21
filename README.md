@@ -11,11 +11,12 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
 - **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; user-selectable font
 - **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
-- **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size
+- **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size when the footer is enabled, or to a manually adjustable pixel height (shown only while the footer is off, since the 2× rule needs a footer size to scale against)
+- **Color eyedropper** — a **Pick** button next to Page BG, Text, and Stroke color swatches lets you click anywhere on the preview image to sample that pixel's color instead of using the color chooser
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
 - **MP4 video support** — open an MP4, caption every frame the same way as a GIF, and export as either an MP4 or a GIF, regardless of which one you started with
 - **Minimum output size** — final output is upscaled (never downscaled, aspect ratio preserved) to at least 1280×720 if the source is smaller; the Preview panel label shows the actual output size next to the on-screen preview, which can still display smaller to fit the window
-- **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM; the whole file is still processed automatically when you Save or Send to DA)
+- **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM); either way, **Save** and **Send to DA** composite and write one frame at a time straight to the output file instead of building the whole thing in memory first, so exporting doesn't need to hold the full file in RAM regardless of length
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
 - **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
@@ -78,7 +79,7 @@ python caption_creator.py
 
 **Option B — Batch launcher (Windows):**
 
-Double-click `run.bat`. It uses `python` from your system PATH, so no editing needed as long as Python is installed and on PATH.
+Double-click `run.bat`. It uses `python` from your system PATH, so no editing needed as long as Python is installed and on PATH. If this is a git checkout, it also checks for updates first: `git fetch`, compares against `origin`, and pulls with `--ff-only` if you're behind. It never overwrites local changes or force-pulls — if a fast-forward isn't possible (e.g. you have local edits), it just prints a note and launches the current version as-is. If git isn't installed or this isn't a git checkout, the update check is skipped silently.
 
 ---
 
@@ -97,13 +98,13 @@ Caption Creator can save finished images, GIFs, and videos directly to your Devi
 ### Usage
 
 1. Click **DA Login** in the toolbar — your browser opens the DeviantArt authorization page; log in and authorize the app
-2. Once logged in, the **Send to DA…** button appears in the toolbar (it's hidden until login succeeds)
+2. Once logged in, **DA Login** is replaced by **Send to DA…** and **Log Out** (both hidden again if you log out)
 3. Open an image, GIF, or video and apply your caption styling
 4. Click **Send to DA…** — a dialog prompts for a **Title** (required, starts empty) and a **Description** (pre-filled with your caption text, sent as DeviantArt's artist comments); if you started from a video, you'll also choose to upload as **MP4** or **GIF** (defaults to MP4); all are editable before sending
 5. The file saves as a private draft on your DeviantArt account
 6. Click **Publish to Gallery** in the confirmation dialog to make it public
 
-Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
+Click **Log Out** to clear the cached token (with a confirmation prompt) if you need to re-authorize or switch accounts. Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
 
 ---
 
