@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# runtime logs (rotated backups: .log.1, .log.2, .log.3)
+caption_creator_crash.log*
+
+# DeviantArt auth & settings (private)
+da_tokens.json
+da_settings.json
+
+# personal watermark images
+watermark/
