@@ -9,8 +9,8 @@ A Windows desktop app for creating X-Change-style captioned images and animated 
 - **Standard format** — image on the left, styled text panel on the right
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
-- **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke, drop shadow
-- **Fonts** — Tahoma Bold for caption body; Aardvark Cafe for X-Change title and tagline (optional install)
+- **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; user-selectable font
+- **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
 - **DeviantArt integration** — upload finished output to Sta.sh with one click; optionally publish to gallery
@@ -54,7 +54,7 @@ The app detects the font automatically on startup. If it isn't installed, a fall
 
 ### 4. (Optional) Add a watermark
 
-Place a single PNG or JPG in the `watermark/` folder:
+Place a single image (PNG, JPG, BMP, GIF, or WebP) in the `watermark/` folder:
 
 ```
 watermark/
@@ -74,12 +74,7 @@ python caption_creator.py
 
 **Option B — Batch launcher (Windows):**
 
-Edit `run.bat` and update the Python path to match your installation, then double-click it:
-```bat
-@echo off
-"C:\Path\To\Python312\python.exe" "%~dp0caption_creator.py"
-pause
-```
+Double-click `run.bat`. It uses `python` from your system PATH, so no editing needed as long as Python is installed and on PATH.
 
 ---
 
