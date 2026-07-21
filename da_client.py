@@ -181,8 +181,10 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "view": "login",   # tell DA to show the login form, not the join/signup page
     }
     auth_url = _DA_AUTH_URL + "?" + urllib.parse.urlencode(params)
+    log.info("Auth URL: %s", auth_url)
 
     log.info("Opening browser for authorization...")
     if open_browser:
@@ -268,8 +270,17 @@ def da_ensure_token(client_id: str, open_browser=None) -> str:
     return tokens["access_token"]
 
 
+def da_has_cached_token() -> bool:
+    """Return True if a non-expired token exists in the cache (no network call)."""
+    tokens = _load_tokens()
+    return bool(tokens and time.time() < tokens.get("expires_at", 0))
+
+
 def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
     """Upload file as a private draft on DeviantArt (via Sta.sh). Returns stackid string."""
+    file_size = os.path.getsize(file_path)
+    log.info("Uploading %s (%.1f KB) to Sta.sh as '%s'...",
+             os.path.basename(file_path), file_size / 1024, title or "Caption Creator Upload")
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": _UA,
@@ -277,6 +288,7 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
     }
     delay = 1.0
     for attempt in range(3):
+        log.info("Sta.sh submit attempt %d/3...", attempt + 1)
         with open(file_path, "rb") as fh:
             fname = os.path.basename(file_path)
             resp = requests.post(
@@ -286,14 +298,30 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
                 files={"file": (fname, fh)},
                 timeout=60,
             )
+        log.debug("Sta.sh response: HTTP %d", resp.status_code)
+        if resp.status_code == 401:
+            log.error("HTTP 401 Unauthorized — token may be expired or revoked. Try DA Login again.")
+            resp.raise_for_status()
+        if resp.status_code == 403:
+            log.error("HTTP 403 Forbidden — check that your app has 'stash' scope. Body: %s", resp.text[:300])
+            resp.raise_for_status()
         if resp.status_code == 429:
+            log.warning("Rate limited — retrying in %.0fs...", delay)
             time.sleep(delay)
             delay *= 2
             continue
-        resp.raise_for_status()
-        data = resp.json()
+        if resp.status_code >= 400:
+            log.error("HTTP %d error from Sta.sh: %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+        try:
+            data = resp.json()
+        except Exception:
+            log.error("Non-JSON response from Sta.sh: %s", resp.text[:300])
+            raise RuntimeError(f"Unexpected response from Sta.sh (HTTP {resp.status_code})")
         if data.get("status") != "success":
+            log.error("Sta.sh returned non-success: %s", data)
             raise RuntimeError(f"Sta.sh submit error: {data}")
+        log.info("Upload successful — stackid: %s", data["stackid"])
         return str(data["stackid"])
     raise RuntimeError("DeviantArt upload failed after 3 attempts (rate limited).")
 

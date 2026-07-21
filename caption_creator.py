@@ -535,6 +535,7 @@ class CaptionApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._auto_detect_watermark()
+        self.root.after(100, self._da_update_status)
         if self._warn_aardvark:
             self.root.after(500, self._prompt_aardvark)
 
@@ -564,6 +565,8 @@ class CaptionApp:
         ttk.Button(bar, text="DA Login", command=self._da_login).pack(side="left", padx=2)
         ttk.Button(bar, text="Send to DA…", command=self._da_send).pack(side="left", padx=2)
         ttk.Button(bar, text="DA Settings", command=self._da_settings).pack(side="left", padx=2)
+        self._da_status_label = ttk.Label(bar, text="DA: not logged in", foreground="#999")
+        self._da_status_label.pack(side="left", padx=(6, 2))
         self._status = ttk.Label(bar, text="No file loaded", foreground="#888")
         self._status.pack(side="left", padx=12)
 
@@ -1271,6 +1274,13 @@ class CaptionApp:
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
+    def _da_update_status(self) -> None:
+        """Refresh the DA login status label based on cached token state."""
+        if da_client.da_has_cached_token():
+            self._da_status_label.config(text="DA: logged in", foreground="#4a4")
+        else:
+            self._da_status_label.config(text="DA: not logged in", foreground="#999")
+
     def _da_login(self) -> None:
         """Authenticate with DeviantArt (opens browser, shows log window)."""
         client_id = da_client.load_client_id()
@@ -1282,8 +1292,16 @@ class CaptionApp:
         if getattr(self, "_da_login_in_progress", False):
             self._da_show_log()
             return
-        self._da_login_in_progress = True
 
+        # If a valid token already exists, ask before re-opening the browser
+        if da_client.da_has_cached_token():
+            if not messagebox.askyesno(
+                "Already Logged In",
+                "You are already logged in to DeviantArt.\nOpen the browser to re-authorize?"
+            ):
+                return
+
+        self._da_login_in_progress = True
         self._da_show_log()
 
         def _open_browser(url):
@@ -1292,13 +1310,10 @@ class CaptionApp:
         def _do_login():
             try:
                 da_client.da_authorize(client_id, open_browser=_open_browser)
-                self.root.after(0, lambda: self._status.config(
-                    text=self._status.cget("text").rstrip() + " — DA: logged in"
-                    if "DA:" not in self._status.cget("text")
-                    else self._status.cget("text")
-                ))
+                self.root.after(0, self._da_update_status)
             except Exception as exc:
                 log.exception("DA_LOGIN_ERROR: %s", exc)
+                self.root.after(0, self._da_update_status)
             finally:
                 self._da_login_in_progress = False
 
