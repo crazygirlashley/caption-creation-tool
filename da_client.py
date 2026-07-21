@@ -181,12 +181,16 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-        "view": "login",   # tell DA to show the login form, not the join/signup page
     }
     auth_url = _DA_AUTH_URL + "?" + urllib.parse.urlencode(params)
     log.info("Auth URL: %s", auth_url)
 
     log.info("Opening browser for authorization...")
+    log.info(
+        "Tip: if DeviantArt shows a sign-up page, look for 'Sign In' or "
+        "'Already a member?' to log into your existing account — "
+        "the authorization will continue automatically."
+    )
     if open_browser:
         open_browser(auth_url)
     else:
