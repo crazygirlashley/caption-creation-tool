@@ -78,7 +78,7 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 
 ---
 
-## DeviantArt Upload (Optional)
+## DeviantArt Upload (Optional) (Currently a WIP and doesn't appear to be working)
 
 Caption Creator can save finished images and GIFs directly to your DeviantArt account as private drafts, and optionally publish them to your gallery.
 
