@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
+import functools
 import json
 import logging
 import logging.handlers
@@ -14,6 +15,8 @@ import traceback
 from typing import Optional
 import webbrowser
 
+import imageio.v2 as imageio
+import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
 import da_client
@@ -170,8 +173,11 @@ def _load_formats() -> dict:
     return result
 
 
+@functools.lru_cache(maxsize=None)
 def _find_font_file(stem: str) -> Optional[str]:
-    """Return path to a font file whose name contains `stem` (case-insensitive)."""
+    """Return path to a font file whose name contains `stem` (case-insensitive).
+    Cached — this walks every file in the Windows Fonts dir, which is slow enough
+    to cause visible preview lag if repeated on every render/keystroke."""
     needle = stem.lower().replace(" ", "").replace("_", "")
     for font_dir in _FONT_DIRS:
         if not os.path.isdir(font_dir):
@@ -189,6 +195,7 @@ def _check_aardvark() -> Optional[str]:
     return _find_font_file("aardc")
 
 
+@functools.lru_cache(maxsize=256)
 def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     # Special case for Aardvark Cafe
     if family == _AARDVARK_NAME:
@@ -402,7 +409,7 @@ def build_composite(
     out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 255))
     draw = ImageDraw.Draw(out)
 
-    out.paste(frame, (0, 0))
+    out.paste(frame, (0, 0), frame)
     out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
               (panel_x, panel_y))
 
@@ -487,7 +494,9 @@ class CaptionApp:
         self._frames: list = []
         self._durations: list = []
         self._cache: list = []
-        self._is_gif: bool = False
+        self._is_anim: bool = False
+        self._is_video: bool = False
+        self._video_fps: Optional[float] = None
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
         self._tk_img = None
@@ -500,6 +509,7 @@ class CaptionApp:
         self._font_var = tk.StringVar(value=available_fonts[0] if available_fonts else "Arial")
         self._size_var = tk.IntVar(value=72)
         self._width_var = tk.IntVar(value=320)
+        self._dynamic_width_var = tk.BooleanVar(value=True)
         self._pad_var = tk.IntVar(value=20)
         self._stroke_width_var = tk.IntVar(value=0)
         self._auto_size_var = tk.BooleanVar(value=True)
@@ -559,12 +569,14 @@ class CaptionApp:
         # ---- Toolbar (top) ----
         bar = ttk.Frame(self.root, padding=(6, 5))
         bar.pack(side="top", fill="x")
-        ttk.Button(bar, text="Open Image / GIF…", command=self._open).pack(side="left", padx=4)
+        ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
         ttk.Button(bar, text="DA Login", command=self._da_login).pack(side="left", padx=2)
-        ttk.Button(bar, text="Send to DA…", command=self._da_send).pack(side="left", padx=2)
-        ttk.Button(bar, text="DA Settings", command=self._da_settings).pack(side="left", padx=2)
+        # Send to DA is only shown once _da_update_status confirms a cached login token.
+        self._da_send_btn = ttk.Button(bar, text="Send to DA…", command=self._da_send)
+        self._da_settings_btn = ttk.Button(bar, text="DA Settings", command=self._da_settings)
+        self._da_settings_btn.pack(side="left", padx=2)
         self._da_status_label = ttk.Label(bar, text="DA: not logged in", foreground="#999")
         self._da_status_label.pack(side="left", padx=(6, 2))
         self._status = ttk.Label(bar, text="No file loaded", foreground="#888")
@@ -649,6 +661,7 @@ class CaptionApp:
                                  relief="solid", bd=1, padx=4, pady=4)
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         self._text_box.insert("1.0", "Your caption here")
+        self._text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
         r += 1
 
         ttk.Label(f, text="Page BG Color:").grid(row=r, column=0, sticky="w", pady=4)
@@ -691,8 +704,16 @@ class CaptionApp:
 
         self._cap_size_label = ttk.Label(f, text="Caption Width:")
         self._cap_size_label.grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=80, to=1200, textvariable=self._width_var,
-                    width=7).grid(row=r, column=1, sticky="w", padx=6)
+        self._width_spin = ttk.Spinbox(f, from_=80, to=1200, textvariable=self._width_var,
+                                       width=7)
+        self._width_spin.grid(row=r, column=1, sticky="w", padx=6)
+        self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
+        r += 1
+
+        ttk.Checkbutton(f, text="Dynamic Width (1.25× image width)",
+                        variable=self._dynamic_width_var,
+                        command=self._on_dynamic_width_toggle).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
 
         ttk.Label(f, text="Padding:").grid(row=r, column=0, sticky="w", pady=4)
@@ -719,6 +740,7 @@ class CaptionApp:
                                         relief="solid", bd=1, padx=3, pady=3)
         self._header_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._header_text_box.insert("1.0", "")
+        self._header_text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
         r += 1
 
         ttk.Label(f, text="Header Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -746,6 +768,7 @@ class CaptionApp:
                                         relief="solid", bd=1, padx=3, pady=3)
         self._footer_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._footer_text_box.insert("1.0", "")
+        self._footer_text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
         r += 1
 
         ttk.Label(f, text="Footer Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -809,6 +832,17 @@ class CaptionApp:
         if r[1]:
             self._stroke_color = r[1]; self._stroke_btn.config(bg=r[1]); self._safe_refresh()
 
+    def _on_dynamic_width_toggle(self) -> None:
+        self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
+        self._apply_dynamic_width()
+
+    def _apply_dynamic_width(self) -> None:
+        """When Dynamic Width is enabled, override cap width with 1.25x the image width."""
+        if not self._dynamic_width_var.get() or not self._frames:
+            return
+        fw = self._frames[0].size[0]
+        self._width_var.set(int(round(fw * 1.25)))
+
     def _apply_preset(self, bg: str, stroke: str) -> None:
         self._page_bg_color = bg
         self._stroke_color = stroke
@@ -856,11 +890,54 @@ class CaptionApp:
     # File I/O
     # ------------------------------------------------------------------
 
+    def _load_video_frames(self, path: str) -> bool:
+        """Decode an MP4 into self._frames/_durations via the imageio/ffmpeg backend.
+        Returns False (leaving self._frames empty) on failure or user cancellation."""
+        try:
+            reader = imageio.get_reader(path, "ffmpeg")
+            meta = reader.get_meta_data()
+        except Exception:
+            log.exception("VIDEO_OPEN_ERROR")
+            messagebox.showerror("Open Error",
+                                  "Failed to open video file — is the codec supported?")
+            return False
+
+        fps = meta.get("fps") or 24.0
+        self._video_fps = fps
+        duration_s = meta.get("duration")
+        if duration_s:
+            est_frames = int(duration_s * fps)
+            if est_frames > 600 and not messagebox.askyesno(
+                "Large Video",
+                f"This video has an estimated {est_frames} frames at {fps:.1f} fps.\n"
+                "Processing all frames may take a while and use significant memory.\n\n"
+                "Continue?",
+            ):
+                reader.close()
+                return False
+
+        duration_ms = max(1, round(1000 / fps))
+        try:
+            for frame in reader:
+                self._frames.append(Image.fromarray(frame).convert("RGBA"))
+                self._durations.append(duration_ms)
+        except Exception:
+            log.exception("VIDEO_DECODE_ERROR")
+            messagebox.showerror("Open Error", "Failed to decode video frames.")
+            reader.close()
+            return False
+        reader.close()
+
+        if not self._frames:
+            messagebox.showerror("Open Error", "Video contained no readable frames.")
+            return False
+        return True
+
     def _open(self) -> None:
         path = filedialog.askopenfilename(
-            title="Open Image or GIF",
+            title="Open Image, GIF, or Video",
             filetypes=[
-                ("Images & GIFs", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                ("Images, GIFs & Video", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp4"),
                 ("All files", "*.*"),
             ],
         )
@@ -876,36 +953,73 @@ class CaptionApp:
         self._frames.clear()
         self._durations.clear()
         self._cache.clear()
+        self._video_fps = None
 
-        img = Image.open(path)
-        is_anim = getattr(img, "is_animated", False)
-        self._is_gif = is_anim or path.lower().endswith(".gif")
+        ext = os.path.splitext(path)[1].lower()
+        self._is_video = ext == ".mp4"
 
-        if self._is_gif:
-            for frm in ImageSequence.Iterator(img):
-                self._frames.append(frm.copy().convert("RGBA"))
-                self._durations.append(frm.info.get("duration", 100))
+        if self._is_video:
+            if not self._load_video_frames(path):
+                self._is_video = False
+                self._status.config(text="No file loaded")
+                return
+            self._is_anim = len(self._frames) > 1
         else:
-            self._frames.append(img.convert("RGBA"))
-            self._durations.append(0)
+            img = Image.open(path)
+            is_anim = getattr(img, "is_animated", False)
+            self._is_anim = is_anim or ext == ".gif"
+
+            if self._is_anim:
+                for frm in ImageSequence.Iterator(img):
+                    self._frames.append(frm.copy().convert("RGBA"))
+                    self._durations.append(frm.info.get("duration", 100))
+            else:
+                self._frames.append(img.convert("RGBA"))
+                self._durations.append(0)
 
         name = os.path.basename(path)
-        kind = f"GIF ({len(self._frames)} frames)" if self._is_gif else "Image"
+        if self._is_video:
+            kind = f"MP4 ({len(self._frames)} frames, {self._video_fps:.1f} fps)"
+        elif self._is_anim:
+            kind = f"GIF ({len(self._frames)} frames)"
+        else:
+            kind = "Image"
         w, h = self._frames[0].size
         self._status.config(text=f"{name}  •  {kind}  •  {w}×{h}px")
         log.info("FILE_OPEN  %s  %s  %dx%d", name, kind, w, h)
 
         self._anim_idx = 0
+        self._apply_dynamic_width()
         self._safe_refresh(debounce_ms=0)
+
+    def _export_fps(self) -> float:
+        """FPS to use when encoding an MP4 — the source video's fps if known,
+        otherwise derived from the average GIF frame duration."""
+        if self._video_fps:
+            return self._video_fps
+        if self._durations and any(self._durations):
+            avg_ms = sum(self._durations) / len(self._durations)
+            if avg_ms > 0:
+                return 1000.0 / avg_ms
+        return 10.0
+
+    def _write_mp4(self, path: str, frames: list) -> None:
+        fps = self._export_fps()
+        writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=8)
+        try:
+            for frame in frames:
+                writer.append_data(np.array(frame.convert("RGB")))
+        finally:
+            writer.close()
 
     def _save(self) -> None:
         if not self._cache:
-            messagebox.showwarning("Nothing to save", "Open an image or GIF first.")
+            messagebox.showwarning("Nothing to save", "Open an image, GIF, or video first.")
             return
 
         # If a GIF background build is still in progress or was never completed,
         # cancel it and do a blocking full render now before saving.
-        if self._is_gif and not self._cache_complete:
+        if self._is_anim and not self._cache_complete:
             self._build_cancel.set()
             if self._refresh_job:
                 self.root.after_cancel(self._refresh_job)
@@ -923,16 +1037,28 @@ class CaptionApp:
                 t = self._status.cget("text")
                 self._status.config(text=t.replace(" [Rendering for save…]", ""))
 
-        if self._is_gif:
+        if self._is_anim:
+            if self._is_video:
+                default_ext = ".mp4"
+                filetypes = [("MP4 Video", "*.mp4"), ("Animated GIF", "*.gif")]
+            else:
+                default_ext = ".gif"
+                filetypes = [("Animated GIF", "*.gif"), ("MP4 Video", "*.mp4")]
             path = filedialog.asksaveasfilename(
-                defaultextension=".gif",
-                filetypes=[("Animated GIF", "*.gif")],
-            )
+                defaultextension=default_ext, filetypes=filetypes)
             if not path:
                 return
-            rgb = [f.convert("RGB") for f in self._cache]
-            rgb[0].save(path, save_all=True, append_images=rgb[1:],
-                        loop=0, duration=self._durations, optimize=False)
+            if path.lower().endswith(".mp4"):
+                try:
+                    self._write_mp4(path, self._cache)
+                except Exception:
+                    log.exception("MP4_SAVE_ERROR")
+                    messagebox.showerror("Save Error", "Failed to encode MP4 video.")
+                    return
+            else:
+                rgb = [f.convert("RGB") for f in self._cache]
+                rgb[0].save(path, save_all=True, append_images=rgb[1:],
+                            loop=0, duration=self._durations, optimize=False)
         else:
             path = filedialog.asksaveasfilename(
                 defaultextension=".png",
@@ -984,7 +1110,9 @@ class CaptionApp:
         self._align_var.set(data.get("align", "center"))
 
         # Panel size and label
-        if "cap_panel_size" in data:
+        self._dynamic_width_var.set(data.get("dynamic_width", False))
+        self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
+        if "cap_panel_size" in data and not self._dynamic_width_var.get():
             self._width_var.set(data["cap_panel_size"])
         if data.get("layout") == "vertical":
             self._cap_size_label.config(text="Caption Height:")
@@ -1018,6 +1146,7 @@ class CaptionApp:
         else:
             self._pill_frame.pack_forget()
 
+        self._apply_dynamic_width()
         self._safe_refresh()
 
     def _safe_refresh(self, debounce_ms: int = 400) -> None:
@@ -1044,7 +1173,7 @@ class CaptionApp:
         self._refresh_preview()
 
         # For GIFs, schedule the full rebuild after the debounce window
-        if self._is_gif:
+        if self._is_anim:
             self._refresh_job = self.root.after(debounce_ms, self._rebuild_all_async)
 
     def _collect_render_params(self) -> Optional[dict]:
@@ -1144,14 +1273,14 @@ class CaptionApp:
             log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
 
         self._cache = [first]
-        self._cache_complete = not self._is_gif
+        self._cache_complete = not self._is_anim
         self._anim_idx = 0
         self._redraw()
 
     def _rebuild_all_async(self) -> None:
         """Build all GIF frames in a background thread; post results back to main thread."""
         self._refresh_job = None
-        if not self._frames or not self._is_gif:
+        if not self._frames or not self._is_anim:
             return
 
         params = self._collect_render_params()
@@ -1214,7 +1343,7 @@ class CaptionApp:
             log.warning("SLOW_RENDER  frames=%d  total=%.2fs  per_frame=%.0fms",
                         len(self._frames), elapsed, elapsed / len(self._frames) * 1000)
         self._anim_idx = 0
-        if self._is_gif:
+        if self._is_anim:
             self._start_anim()
         else:
             self._redraw()
@@ -1275,11 +1404,16 @@ class CaptionApp:
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _da_update_status(self) -> None:
-        """Refresh the DA login status label based on cached token state."""
+        """Refresh the DA login status label and Send-to-DA button visibility
+        based on cached token state."""
         if da_client.da_has_cached_token():
             self._da_status_label.config(text="DA: logged in", foreground="#4a4")
+            if not self._da_send_btn.winfo_ismapped():
+                self._da_send_btn.pack(side="left", padx=2, before=self._da_settings_btn)
         else:
             self._da_status_label.config(text="DA: not logged in", foreground="#999")
+            if self._da_send_btn.winfo_ismapped():
+                self._da_send_btn.pack_forget()
 
     def _da_login(self) -> None:
         """Authenticate with DeviantArt (opens browser, shows log window)."""
@@ -1338,7 +1472,9 @@ class CaptionApp:
         ttk.Label(
             dlg,
             text="Register at deviantart.com/developers to get a Client ID.\n"
-                 'Set the OAuth2 redirect URI to "http://127.0.0.1" when registering.',
+                 'Set the OAuth2 redirect URI to EXACTLY '
+                 f'"http://127.0.0.1:{da_client.REDIRECT_PORT}" when registering '
+                 '(DeviantArt requires an exact match, port included).',
             foreground="#555", padding=(12, 0, 12, 8), wraplength=280,
         ).pack(anchor="w")
 
@@ -1363,14 +1499,14 @@ class CaptionApp:
     def _da_send(self) -> None:
         """Export the current output and save it as a private draft on DeviantArt."""
         if not self._cache:
-            messagebox.showwarning("Nothing to send", "Open an image or GIF first.")
+            messagebox.showwarning("Nothing to send", "Open an image, GIF, or video first.")
             return
         if getattr(self, "_da_in_progress", False):
             return
         self._da_in_progress = True
 
         # Ensure full GIF cache before uploading
-        if self._is_gif and not self._cache_complete:
+        if self._is_anim and not self._cache_complete:
             self._build_cancel.set()
             if self._refresh_job:
                 self.root.after_cancel(self._refresh_job)
@@ -1404,12 +1540,12 @@ class CaptionApp:
 
         # Write temp file
         import tempfile
-        suffix = ".gif" if self._is_gif else ".png"
+        suffix = ".gif" if self._is_anim else ".png"
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             tmp_path = tmp.name
             tmp.close()
-            if self._is_gif:
+            if self._is_anim:
                 rgb = [f.convert("RGB") for f in self._cache]
                 rgb[0].save(tmp_path, save_all=True, append_images=rgb[1:],
                             loop=0, duration=self._durations, optimize=False)
@@ -1527,7 +1663,7 @@ class CaptionApp:
         self._anim_step()
 
     def _anim_step(self) -> None:
-        if not self._cache or not self._is_gif:
+        if not self._cache or not self._is_anim:
             return
         self._redraw()
         delay = max(20, self._durations[self._anim_idx])

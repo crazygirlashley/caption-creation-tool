@@ -2,6 +2,7 @@
   "name": "Standard (Vertical)",
   "layout": "vertical",
   "cap_panel_size": 300,
+  "dynamic_width": true,
   "page_bg_color": "#f5f5f5",
   "font_color": "#111111",
   "stroke_width": 0,

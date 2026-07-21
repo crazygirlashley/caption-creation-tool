@@ -26,6 +26,13 @@ _DA_PUBLISH_URL = "https://www.deviantart.com/api/v1/oauth2/stash/publish"
 
 _UA = "CaptionCreator/1.0"
 
+# DeviantArt requires redirect_uri to match the registered value EXACTLY, including
+# port — it has no loopback/wildcard-port exception (unlike e.g. Google's RFC 8252
+# support). So the callback listener must bind a fixed port, and this exact URI
+# (scheme + host + port, no trailing slash) must be registered at
+# https://www.deviantart.com/studio/apps.
+REDIRECT_PORT = 24858
+
 log = logging.getLogger(__name__)
 
 
@@ -168,10 +175,17 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
 
-    server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
-    port = server.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}"
-    log.info("OAuth2 PKCE flow starting — callback listener on port %d", port)
+    try:
+        server = HTTPServer(("127.0.0.1", REDIRECT_PORT), _CallbackHandler)
+    except OSError as exc:
+        log.error("Could not bind callback listener on port %d: %s", REDIRECT_PORT, exc)
+        raise RuntimeError(
+            f"Could not start the local OAuth callback listener on port "
+            f"{REDIRECT_PORT} (it may already be in use by another program, "
+            f"or another copy of Caption Creator): {exc}"
+        ) from exc
+    redirect_uri = f"http://127.0.0.1:{REDIRECT_PORT}"
+    log.info("OAuth2 PKCE flow starting — callback listener on port %d", REDIRECT_PORT)
 
     params = {
         "response_type": "code",
@@ -298,7 +312,9 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
             resp = requests.post(
                 _DA_SUBMIT_URL,
                 headers=headers,
-                data={"title": title or "Caption Creator Upload", "is_mature": "false"},
+                # /stash/submit's schema is additionalProperties:false and has no
+                # is_mature field — that's a /stash/publish-time attribute, not submit-time.
+                data={"title": title or "Caption Creator Upload"},
                 files={"file": (fname, fh)},
                 timeout=60,
             )
@@ -325,7 +341,15 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
         if data.get("status") != "success":
             log.error("Sta.sh returned non-success: %s", data)
             raise RuntimeError(f"Sta.sh submit error: {data}")
-        log.info("Upload successful — stackid: %s", data["stackid"])
+        # Only "status" and "itemid" are guaranteed by the API — "stackid" is optional,
+        # but we need it to publish, so fail clearly rather than KeyError-ing.
+        if "stackid" not in data:
+            log.error("Sta.sh response missing stackid: %s", data)
+            raise RuntimeError(
+                f"Sta.sh submit succeeded (itemid={data.get('itemid')}) but returned no "
+                "stackid, so it can't be published."
+            )
+        log.info("Upload successful — itemid=%s  stackid=%s", data.get("itemid"), data["stackid"])
         return str(data["stackid"])
     raise RuntimeError("DeviantArt upload failed after 3 attempts (rate limited).")
 

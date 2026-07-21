@@ -1,5 +1,6 @@
 {
   "name": "X-Change",
+  "dynamic_width": true,
   "page_bg_color": "#ffc0cb",
   "font_color": "#ffffff",
   "stroke_width": 2,

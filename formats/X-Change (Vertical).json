@@ -2,6 +2,7 @@
   "name": "X-Change (Vertical)",
   "layout": "vertical",
   "cap_panel_size": 300,
+  "dynamic_width": true,
   "page_bg_color": "#ffc0cb",
   "font_color": "#ffffff",
   "stroke_width": 2,
