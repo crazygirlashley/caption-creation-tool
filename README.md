@@ -15,6 +15,8 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
 - **MP4 video support** — open an MP4, caption every frame the same way as a GIF, and export as either an MP4 or a GIF, regardless of which one you started with
 - **Minimum output size** — final output is upscaled (never downscaled, aspect ratio preserved) to at least 1280×720 if the source is smaller; the Preview panel label shows the actual output size next to the on-screen preview, which can still display smaller to fit the window
+- **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM; the whole file is still processed automatically when you Save or Send to DA)
+- **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
 - **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 

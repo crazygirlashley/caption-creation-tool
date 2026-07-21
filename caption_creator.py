@@ -253,6 +253,20 @@ def _font_list() -> list:
 _MIN_OUTPUT_W = 1280
 _MIN_OUTPUT_H = 720
 
+# Raw RGBA frame-data threshold above which we warn before loading a GIF/video.
+# The app holds source frames AND a separately-rendered cache simultaneously
+# (plus temporary RGB copies during save/upload), so actual peak usage runs
+# several times higher than this raw estimate — kept conservative accordingly.
+_LARGE_MEDIA_WARN_BYTES = 400 * 1024 * 1024
+
+
+def _human_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if num_bytes < 1024 or unit == "GB":
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} GB"
+
 
 def _hex_to_rgb(color: str) -> tuple:
     h = color.lstrip("#")
@@ -517,6 +531,14 @@ class CaptionApp:
         self._is_anim: bool = False
         self._is_video: bool = False
         self._video_fps: Optional[float] = None
+        # When set, self._frames holds only a single placeholder frame standing
+        # in for a large GIF/video whose full decode was deferred until an
+        # actual Save/Send-to-DA (see _materialize_deferred_source).
+        self._deferred_path: Optional[str] = None
+        self._deferred_kind: Optional[str] = None
+        self._deferred_total_frames: Optional[int] = None
+        self._source_path: Optional[str] = None
+        self._single_frame_var = tk.BooleanVar(value=False)
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
         self._tk_img = None
@@ -591,9 +613,16 @@ class CaptionApp:
         bar.pack(side="top", fill="x")
         ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
-        ttk.Button(bar, text="DA Login", command=self._da_login).pack(side="left", padx=2)
-        # Send to DA is only shown once _da_update_status confirms a cached login token.
+        # Only shown for animated sources (GIF/MP4) — hidden for static images.
+        self._single_frame_check = ttk.Checkbutton(
+            bar, text="Single-Frame Preview", variable=self._single_frame_var,
+            command=self._on_single_frame_toggle)
+        self._toolbar_sep = ttk.Separator(bar, orient="vertical")
+        self._toolbar_sep.pack(side="left", fill="y", padx=6, pady=4)
+        # DA Login is hidden once _da_update_status confirms a cached login token;
+        # Send to DA is only shown once that same check passes.
+        self._da_login_btn = ttk.Button(bar, text="DA Login", command=self._da_login)
+        self._da_login_btn.pack(side="left", padx=2)
         self._da_send_btn = ttk.Button(bar, text="Send to DA…", command=self._da_send)
         self._da_settings_btn = ttk.Button(bar, text="DA Settings", command=self._da_settings)
         self._da_settings_btn.pack(side="left", padx=2)
@@ -911,9 +940,88 @@ class CaptionApp:
     # File I/O
     # ------------------------------------------------------------------
 
-    def _load_video_frames(self, path: str) -> bool:
+    def _large_media_choice(self, frame_count: int, width: int, height: int) -> str:
+        """For media whose raw frame data would use a lot of memory, ask how to
+        proceed. Returns "full" (load every frame now), "placeholder" (load
+        just one frame now, defer the rest to Save/Send-to-DA time), or
+        "cancel". Returns "full" immediately, with no dialog, if the estimated
+        size is below the warning threshold or can't be estimated."""
+        if frame_count <= 0 or width <= 0 or height <= 0:
+            return "full"
+        raw_bytes = frame_count * width * height * 4
+        if raw_bytes <= _LARGE_MEDIA_WARN_BYTES:
+            return "full"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Large File")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        msg = (
+            f"This file has {frame_count} frames at {width}×{height}px — raw frame "
+            f"data alone is about {_human_size(raw_bytes)}, and loading every frame "
+            "now needs several times that to hold both the source and the "
+            "captioned output in memory at once. On a machine with limited RAM "
+            "this can hang or crash the app."
+        )
+        ttk.Label(dlg, text=msg, wraplength=360, justify="left",
+                 padding=(16, 16, 16, 8)).pack()
+
+        result: list = ["cancel"]
+
+        def _choose(choice):
+            result[0] = choice
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill="x", padx=16, pady=(0, 16))
+        ttk.Button(btn_row, text="Use Single-Frame Preview",
+                   command=lambda: _choose("placeholder")).pack(fill="x", pady=(0, 4))
+        ttk.Label(btn_row, text="(shows one frame now; processes all frames when you "
+                               "Save or Send to DA)",
+                 foreground="#666", wraplength=340, justify="left",
+                 font=("TkDefaultFont", 8)).pack(fill="x", pady=(0, 8))
+        ttk.Button(btn_row, text="Load Full File Now",
+                   command=lambda: _choose("full")).pack(fill="x", pady=(0, 4))
+        ttk.Button(btn_row, text="Cancel",
+                   command=lambda: _choose("cancel")).pack(fill="x")
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _choose("cancel"))
+        self.root.wait_window(dlg)
+        return result[0]
+
+    def _load_gif_frames(self, path: str, force_full: bool = False) -> bool:
+        """Decode a GIF/animated image into self._frames/_durations.
+        Returns False (leaving self._frames empty) on cancellation. Sets
+        self._deferred_path/_deferred_kind if the user picks the placeholder
+        option instead of a full load."""
+        img = Image.open(path)
+        n_frames = getattr(img, "n_frames", 1)
+        w, h = img.size
+
+        choice = "full" if force_full else self._large_media_choice(n_frames, w, h)
+        if choice == "cancel":
+            return False
+
+        if choice == "placeholder":
+            first = next(iter(ImageSequence.Iterator(img)))
+            self._frames.append(first.copy().convert("RGBA"))
+            self._durations.append(first.info.get("duration", 100))
+            self._deferred_path = path
+            self._deferred_kind = "gif"
+            self._deferred_total_frames = n_frames
+            return True
+
+        for frm in ImageSequence.Iterator(img):
+            self._frames.append(frm.copy().convert("RGBA"))
+            self._durations.append(frm.info.get("duration", 100))
+        return True
+
+    def _load_video_frames(self, path: str, force_full: bool = False) -> bool:
         """Decode an MP4 into self._frames/_durations via the imageio/ffmpeg backend.
-        Returns False (leaving self._frames empty) on failure or user cancellation."""
+        Returns False (leaving self._frames empty) on failure or user cancellation.
+        Sets self._deferred_path/_deferred_kind if the user picks the
+        placeholder option instead of a full load."""
         try:
             reader = imageio.get_reader(path, "ffmpeg")
             meta = reader.get_meta_data()
@@ -926,22 +1034,28 @@ class CaptionApp:
         fps = meta.get("fps") or 24.0
         self._video_fps = fps
         duration_s = meta.get("duration")
-        if duration_s:
+        vid_w, vid_h = meta.get("size", (0, 0))
+        choice = "full"
+        if not force_full and duration_s:
             est_frames = int(duration_s * fps)
-            if est_frames > 600 and not messagebox.askyesno(
-                "Large Video",
-                f"This video has an estimated {est_frames} frames at {fps:.1f} fps.\n"
-                "Processing all frames may take a while and use significant memory.\n\n"
-                "Continue?",
-            ):
+            choice = self._large_media_choice(est_frames, vid_w, vid_h)
+            if choice == "cancel":
                 reader.close()
                 return False
 
         duration_ms = max(1, round(1000 / fps))
         try:
-            for frame in reader:
-                self._frames.append(Image.fromarray(frame).convert("RGBA"))
+            if choice == "placeholder":
+                first = reader.get_data(0)
+                self._frames.append(Image.fromarray(first).convert("RGBA"))
                 self._durations.append(duration_ms)
+                self._deferred_path = path
+                self._deferred_kind = "mp4"
+                self._deferred_total_frames = est_frames
+            else:
+                for frame in reader:
+                    self._frames.append(Image.fromarray(frame).convert("RGBA"))
+                    self._durations.append(duration_ms)
         except Exception:
             log.exception("VIDEO_DECODE_ERROR")
             messagebox.showerror("Open Error", "Failed to decode video frames.")
@@ -953,6 +1067,84 @@ class CaptionApp:
             messagebox.showerror("Open Error", "Video contained no readable frames.")
             return False
         return True
+
+    def _materialize_deferred_source(self) -> bool:
+        """If the current file is a single-frame placeholder standing in for a
+        deferred large GIF/video, fully decode all its frames now. Returns
+        True immediately if there's nothing deferred. Never re-prompts —
+        the user already chose to defer this cost to save/send time."""
+        if not self._deferred_path:
+            return True
+        path, kind = self._deferred_path, self._deferred_kind
+        self._frames.clear()
+        self._durations.clear()
+        old_txt = self._status.cget("text")
+        self._status.config(text=old_txt + " [Loading all frames…]")
+        self.root.update_idletasks()
+        try:
+            if kind == "mp4":
+                ok = self._load_video_frames(path, force_full=True)
+            else:
+                ok = self._load_gif_frames(path, force_full=True)
+        except Exception:
+            log.exception("MATERIALIZE_DEFERRED_ERROR")
+            ok = False
+        finally:
+            self._status.config(
+                text=self._status.cget("text").replace(" [Loading all frames…]", ""))
+        if ok:
+            self._deferred_path = None
+            self._deferred_kind = None
+            self._deferred_total_frames = None
+            # Frames are all in memory now regardless of how we got here (an
+            # explicit toggle-off or an automatic Save/Send-to-DA materialize)
+            # — keep the checkbox in sync either way.
+            self._single_frame_var.set(False)
+        else:
+            messagebox.showerror("Load Error", "Failed to load the full file for export.")
+        return ok
+
+    def _update_single_frame_visibility(self) -> None:
+        """The Single-Frame Preview toggle only makes sense for animated sources.
+        Uses winfo_manager() rather than winfo_ismapped() — the latter reflects
+        actual on-screen mapping, which can read False even when packed (e.g.
+        before the window is first drawn), causing a spurious re-pack/no-op."""
+        packed = self._single_frame_check.winfo_manager() == "pack"
+        if self._is_anim:
+            if not packed:
+                self._single_frame_check.pack(side="left", padx=4, before=self._toolbar_sep)
+        else:
+            if packed:
+                self._single_frame_check.pack_forget()
+
+    def _on_single_frame_toggle(self) -> None:
+        """Manually collapse the loaded animation down to one preview frame
+        (freeing memory while editing), or restore the full frame set."""
+        if self._single_frame_var.get():
+            if self._deferred_path or not self._source_path or len(self._frames) <= 1:
+                return
+            total = len(self._frames)
+            first, first_duration = self._frames[0], self._durations[0]
+            self._frames[:] = [first]
+            self._durations[:] = [first_duration]
+            self._deferred_path = self._source_path
+            self._deferred_kind = "mp4" if self._is_video else "gif"
+            self._deferred_total_frames = total
+            self._cache_complete = False
+            self._stop_anim()
+            self._anim_idx = 0
+            self._update_preview_label()
+            log.info("SINGLE_FRAME_MODE_ON  total_frames=%d", total)
+            self._safe_refresh(debounce_ms=0)
+        else:
+            if not self._deferred_path:
+                return
+            if self._materialize_deferred_source():
+                log.info("SINGLE_FRAME_MODE_OFF  frames=%d", len(self._frames))
+                self._anim_idx = 0
+                self._safe_refresh(debounce_ms=0)
+            else:
+                self._single_frame_var.set(True)  # materialize failed — stay collapsed
 
     def _open(self) -> None:
         path = filedialog.askopenfilename(
@@ -976,6 +1168,9 @@ class CaptionApp:
         self._cache.clear()
         self._update_preview_label()
         self._video_fps = None
+        self._deferred_path = None
+        self._deferred_kind = None
+        self._deferred_total_frames = None
 
         ext = os.path.splitext(path)[1].lower()
         self._is_video = ext == ".mp4"
@@ -985,22 +1180,30 @@ class CaptionApp:
                 self._is_video = False
                 self._status.config(text="No file loaded")
                 return
-            self._is_anim = len(self._frames) > 1
+            # In placeholder mode self._frames has only 1 entry regardless of the
+            # real total, so use the deferred total (if any) to decide animation.
+            total_frames = self._deferred_total_frames if self._deferred_path else len(self._frames)
+            self._is_anim = total_frames > 1
         else:
             img = Image.open(path)
             is_anim = getattr(img, "is_animated", False)
             self._is_anim = is_anim or ext == ".gif"
 
             if self._is_anim:
-                for frm in ImageSequence.Iterator(img):
-                    self._frames.append(frm.copy().convert("RGBA"))
-                    self._durations.append(frm.info.get("duration", 100))
+                if not self._load_gif_frames(path):
+                    self._status.config(text="No file loaded")
+                    return
             else:
                 self._frames.append(img.convert("RGBA"))
                 self._durations.append(0)
 
         name = os.path.basename(path)
-        if self._is_video:
+        if self._deferred_path:
+            total = self._deferred_total_frames or len(self._frames)
+            kind_word = "MP4" if self._deferred_kind == "mp4" else "GIF"
+            extra = f", {self._video_fps:.1f} fps" if self._video_fps else ""
+            kind = f"{kind_word} (1 of {total} frames shown{extra} — preview only)"
+        elif self._is_video:
             kind = f"MP4 ({len(self._frames)} frames, {self._video_fps:.1f} fps)"
         elif self._is_anim:
             kind = f"GIF ({len(self._frames)} frames)"
@@ -1009,6 +1212,10 @@ class CaptionApp:
         w, h = self._frames[0].size
         self._status.config(text=f"{name}  •  {kind}  •  {w}×{h}px")
         log.info("FILE_OPEN  %s  %s  %dx%d", name, kind, w, h)
+
+        self._source_path = path
+        self._single_frame_var.set(bool(self._deferred_path))
+        self._update_single_frame_visibility()
 
         self._anim_idx = 0
         self._apply_dynamic_width()
@@ -1039,9 +1246,10 @@ class CaptionApp:
             messagebox.showwarning("Nothing to save", "Open an image, GIF, or video first.")
             return
 
-        # If a GIF background build is still in progress or was never completed,
-        # cancel it and do a blocking full render now before saving.
-        if self._is_anim and not self._cache_complete:
+        # If a GIF background build is still in progress or was never completed
+        # (including a deferred large-file placeholder), cancel it and do a
+        # blocking full render now before saving.
+        if self._is_anim and (self._deferred_path or not self._cache_complete):
             self._build_cancel.set()
             if self._refresh_job:
                 self.root.after_cancel(self._refresh_job)
@@ -1050,6 +1258,8 @@ class CaptionApp:
             self._status.config(text=txt + " [Rendering for save…]")
             self.root.update_idletasks()
             try:
+                if not self._materialize_deferred_source():
+                    return
                 self._refresh()
             except Exception:
                 log.exception("SAVE_RENDER_ERROR")
@@ -1305,6 +1515,12 @@ class CaptionApp:
         self._refresh_job = None
         if not self._frames or not self._is_anim:
             return
+        if self._deferred_path:
+            # Only a single placeholder frame is loaded — nothing meaningful to
+            # rebuild yet. Rebuilding it would trivially "complete" and mark
+            # _cache_complete True, which would wrongly skip materializing the
+            # full source at save/send time. Full processing happens there instead.
+            return
 
         params = self._collect_render_params()
         if params is None:
@@ -1429,15 +1645,25 @@ class CaptionApp:
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _da_update_status(self) -> None:
-        """Refresh the DA login status label and Send-to-DA button visibility
-        based on cached token state."""
+        """Refresh the DA login status label, and show/hide DA Login vs.
+        Send-to-DA based on cached token state. Uses winfo_manager() rather
+        than winfo_ismapped() — the latter reflects actual on-screen mapping,
+        which can read False even when packed (e.g. before the window is
+        first drawn), causing a spurious re-pack/no-op."""
+        send_packed = self._da_send_btn.winfo_manager() == "pack"
+        login_packed = self._da_login_btn.winfo_manager() == "pack"
         if da_client.da_has_cached_token():
             self._da_status_label.config(text="DA: logged in", foreground="#4a4")
-            if not self._da_send_btn.winfo_ismapped():
+            if not send_packed:
                 self._da_send_btn.pack(side="left", padx=2, before=self._da_settings_btn)
+            if login_packed:
+                self._da_login_btn.pack_forget()
         else:
             self._da_status_label.config(text="DA: not logged in", foreground="#999")
-            if self._da_send_btn.winfo_ismapped():
+            if not login_packed:
+                self._da_login_btn.pack(side="left", padx=2,
+                                        before=self._da_send_btn if send_packed else self._da_settings_btn)
+            if send_packed:
                 self._da_send_btn.pack_forget()
 
     def _da_login(self) -> None:
@@ -1593,8 +1819,8 @@ class CaptionApp:
 
         self._da_in_progress = True
 
-        # Ensure full GIF cache before uploading
-        if self._is_anim and not self._cache_complete:
+        # Ensure full GIF cache before uploading (including a deferred large-file placeholder)
+        if self._is_anim and (self._deferred_path or not self._cache_complete):
             self._build_cancel.set()
             if self._refresh_job:
                 self.root.after_cancel(self._refresh_job)
@@ -1603,6 +1829,9 @@ class CaptionApp:
             self._status.config(text=old_txt + " [Rendering for upload…]")
             self.root.update_idletasks()
             try:
+                if not self._materialize_deferred_source():
+                    self._da_in_progress = False
+                    return
                 self._refresh()
             except Exception:
                 log.exception("DA_SEND_RENDER_ERROR")
