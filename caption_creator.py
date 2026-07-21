@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
+import json
 import logging
 import logging.handlers
 import os
@@ -116,6 +117,26 @@ _PILL_PRESETS = {
 
 _AARDVARK_NAME = "Aardvark Cafe"
 _AARDVARK_DAFONT = "https://www.dafont.com/aardvark-cafe.font"
+
+_FORMATS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "formats")
+
+
+def _load_formats() -> dict:
+    """Scan formats/ dir and return {name: dict} for every valid format JSON."""
+    result = {}
+    if not os.path.isdir(_FORMATS_DIR):
+        return result
+    for fname in sorted(os.listdir(_FORMATS_DIR)):
+        if not fname.lower().endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(_FORMATS_DIR, fname), encoding="utf-8") as fh:
+                data = json.load(fh)
+            name = data.get("name") or os.path.splitext(fname)[0]
+            result[name] = data
+        except Exception:
+            log.warning("FORMAT_LOAD_ERROR  %s", fname)
+    return result
 
 
 def _find_font_file(stem: str) -> Optional[str]:
@@ -325,7 +346,8 @@ def build_composite(
     shadow: bool = False,
     align: str = "center",
     fmt: str = "Standard",
-    header_text: str = "X-Change",
+    layout: str = "horizontal",
+    header_text: str = "",
     header_font: str = "Arial Bold",
     header_size: int = 28,
     footer_enabled: bool = False,
@@ -337,30 +359,35 @@ def build_composite(
 ) -> Image.Image:
     frame = frame.convert("RGBA")
     fw, fh = frame.size
-    total_w = fw + cap_width
 
-    out = Image.new("RGBA", (total_w, fh), (0, 0, 0, 255))
+    # Panel geometry — cap_width acts as height in vertical layout
+    if layout == "vertical":
+        panel_x, panel_y, panel_w, panel_h = 0, fh, fw, cap_width
+        total_w, total_h = fw, fh + cap_width
+    else:
+        panel_x, panel_y, panel_w, panel_h = fw, 0, cap_width, fh
+        total_w, total_h = fw + cap_width, fh
+
+    out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 255))
     draw = ImageDraw.Draw(out)
 
-    # Image (always at y=0)
     out.paste(frame, (0, 0))
-
-    # Caption panel (right side)
-    out.paste(Image.new("RGBA", (cap_width, fh), _hex_to_rgb(page_bg) + (255,)), (fw, 0))
+    out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
+              (panel_x, panel_y))
 
     # When shadow is on, accumulate all text into two layers then composite once.
     # This cuts GaussianBlur calls from N-per-text-element down to one per frame.
     if shadow:
-        txt_img = Image.new("RGBA", (total_w, fh), (0, 0, 0, 0))
+        txt_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
         txt_draw = ImageDraw.Draw(txt_img)
-        shd_img = Image.new("RGBA", (total_w, fh), (0, 0, 0, 0))
+        shd_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
         shd_draw_ctx: Optional[ImageDraw.ImageDraw] = ImageDraw.Draw(shd_img)
     else:
         txt_img = None
         txt_draw = draw
         shd_draw_ctx = None
 
-    _draw_text_block(txt_draw, fw, 0, cap_width, fh,
+    _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
                      text, font_family, font_size, font_color, padding,
                      stroke_width, stroke_color, bold, shd_draw_ctx,
                      align=align)
@@ -396,8 +423,8 @@ def build_composite(
                                        stroke_width, stroke_color, shd_draw_ctx)
                     ty += line_h
 
-    # X-Change: title text overlaid at top-left corner of image
-    if fmt == "X-Change" and header_text.strip():
+    # Title text overlaid at top-left corner of image
+    if header_text.strip():
         fnt = _pil_font(header_font, header_size)
         _draw_text_overlay(txt_draw, (8, 8), header_text.strip(), fnt,
                            font_color, stroke_width, stroke_color, shd_draw_ctx)
@@ -448,12 +475,14 @@ class CaptionApp:
         self._bold_var = tk.BooleanVar(value=False)
         self._align_var = tk.StringVar(value="center")
 
-        # Format
-        self._format_var = tk.StringVar(value="Standard")
+        # Formats (loaded from formats/ dir)
+        self._formats: dict = _load_formats()
+        default_fmt = "Standard" if "Standard" in self._formats else (
+            next(iter(self._formats), "Standard"))
+        self._format_var = tk.StringVar(value=default_fmt)
 
-        # X-Change title badge
-        xc_font_default = _AARDVARK_NAME if _check_aardvark() else "Impact"
-        self._header_font_var = tk.StringVar(value=xc_font_default)
+        # Header
+        self._header_font_var = tk.StringVar(value="Arial")
         self._header_size_var = tk.IntVar(value=28)
 
         # Footer overlay
@@ -517,15 +546,18 @@ class CaptionApp:
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
 
-        # Format selector + Apply
+        # Format selector + Reload + Apply
         fmt_bar = tk.Frame(right, bg=right.cget("bg"))
         fmt_bar.pack(fill="x", padx=8, pady=6)
         ttk.Label(fmt_bar, text="Format:").pack(side="left")
-        ttk.Combobox(fmt_bar, textvariable=self._format_var,
-                     values=["Standard", "X-Change"],
-                     width=12, state="readonly").pack(side="left", padx=6)
+        self._fmt_combo = ttk.Combobox(fmt_bar, textvariable=self._format_var,
+                                       values=list(self._formats.keys()),
+                                       width=12, state="readonly")
+        self._fmt_combo.pack(side="left", padx=6)
         ttk.Button(fmt_bar, text="Apply",
                    command=lambda: self._safe_refresh(debounce_ms=0)).pack(side="right")
+        ttk.Button(fmt_bar, text="↺", width=2,
+                   command=self._reload_formats).pack(side="right", padx=(0, 2))
 
         # Pill preset bar — shown only for X-Change
         self._pill_frame = tk.Frame(right, bg=right.cget("bg"))
@@ -621,7 +653,8 @@ class CaptionApp:
         self._fc_btn.grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
-        ttk.Label(f, text="Caption Width:").grid(row=r, column=0, sticky="w", pady=4)
+        self._cap_size_label = ttk.Label(f, text="Caption Width:")
+        self._cap_size_label.grid(row=r, column=0, sticky="w", pady=4)
         ttk.Spinbox(f, from_=80, to=1200, textvariable=self._width_var,
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
@@ -649,7 +682,7 @@ class CaptionApp:
         self._header_text_box = tk.Text(f, width=18, height=3, wrap="word",
                                         relief="solid", bd=1, padx=3, pady=3)
         self._header_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
-        self._header_text_box.insert("1.0", "X-Change")
+        self._header_text_box.insert("1.0", "")
         r += 1
 
         ttk.Label(f, text="Header Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -676,7 +709,7 @@ class CaptionApp:
         self._footer_text_box = tk.Text(f, width=18, height=3, wrap="word",
                                         relief="solid", bd=1, padx=3, pady=3)
         self._footer_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
-        self._footer_text_box.insert("1.0", "Fast Acting, Gender Swapping Pill")
+        self._footer_text_box.insert("1.0", "")
         r += 1
 
         ttk.Label(f, text="Footer Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -883,38 +916,72 @@ class CaptionApp:
     # Rendering
     # ------------------------------------------------------------------
 
+    def _reload_formats(self) -> None:
+        """Re-scan formats/ dir and refresh the dropdown."""
+        self._formats = _load_formats()
+        self._fmt_combo.config(values=list(self._formats.keys()))
+        if self._format_var.get() not in self._formats and self._formats:
+            self._format_var.set(next(iter(self._formats)))
+        self._on_format_change()
+
     def _on_format_change(self) -> None:
         fmt = self._format_var.get()
-        if fmt == "X-Change":
-            self._fc_color = "#ffffff"
-            self._fc_btn.config(bg="#ffffff")
-            self._stroke_width_var.set(2)
-            self._page_bg_color = "#ffc0cb"
-            self._stroke_color = "#dd2bbc"
-            self._bg_btn.config(bg="#ffc0cb")
-            self._stroke_btn.config(bg="#dd2bbc")
-            self._font_var.set("Tahoma")
-            self._bold_var.set(True)
-            self._pad_var.set(5)
-            xc_font = _AARDVARK_NAME if _check_aardvark() else "Arial Bold"
-            self._header_font_var.set(xc_font)
-            self._footer_font_var.set(xc_font)
-            self._auto_size_var.set(True)
-            self._footer_enabled.set(True)
+        data = self._formats.get(fmt, {})
+
+        # Colors
+        fc = data.get("font_color", "#111111")
+        bg = data.get("page_bg_color", "#f5f5f5")
+        sc = data.get("stroke_color", "#000000")
+        self._fc_color = fc
+        self._fc_btn.config(bg=fc)
+        self._page_bg_color = bg
+        self._bg_btn.config(bg=bg)
+        self._stroke_color = sc
+        self._stroke_btn.config(bg=sc)
+
+        # Caption settings
+        self._stroke_width_var.set(data.get("stroke_width", 0))
+        self._font_var.set(data.get("font_family", "Arial"))
+        self._bold_var.set(data.get("bold", False))
+        self._pad_var.set(data.get("padding", 20))
+        self._auto_size_var.set(data.get("auto_size", False))
+        self._align_var.set(data.get("align", "center"))
+
+        # Panel size and label
+        if "cap_panel_size" in data:
+            self._width_var.set(data["cap_panel_size"])
+        if data.get("layout") == "vertical":
+            self._cap_size_label.config(text="Caption Height:")
+        else:
+            self._cap_size_label.config(text="Caption Width:")
+
+        # Header
+        hfont = data.get("header_font", "Arial")
+        if hfont == _AARDVARK_NAME and not _check_aardvark():
+            hfont = "Arial Bold"
+        self._header_font_var.set(hfont)
+        self._header_size_var.set(data.get("header_size", 28))
+        if not self._header_text_box.get("1.0", "end-1c").strip():
+            self._header_text_box.delete("1.0", "end")
+            self._header_text_box.insert("1.0", data.get("header_text", ""))
+
+        # Footer
+        ffont = data.get("footer_font", "Arial")
+        if ffont == _AARDVARK_NAME and not _check_aardvark():
+            ffont = "Arial Bold"
+        self._footer_font_var.set(ffont)
+        self._footer_size_var.set(data.get("footer_size", 16))
+        self._footer_enabled.set(data.get("footer_enabled", False))
+        if not self._footer_text_box.get("1.0", "end-1c").strip():
+            self._footer_text_box.delete("1.0", "end")
+            self._footer_text_box.insert("1.0", data.get("footer_text", ""))
+
+        # Pill presets
+        if data.get("show_pill_presets", False):
             self._pill_frame.pack(fill="x", padx=8, pady=(0, 4), before=self._nb)
         else:
             self._pill_frame.pack_forget()
-            self._fc_color = "#111111"
-            self._fc_btn.config(bg="#111111")
-            self._stroke_width_var.set(0)
-            self._page_bg_color = "#f5f5f5"
-            self._stroke_color = "#000000"
-            self._bg_btn.config(bg="#f5f5f5")
-            self._stroke_btn.config(bg="#000000")
-            self._font_var.set("Arial")
-            self._bold_var.set(False)
-            self._pad_var.set(20)
-            self._footer_enabled.set(False)
+
         self._safe_refresh()
 
     def _safe_refresh(self, debounce_ms: int = 400) -> None:
@@ -926,7 +993,6 @@ class CaptionApp:
             self._stroke_width_var.get()
             self._header_size_var.get()
             self._footer_size_var.get()
-            self._watermark_h_var.get()
         except tk.TclError:
             return
 
@@ -960,12 +1026,21 @@ class CaptionApp:
 
         bold = self._bold_var.get()
         fmt = self._format_var.get()
-        shadow = fmt == "X-Change"
+        fmt_data = self._formats.get(fmt, {})
+        shadow = fmt_data.get("shadow", False)
+        header_enabled = fmt_data.get("header_enabled", False)
+        layout = fmt_data.get("layout", "horizontal")
 
         if self._auto_size_var.get() and self._frames:
-            fh = self._frames[0].size[1]
-            size = _fit_font_size(text, self._font_var.get(), max_size,
-                                  width, fh, pad, stroke_w)
+            if layout == "vertical":
+                # Vertical: panel spans full image width; cap_width is the panel height
+                fw = self._frames[0].size[0]
+                size = _fit_font_size(text, self._font_var.get(), max_size,
+                                      fw, width, pad, stroke_w)
+            else:
+                fh = self._frames[0].size[1]
+                size = _fit_font_size(text, self._font_var.get(), max_size,
+                                      width, fh, pad, stroke_w)
         else:
             size = max_size
 
@@ -976,9 +1051,10 @@ class CaptionApp:
             shadow=shadow,
             align=self._align_var.get(),
             fmt=fmt,
+            layout=layout,
         )
 
-        if fmt == "X-Change":
+        if header_enabled:
             try:
                 kwargs.update(
                     header_text=self._header_text_box.get("1.0", "end-1c"),
@@ -1153,7 +1229,7 @@ class CaptionApp:
         return result[0]
 
     def _da_send(self) -> None:
-        """Export the current output and upload it to DeviantArt Sta.sh."""
+        """Export the current output and save it as a private draft on DeviantArt."""
         if not self._cache:
             messagebox.showwarning("Nothing to send", "Open an image or GIF first.")
             return
@@ -1207,25 +1283,34 @@ class CaptionApp:
             messagebox.showerror("Export Error", "Failed to write temp file for upload.")
             return
 
-        # Authenticate (may open browser — do on main thread before going async)
+        # Auth + upload run together in a background thread so the browser OAuth
+        # flow (which can block for many seconds) never freezes the UI.
         self._status.config(text=self._status.cget("text") + " [Authenticating…]")
-        self.root.update_idletasks()
-        try:
-            token = da_client.da_ensure_token(client_id)
-        except Exception as exc:
-            log.exception("DA_AUTH_ERROR")
-            self._status.config(
-                text=self._status.cget("text").replace(" [Authenticating…]", ""))
-            messagebox.showerror("Auth Error", f"DeviantArt authorization failed:\n{exc}")
-            os.unlink(tmp_path)
-            return
-        self._status.config(
-            text=self._status.cget("text").replace(" [Authenticating…]", ""))
 
-        # Upload in background thread
-        self._status.config(text=self._status.cget("text") + " [Uploading…]")
+        def _auth_and_upload():
+            def _open_browser(url):
+                self.root.after(0, lambda u=url: webbrowser.open(u))
 
-        def _upload():
+            try:
+                token = da_client.da_ensure_token(client_id, open_browser=_open_browser)
+            except Exception as exc:
+                log.exception("DA_AUTH_ERROR")
+                def _on_auth_fail(e=exc):
+                    self._status.config(
+                        text=self._status.cget("text").replace(" [Authenticating…]", ""))
+                    messagebox.showerror("Auth Error", f"DeviantArt authorization failed:\n{e}")
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                self.root.after(0, _on_auth_fail)
+                return
+
+            def _set_uploading():
+                txt = self._status.cget("text").replace(" [Authenticating…]", "")
+                self._status.config(text=txt + " [Saving draft…]")
+            self.root.after(0, _set_uploading)
+
             try:
                 stackid = da_client.da_stash_submit(token, tmp_path, title)
                 self.root.after(0, lambda: self._da_upload_done(stackid, token, tmp_path))
@@ -1233,10 +1318,10 @@ class CaptionApp:
                 log.exception("DA_UPLOAD_ERROR")
                 self.root.after(0, lambda e=exc: self._da_upload_failed(str(e), tmp_path))
 
-        threading.Thread(target=_upload, daemon=True).start()
+        threading.Thread(target=_auth_and_upload, daemon=True).start()
 
     def _da_upload_done(self, stackid: str, token: str, tmp_path: str) -> None:
-        self._status.config(text=self._status.cget("text").replace(" [Uploading…]", ""))
+        self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
         log.info("DA_UPLOAD_DONE  stackid=%s", stackid)
         try:
             os.unlink(tmp_path)
@@ -1244,10 +1329,10 @@ class CaptionApp:
             pass
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("Uploaded to DeviantArt")
+        dlg.title("Saved as Draft")
         dlg.resizable(False, False)
         dlg.grab_set()
-        ttk.Label(dlg, text="Uploaded to Sta.sh successfully.",
+        ttk.Label(dlg, text="Saved as draft on DeviantArt.",
                   padding=(16, 16, 16, 8)).pack()
 
         pub_status = ttk.Label(dlg, text="", foreground="#555", padding=(16, 0, 16, 4))
@@ -1284,7 +1369,7 @@ class CaptionApp:
         ttk.Button(btn_row, text="Close", command=dlg.destroy).pack(side="left")
 
     def _da_upload_failed(self, msg: str, tmp_path: str) -> None:
-        self._status.config(text=self._status.cget("text").replace(" [Uploading…]", ""))
+        self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
         try:
             os.unlink(tmp_path)
         except OSError:

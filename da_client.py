@@ -1,11 +1,10 @@
-"""DeviantArt API client — OAuth2 PKCE auth, Sta.sh upload, gallery publish."""
+"""DeviantArt API client — OAuth2 PKCE auth, draft upload via Sta.sh, gallery publish."""
 
 import base64
 import hashlib
 import json
 import os
 import secrets
-import threading
 import time
 import urllib.parse
 import webbrowser
@@ -91,7 +90,6 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def log_message(self, *_):
         pass  # silence access log
@@ -101,8 +99,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 # Public API
 # ---------------------------------------------------------------------------
 
-def da_authorize(client_id: str) -> dict:
-    """Run the PKCE authorization flow. Opens the browser; blocks until done."""
+def da_authorize(client_id: str, open_browser=None) -> dict:
+    """Run the PKCE authorization flow. Calls open_browser(url) or webbrowser.open(url).
+    Polls for the callback with a 5-minute timeout instead of blocking indefinitely."""
     _CallbackHandler.code = None
     _CallbackHandler.error = None
 
@@ -111,7 +110,7 @@ def da_authorize(client_id: str) -> dict:
 
     server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
     port = server.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_uri = f"http://127.0.0.1:{port}"
 
     params = {
         "response_type": "code",
@@ -123,14 +122,25 @@ def da_authorize(client_id: str) -> dict:
         "code_challenge_method": "S256",
     }
     auth_url = _DA_AUTH_URL + "?" + urllib.parse.urlencode(params)
-    webbrowser.open(auth_url)
 
-    server.serve_forever()  # blocks until handler calls server.shutdown()
+    if open_browser:
+        open_browser(auth_url)
+    else:
+        webbrowser.open(auth_url)
+
+    # Poll with 1-second steps so the thread stays interruptible; 5-min hard timeout
+    server.timeout = 1.0
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        server.handle_request()
+        if _CallbackHandler.code is not None or _CallbackHandler.error is not None:
+            break
+    server.server_close()
 
     if _CallbackHandler.error:
         raise RuntimeError(f"DeviantArt authorization failed: {_CallbackHandler.error}")
     if not _CallbackHandler.code:
-        raise RuntimeError("No authorization code received from DeviantArt.")
+        raise RuntimeError("DeviantArt authorization timed out or was cancelled.")
 
     resp = requests.post(_DA_TOKEN_URL, data={
         "grant_type": "authorization_code",
@@ -151,7 +161,7 @@ def da_authorize(client_id: str) -> dict:
     return tokens
 
 
-def da_ensure_token(client_id: str) -> str:
+def da_ensure_token(client_id: str, open_browser=None) -> str:
     """Return a valid access token, refreshing or re-authorizing as needed."""
     tokens = _load_tokens()
 
@@ -179,12 +189,12 @@ def da_ensure_token(client_id: str) -> str:
             pass  # fall through to full re-auth
 
     # Full PKCE flow
-    tokens = da_authorize(client_id)
+    tokens = da_authorize(client_id, open_browser=open_browser)
     return tokens["access_token"]
 
 
 def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
-    """Upload file to Sta.sh. Returns stackid string."""
+    """Upload file as a private draft on DeviantArt (via Sta.sh). Returns stackid string."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": _UA,

@@ -1,0 +1,22 @@
+{
+  "name": "Standard",
+  "page_bg_color": "#f5f5f5",
+  "font_color": "#111111",
+  "stroke_width": 0,
+  "stroke_color": "#000000",
+  "font_family": "Arial",
+  "bold": false,
+  "padding": 5,
+  "auto_size": true,
+  "shadow": false,
+  "align": "center",
+  "show_pill_presets": false,
+  "header_enabled": false,
+  "header_text": "",
+  "header_font": "Arial",
+  "header_size": 28,
+  "footer_enabled": false,
+  "footer_text": "",
+  "footer_font": "Arial",
+  "footer_size": 16
+}

@@ -13,7 +13,7 @@ A Windows desktop app for creating X-Change-style captioned images and animated 
 - **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
-- **DeviantArt integration** — upload finished output to Sta.sh with one click; optionally publish to gallery
+- **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
 ---
@@ -80,11 +80,11 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 
 ## DeviantArt Upload (Optional)
 
-Caption Creator can upload finished images and GIFs directly to your DeviantArt Sta.sh staging area and optionally publish them to your gallery.
+Caption Creator can save finished images and GIFs directly to your DeviantArt account as private drafts, and optionally publish them to your gallery.
 
 ### One-time setup
 
-1. Log into DeviantArt and go to [deviantart.com/developers/apps](https://www.deviantart.com/developers/apps)
+1. Log into DeviantArt and go to [deviantart.com/studio/apps](https://www.deviantart.com/studio/apps)
 2. Register a new application — choose **Public** client type
 3. Set the OAuth2 redirect URI to `http://127.0.0.1`
 4. Copy your **Client ID**
@@ -95,10 +95,43 @@ Caption Creator can upload finished images and GIFs directly to your DeviantArt 
 1. Open an image or GIF and apply your caption styling
 2. Click **Send to DeviantArt…**
 3. Your browser will open the DeviantArt authorization page — authorize the app
-4. The file uploads to your private Sta.sh area
+4. The file saves as a private draft on your DeviantArt account
 5. Click **Publish to Gallery** in the confirmation dialog to make it public
 
 Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
+
+---
+
+## Custom Formats
+
+Caption styles are defined as JSON files in the `formats/` folder. You can create your own format by adding a new `.json` file there — it will appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
+
+Each format file supports the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Display name shown in the dropdown |
+| `page_bg_color` | hex string | Caption panel background color |
+| `font_color` | hex string | Caption text color |
+| `stroke_width` | int | Text stroke thickness in px |
+| `stroke_color` | hex string | Stroke color |
+| `font_family` | string | Caption font name |
+| `bold` | bool | Bold caption text |
+| `padding` | int | Caption text padding in px |
+| `auto_size` | bool | Auto-fit font size to panel height |
+| `shadow` | bool | Drop shadow on all overlaid text |
+| `align` | `"left"` / `"center"` / `"right"` | Caption text alignment |
+| `show_pill_presets` | bool | Show pill color preset buttons |
+| `header_enabled` | bool | Show title overlay on image |
+| `header_text` | string | Default title text |
+| `header_font` | string | Title font (use `"Aardvark Cafe"` for the X-Change font) |
+| `header_size` | int | Title font size |
+| `footer_enabled` | bool | Show tagline overlay on image |
+| `footer_text` | string | Default tagline text |
+| `footer_font` | string | Tagline font |
+| `footer_size` | int | Tagline font size |
+
+See `formats/Standard.json` and `formats/X-Change.json` for examples.
 
 ---
 
@@ -107,7 +140,10 @@ Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 mo
 ```
 caption-creation-tool/
 ├── caption_creator.py     # Main application
-├── da_client.py           # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
+├── da_client.py           # DeviantArt API client (OAuth2 PKCE, draft upload)
+├── formats/               # Format definitions (JSON) — add your own here
+│   ├── Standard.json
+│   └── X-Change.json
 ├── requirements.txt       # Python dependencies
 ├── run.bat                # Windows launcher
 ├── watermark/             # Drop a single watermark image here (gitignored)
