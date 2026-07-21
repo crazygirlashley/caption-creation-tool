@@ -48,6 +48,37 @@ def _tk_excepthook(exc, val, tb):
               "".join(traceback.format_exception(exc, val, tb)).rstrip())
 
 
+class _DALogHandler(logging.Handler):
+    """Routes da_client log records to a Tkinter Text widget on the main thread."""
+
+    _TAGS = {
+        logging.ERROR:   "err",
+        logging.WARNING: "warn",
+        logging.INFO:    "info",
+        logging.DEBUG:   "dbg",
+    }
+
+    def __init__(self, text_widget: "tk.Text") -> None:
+        super().__init__()
+        self._text = text_widget
+        self.setFormatter(logging.Formatter(
+            "%(asctime)s  [%(levelname)s]  %(message)s", datefmt="%H:%M:%S"
+        ))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record) + "\n"
+        tag = self._TAGS.get(record.levelno, "dbg")
+        def _append(m=msg, t=tag):
+            try:
+                self._text.config(state="normal")
+                self._text.insert("end", m, t)
+                self._text.see("end")
+                self._text.config(state="disabled")
+            except tk.TclError:
+                pass
+        self._text.after(0, _append)
+
+
 class _Watchdog(threading.Thread):
     """Daemon thread: logs a warning if the Tk main thread stops processing for TIMEOUT seconds."""
     TIMEOUT = 8.0
@@ -529,7 +560,9 @@ class CaptionApp:
         bar.pack(side="top", fill="x")
         ttk.Button(bar, text="Open Image / GIF…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
-        ttk.Button(bar, text="Send to DeviantArt…", command=self._da_send).pack(side="left", padx=4)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
+        ttk.Button(bar, text="DA Login", command=self._da_login).pack(side="left", padx=2)
+        ttk.Button(bar, text="Send to DA…", command=self._da_send).pack(side="left", padx=2)
         ttk.Button(bar, text="DA Settings", command=self._da_settings).pack(side="left", padx=2)
         self._status = ttk.Label(bar, text="No file loaded", foreground="#888")
         self._status.pack(side="left", padx=12)
@@ -1187,6 +1220,90 @@ class CaptionApp:
     # DeviantArt integration
     # ------------------------------------------------------------------
 
+    def _da_show_log(self) -> None:
+        """Open (or bring to front) the DeviantArt log window."""
+        if hasattr(self, "_da_log_win") and self._da_log_win and self._da_log_win.winfo_exists():
+            self._da_log_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("DeviantArt Log")
+        win.geometry("620x300")
+        win.resizable(True, True)
+        self._da_log_win = win
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+
+        txt = tk.Text(frame, state="disabled", wrap="word", font=("Consolas", 9),
+                      bg="#1e1e1e", fg="#d4d4d4", relief="flat")
+        sb = ttk.Scrollbar(frame, command=txt.yview)
+        txt.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.tag_config("err",  foreground="#f44747")
+        txt.tag_config("warn", foreground="#ffcc00")
+        txt.tag_config("info", foreground="#9cdcfe")
+        txt.tag_config("dbg",  foreground="#888888")
+        self._da_log_text = txt
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=6, pady=4)
+
+        def _clear():
+            txt.config(state="normal")
+            txt.delete("1.0", "end")
+            txt.config(state="disabled")
+        ttk.Button(btn_row, text="Clear Log", command=_clear).pack(side="right")
+
+        # Attach a logging handler that routes da_client records to this window
+        da_logger = logging.getLogger("da_client")
+        da_logger.setLevel(logging.DEBUG)
+        handler = _DALogHandler(txt)
+        handler.setLevel(logging.DEBUG)
+        self._da_log_handler = handler
+        da_logger.addHandler(handler)
+
+        def _on_close():
+            da_logger.removeHandler(handler)
+            self._da_log_handler = None
+            self._da_log_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _da_login(self) -> None:
+        """Authenticate with DeviantArt (opens browser, shows log window)."""
+        client_id = da_client.load_client_id()
+        if not client_id:
+            client_id = self._da_settings()
+            if not client_id:
+                return
+
+        if getattr(self, "_da_login_in_progress", False):
+            self._da_show_log()
+            return
+        self._da_login_in_progress = True
+
+        self._da_show_log()
+
+        def _open_browser(url):
+            self.root.after(0, lambda u=url: webbrowser.open(u))
+
+        def _do_login():
+            try:
+                da_client.da_authorize(client_id, open_browser=_open_browser)
+                self.root.after(0, lambda: self._status.config(
+                    text=self._status.cget("text").rstrip() + " — DA: logged in"
+                    if "DA:" not in self._status.cget("text")
+                    else self._status.cget("text")
+                ))
+            except Exception as exc:
+                log.exception("DA_LOGIN_ERROR: %s", exc)
+            finally:
+                self._da_login_in_progress = False
+
+        threading.Thread(target=_do_login, daemon=True).start()
+
     def _da_settings(self, *, focus_entry: bool = True) -> Optional[str]:
         """Open the DA settings dialog. Returns entered client_id or None."""
         dlg = tk.Toplevel(self.root)
@@ -1233,6 +1350,9 @@ class CaptionApp:
         if not self._cache:
             messagebox.showwarning("Nothing to send", "Open an image or GIF first.")
             return
+        if getattr(self, "_da_in_progress", False):
+            return
+        self._da_in_progress = True
 
         # Ensure full GIF cache before uploading
         if self._is_gif and not self._cache_complete:
@@ -1247,6 +1367,7 @@ class CaptionApp:
                 self._refresh()
             except Exception:
                 log.exception("DA_SEND_RENDER_ERROR")
+                self._da_in_progress = False
                 messagebox.showerror("Render Error", "Failed to render all frames.")
                 return
             finally:
@@ -1258,6 +1379,7 @@ class CaptionApp:
         if not client_id:
             client_id = self._da_settings()
             if not client_id:
+                self._da_in_progress = False
                 return
 
         # Derive a title from the first non-empty line of caption text
@@ -1280,36 +1402,31 @@ class CaptionApp:
                 self._cache[0].save(tmp_path)
         except Exception:
             log.exception("DA_SEND_EXPORT_ERROR")
+            self._da_in_progress = False
             messagebox.showerror("Export Error", "Failed to write temp file for upload.")
             return
 
-        # Auth + upload run together in a background thread so the browser OAuth
-        # flow (which can block for many seconds) never freezes the UI.
-        self._status.config(text=self._status.cget("text") + " [Authenticating…]")
+        # Upload runs in a background thread; token must already be cached (use DA Login first)
+        self._status.config(text=self._status.cget("text") + " [Saving draft…]")
 
-        def _auth_and_upload():
-            def _open_browser(url):
-                self.root.after(0, lambda u=url: webbrowser.open(u))
-
+        def _upload():
             try:
-                token = da_client.da_ensure_token(client_id, open_browser=_open_browser)
+                token = da_client.da_ensure_silent_token(client_id)
             except Exception as exc:
-                log.exception("DA_AUTH_ERROR")
-                def _on_auth_fail(e=exc):
+                def _on_no_token(e=exc):
+                    self._da_in_progress = False
                     self._status.config(
-                        text=self._status.cget("text").replace(" [Authenticating…]", ""))
-                    messagebox.showerror("Auth Error", f"DeviantArt authorization failed:\n{e}")
+                        text=self._status.cget("text").replace(" [Saving draft…]", ""))
+                    messagebox.showerror(
+                        "Not Logged In",
+                        f"{e}\n\nClick 'DA Login' to authenticate first."
+                    )
                     try:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
-                self.root.after(0, _on_auth_fail)
+                self.root.after(0, _on_no_token)
                 return
-
-            def _set_uploading():
-                txt = self._status.cget("text").replace(" [Authenticating…]", "")
-                self._status.config(text=txt + " [Saving draft…]")
-            self.root.after(0, _set_uploading)
 
             try:
                 stackid = da_client.da_stash_submit(token, tmp_path, title)
@@ -1318,9 +1435,10 @@ class CaptionApp:
                 log.exception("DA_UPLOAD_ERROR")
                 self.root.after(0, lambda e=exc: self._da_upload_failed(str(e), tmp_path))
 
-        threading.Thread(target=_auth_and_upload, daemon=True).start()
+        threading.Thread(target=_upload, daemon=True).start()
 
     def _da_upload_done(self, stackid: str, token: str, tmp_path: str) -> None:
+        self._da_in_progress = False
         self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
         log.info("DA_UPLOAD_DONE  stackid=%s", stackid)
         try:
@@ -1369,6 +1487,7 @@ class CaptionApp:
         ttk.Button(btn_row, text="Close", command=dlg.destroy).pack(side="left")
 
     def _da_upload_failed(self, msg: str, tmp_path: str) -> None:
+        self._da_in_progress = False
         self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
         try:
             os.unlink(tmp_path)

@@ -3,8 +3,10 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -23,6 +25,8 @@ _DA_SUBMIT_URL = "https://www.deviantart.com/api/v1/oauth2/stash/submit"
 _DA_PUBLISH_URL = "https://www.deviantart.com/api/v1/oauth2/stash/publish"
 
 _UA = "CaptionCreator/1.0"
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +63,50 @@ def _save_tokens(tokens: dict) -> None:
         json.dump(tokens, f)
 
 
+def da_logout() -> None:
+    """Delete cached tokens so the next login triggers a fresh OAuth flow."""
+    try:
+        os.unlink(_TOKENS_PATH)
+        log.info("Logged out — cached tokens removed.")
+    except FileNotFoundError:
+        log.info("No cached tokens found — already logged out.")
+
+
+def da_ensure_silent_token(client_id: str) -> str:
+    """Return a valid access token using only the cache or a silent refresh.
+    Never opens a browser. Raises RuntimeError if interactive login is required."""
+    tokens = _load_tokens()
+
+    if tokens and time.time() < tokens.get("expires_at", 0):
+        log.debug("Cached token is still valid.")
+        return tokens["access_token"]
+
+    if tokens and tokens.get("refresh_token"):
+        log.info("Token expired — attempting silent refresh...")
+        try:
+            resp = requests.post(_DA_TOKEN_URL, data={
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": tokens["refresh_token"],
+            }, headers={"User-Agent": _UA}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            tokens = {
+                "access_token": data["access_token"],
+                "refresh_token": data.get("refresh_token", tokens["refresh_token"]),
+                "expires_at": time.time() + int(data.get("expires_in", 3600)) - 30,
+            }
+            _save_tokens(tokens)
+            log.info("Token refreshed silently.")
+            return tokens["access_token"]
+        except Exception as exc:
+            log.warning("Silent refresh failed: %s", exc)
+
+    raise RuntimeError(
+        "Not logged in to DeviantArt. Use the DA Login button to authenticate."
+    )
+
+
 # ---------------------------------------------------------------------------
 # OAuth2 PKCE helpers
 # ---------------------------------------------------------------------------
@@ -81,15 +129,28 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
         if "code" in params:
             _CallbackHandler.code = params["code"][0]
+            log.info("Authorization code received from DeviantArt.")
             body = b"<h2>Authorized! You can close this tab.</h2>"
-        else:
-            _CallbackHandler.error = params.get("error", ["unknown"])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+        elif "error" in params:
+            _CallbackHandler.error = params["error"][0]
+            log.warning("DeviantArt returned an error in the callback: %s", _CallbackHandler.error)
             body = b"<h2>Authorization failed. You can close this tab.</h2>"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+        else:
+            # Ignore browser noise (favicon, prefetch, etc.) — only act on the real callback
+            self.send_response(204)
+            self.end_headers()
 
     def log_message(self, *_):
         pass  # silence access log
@@ -100,8 +161,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def da_authorize(client_id: str, open_browser=None) -> dict:
-    """Run the PKCE authorization flow. Calls open_browser(url) or webbrowser.open(url).
-    Polls for the callback with a 5-minute timeout instead of blocking indefinitely."""
+    """Run the PKCE authorization flow. Calls open_browser(url) or webbrowser.open(url)."""
     _CallbackHandler.code = None
     _CallbackHandler.error = None
 
@@ -111,6 +171,7 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
     server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
     port = server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}"
+    log.info("OAuth2 PKCE flow starting — callback listener on port %d", port)
 
     params = {
         "response_type": "code",
@@ -123,33 +184,46 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
     }
     auth_url = _DA_AUTH_URL + "?" + urllib.parse.urlencode(params)
 
+    log.info("Opening browser for authorization...")
     if open_browser:
         open_browser(auth_url)
     else:
         webbrowser.open(auth_url)
 
-    # Poll with 1-second steps so the thread stays interruptible; 5-min hard timeout
-    server.timeout = 1.0
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        server.handle_request()
-        if _CallbackHandler.code is not None or _CallbackHandler.error is not None:
-            break
+    log.info("Waiting for authorization callback (5-minute timeout)...")
+    # Watchdog: shut down the server after 5 minutes so the thread doesn't hang forever
+    def _watchdog():
+        log.error("Authorization timed out after 5 minutes — no callback received.")
+        server.shutdown()
+    watchdog = threading.Timer(300, _watchdog)
+    watchdog.daemon = True
+    watchdog.start()
+    server.serve_forever()
+    watchdog.cancel()
     server.server_close()
 
     if _CallbackHandler.error:
+        log.error("Authorization failed — DeviantArt returned error: %s", _CallbackHandler.error)
         raise RuntimeError(f"DeviantArt authorization failed: {_CallbackHandler.error}")
     if not _CallbackHandler.code:
         raise RuntimeError("DeviantArt authorization timed out or was cancelled.")
 
-    resp = requests.post(_DA_TOKEN_URL, data={
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code": _CallbackHandler.code,
-        "code_verifier": verifier,
-    }, headers={"User-Agent": _UA}, timeout=15)
-    resp.raise_for_status()
+    log.info("Callback received — exchanging code for tokens...")
+    try:
+        resp = requests.post(_DA_TOKEN_URL, data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code": _CallbackHandler.code,
+            "code_verifier": verifier,
+        }, headers={"User-Agent": _UA}, timeout=15)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        log.error("Token exchange failed (HTTP %s): %s", exc.response.status_code, exc.response.text)
+        raise
+    except Exception as exc:
+        log.error("Token exchange request failed: %s", exc)
+        raise
     data = resp.json()
 
     tokens = {
@@ -158,6 +232,7 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
         "expires_at": time.time() + int(data.get("expires_in", 3600)) - 30,
     }
     _save_tokens(tokens)
+    log.info("Login successful — token saved, expires in %ds.", int(data.get("expires_in", 3600)))
     return tokens
 
 
