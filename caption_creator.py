@@ -1521,9 +1521,12 @@ class CaptionApp:
         self.root.wait_window(dlg)
         return result[0]
 
-    def _da_send_prompt(self, default_title: str, default_description: str) -> Optional[tuple]:
-        """Ask for a title (required) and description before uploading to DA.
-        Returns (title, description) or None if the user cancelled."""
+    def _da_send_prompt(self, default_title: str, default_description: str,
+                        offer_mp4: bool = False) -> Optional[tuple]:
+        """Ask for a title (required), description, and — if offer_mp4 — an
+        upload format before uploading to DA.
+        Returns (title, description, upload_format) where upload_format is
+        "mp4" or "gif", or None if the user cancelled."""
         dlg = tk.Toplevel(self.root)
         dlg.title("Send to DeviantArt")
         dlg.resizable(False, False)
@@ -1542,6 +1545,16 @@ class CaptionApp:
         desc_box.insert("1.0", default_description)
         desc_box.pack(padx=12, pady=(0, 10), fill="both", expand=True)
 
+        fmt_var = tk.StringVar(value="mp4" if offer_mp4 else "gif")
+        if offer_mp4:
+            fmt_row = ttk.Frame(dlg)
+            fmt_row.pack(fill="x", padx=12, pady=(0, 8))
+            ttk.Label(fmt_row, text="Upload as:").pack(side="left")
+            ttk.Radiobutton(fmt_row, text="MP4", variable=fmt_var,
+                            value="mp4").pack(side="left", padx=(8, 4))
+            ttk.Radiobutton(fmt_row, text="GIF", variable=fmt_var,
+                            value="gif").pack(side="left")
+
         result: list = [None]
 
         def _ok():
@@ -1550,7 +1563,7 @@ class CaptionApp:
                 messagebox.showwarning("Title Required", "Please enter a title.", parent=dlg)
                 return
             description = desc_box.get("1.0", "end-1c").strip()
-            result[0] = (title, description)
+            result[0] = (title, description, fmt_var.get())
             dlg.destroy()
 
         btn_row = ttk.Frame(dlg)
@@ -1573,10 +1586,10 @@ class CaptionApp:
             return
 
         raw_text = self._text_box.get("1.0", "end-1c").strip()
-        prompt = self._da_send_prompt("", raw_text)
+        prompt = self._da_send_prompt("", raw_text, offer_mp4=self._is_video)
         if prompt is None:
             return
-        title, description = prompt
+        title, description, upload_format = prompt
 
         self._da_in_progress = True
 
@@ -1610,15 +1623,21 @@ class CaptionApp:
 
         # Write temp file
         import tempfile
-        suffix = ".gif" if self._is_anim else ".png"
+        if self._is_anim:
+            suffix = ".mp4" if upload_format == "mp4" else ".gif"
+        else:
+            suffix = ".png"
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             tmp_path = tmp.name
             tmp.close()
             if self._is_anim:
-                rgb = [f.convert("RGB") for f in self._cache]
-                rgb[0].save(tmp_path, save_all=True, append_images=rgb[1:],
-                            loop=0, duration=self._durations, optimize=False)
+                if upload_format == "mp4":
+                    self._write_mp4(tmp_path, self._cache)
+                else:
+                    rgb = [f.convert("RGB") for f in self._cache]
+                    rgb[0].save(tmp_path, save_all=True, append_images=rgb[1:],
+                                loop=0, duration=self._durations, optimize=False)
             else:
                 self._cache[0].save(tmp_path)
         except Exception:

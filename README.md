@@ -82,7 +82,7 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 
 ## DeviantArt Upload (Optional)
 
-Caption Creator can save finished images and GIFs directly to your DeviantArt account as private drafts, and optionally publish them to your gallery.
+Caption Creator can save finished images, GIFs, and videos directly to your DeviantArt account as private drafts, and optionally publish them to your gallery.
 
 ### One-time setup
 
@@ -97,8 +97,8 @@ Caption Creator can save finished images and GIFs directly to your DeviantArt ac
 1. Click **DA Login** in the toolbar — your browser opens the DeviantArt authorization page; log in and authorize the app
 2. Once logged in, the **Send to DA…** button appears in the toolbar (it's hidden until login succeeds)
 3. Open an image, GIF, or video and apply your caption styling
-4. Click **Send to DA…** — a dialog prompts for a **Title** (required, starts empty) and a **Description** (pre-filled with your caption text, sent as DeviantArt's artist comments); both are editable before sending
-5. The file saves as a private draft on your DeviantArt account (animated content, including video sources, uploads as a GIF)
+4. Click **Send to DA…** — a dialog prompts for a **Title** (required, starts empty) and a **Description** (pre-filled with your caption text, sent as DeviantArt's artist comments); if you started from a video, you'll also choose to upload as **MP4** or **GIF** (defaults to MP4); all are editable before sending
+5. The file saves as a private draft on your DeviantArt account
 6. Click **Publish to Gallery** in the confirmation dialog to make it public
 
 Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
