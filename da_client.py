@@ -294,7 +294,8 @@ def da_has_cached_token() -> bool:
     return bool(tokens and time.time() < tokens.get("expires_at", 0))
 
 
-def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
+def da_stash_submit(access_token: str, file_path: str, title: str,
+                     artist_comments: str = "") -> str:
     """Upload file as a private draft on DeviantArt (via Sta.sh). Returns stackid string."""
     file_size = os.path.getsize(file_path)
     log.info("Uploading %s (%.1f KB) to Sta.sh as '%s'...",
@@ -304,6 +305,9 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
         "User-Agent": _UA,
         "Accept-Encoding": "gzip",
     }
+    data = {"title": title or "Caption Creator Upload"}
+    if artist_comments:
+        data["artist_comments"] = artist_comments
     delay = 1.0
     for attempt in range(3):
         log.info("Sta.sh submit attempt %d/3...", attempt + 1)
@@ -314,7 +318,7 @@ def da_stash_submit(access_token: str, file_path: str, title: str) -> str:
                 headers=headers,
                 # /stash/submit's schema is additionalProperties:false and has no
                 # is_mature field — that's a /stash/publish-time attribute, not submit-time.
-                data={"title": title or "Caption Creator Upload"},
+                data=data,
                 files={"file": (fname, fh)},
                 timeout=60,
             )

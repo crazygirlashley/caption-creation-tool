@@ -37,6 +37,14 @@ log = logging.getLogger("caption_creator")
 log.setLevel(logging.DEBUG)
 log.addHandler(_handler)
 
+# da_client logs the actual DeviantArt response body on API errors (e.g. why a
+# submit got a 400), but that's only ever useful if it's captured somewhere
+# persistent — attach the same rotating file handler here so it lands in
+# caption_creator_crash.log regardless of whether the DA Log window is open.
+_da_logger = logging.getLogger("da_client")
+_da_logger.setLevel(logging.DEBUG)
+_da_logger.addHandler(_handler)
+
 
 def _excepthook(exc_type, exc_value, exc_tb):
     log.critical("CRASH — unhandled exception\n%s",
@@ -241,6 +249,10 @@ def _font_list() -> list:
 # ---------------------------------------------------------------------------
 # Image compositing
 # ---------------------------------------------------------------------------
+
+_MIN_OUTPUT_W = 1280
+_MIN_OUTPUT_H = 720
+
 
 def _hex_to_rgb(color: str) -> tuple:
     h = color.lstrip("#")
@@ -472,6 +484,14 @@ def build_composite(
         out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3)))
         out.alpha_composite(txt_img)
 
+    # Enforce a minimum final output size — upscale (never downscale) preserving
+    # aspect ratio, so small sources don't distort when stretched to fit both axes.
+    scale = max(1.0, _MIN_OUTPUT_W / total_w, _MIN_OUTPUT_H / total_h)
+    if scale > 1.0:
+        new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
+        new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
+        out = out.resize((new_w, new_h), Image.LANCZOS)
+
     return out
 
 
@@ -590,6 +610,7 @@ class CaptionApp:
         # ---- Preview canvas fills remaining left space ----
         pf = ttk.LabelFrame(self.root, text="Preview", padding=4)
         pf.pack(side="left", fill="both", expand=True, padx=(4, 2), pady=(0, 4))
+        self._preview_frame = pf
         self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
@@ -953,6 +974,7 @@ class CaptionApp:
         self._frames.clear()
         self._durations.clear()
         self._cache.clear()
+        self._update_preview_label()
         self._video_fps = None
 
         ext = os.path.splitext(path)[1].lower()
@@ -1275,6 +1297,7 @@ class CaptionApp:
         self._cache = [first]
         self._cache_complete = not self._is_anim
         self._anim_idx = 0
+        self._update_preview_label()
         self._redraw()
 
     def _rebuild_all_async(self) -> None:
@@ -1321,6 +1344,7 @@ class CaptionApp:
         self._status.config(text=txt.replace(" [Rendering…]", ""))
         log.info("GIF_REBUILD_DONE  frames=%d", len(results))
         self._anim_idx = 0
+        self._update_preview_label()
         self._start_anim()
 
     def _refresh(self) -> None:
@@ -1343,6 +1367,7 @@ class CaptionApp:
             log.warning("SLOW_RENDER  frames=%d  total=%.2fs  per_frame=%.0fms",
                         len(self._frames), elapsed, elapsed / len(self._frames) * 1000)
         self._anim_idx = 0
+        self._update_preview_label()
         if self._is_anim:
             self._start_anim()
         else:
@@ -1496,6 +1521,49 @@ class CaptionApp:
         self.root.wait_window(dlg)
         return result[0]
 
+    def _da_send_prompt(self, default_title: str, default_description: str) -> Optional[tuple]:
+        """Ask for a title (required) and description before uploading to DA.
+        Returns (title, description) or None if the user cancelled."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Send to DeviantArt")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Title:", padding=(12, 12, 12, 2)).pack(anchor="w")
+        title_entry = ttk.Entry(dlg, width=40)
+        title_entry.insert(0, default_title)
+        title_entry.pack(padx=12, pady=(0, 8), fill="x")
+        title_entry.focus_set()
+        title_entry.icursor("end")
+
+        ttk.Label(dlg, text="Description:", padding=(12, 0, 12, 2)).pack(anchor="w")
+        desc_box = tk.Text(dlg, width=40, height=6, wrap="word", relief="solid", bd=1,
+                           padx=4, pady=4)
+        desc_box.insert("1.0", default_description)
+        desc_box.pack(padx=12, pady=(0, 10), fill="both", expand=True)
+
+        result: list = [None]
+
+        def _ok():
+            title = title_entry.get().strip()
+            if not title:
+                messagebox.showwarning("Title Required", "Please enter a title.", parent=dlg)
+                return
+            description = desc_box.get("1.0", "end-1c").strip()
+            result[0] = (title, description)
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btn_row, text="Send", command=_ok).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right")
+
+        # Bind Enter only on the single-line title field — binding it on the whole
+        # dialog would hijack Enter inside the multi-line description box too.
+        title_entry.bind("<Return>", lambda _: _ok())
+        self.root.wait_window(dlg)
+        return result[0]
+
     def _da_send(self) -> None:
         """Export the current output and save it as a private draft on DeviantArt."""
         if not self._cache:
@@ -1503,6 +1571,13 @@ class CaptionApp:
             return
         if getattr(self, "_da_in_progress", False):
             return
+
+        raw_text = self._text_box.get("1.0", "end-1c").strip()
+        prompt = self._da_send_prompt("", raw_text)
+        if prompt is None:
+            return
+        title, description = prompt
+
         self._da_in_progress = True
 
         # Ensure full GIF cache before uploading
@@ -1532,11 +1607,6 @@ class CaptionApp:
             if not client_id:
                 self._da_in_progress = False
                 return
-
-        # Derive a title from the first non-empty line of caption text
-        raw_text = self._text_box.get("1.0", "end-1c").strip()
-        title = next((ln.strip() for ln in raw_text.splitlines() if ln.strip()),
-                     "Caption Creator Upload")
 
         # Write temp file
         import tempfile
@@ -1580,7 +1650,8 @@ class CaptionApp:
                 return
 
             try:
-                stackid = da_client.da_stash_submit(token, tmp_path, title)
+                stackid = da_client.da_stash_submit(token, tmp_path, title,
+                                                     artist_comments=description)
                 self.root.after(0, lambda: self._da_upload_done(stackid, token, tmp_path))
             except Exception as exc:
                 log.exception("DA_UPLOAD_ERROR")
@@ -1645,6 +1716,16 @@ class CaptionApp:
         except OSError:
             pass
         messagebox.showerror("Upload Failed", f"DeviantArt upload failed:\n{msg}")
+
+    def _update_preview_label(self) -> None:
+        """Show the actual final output size (post minimum-size upscale) next to
+        the Preview panel label — the on-screen preview itself is fit-scaled
+        smaller by _redraw(), so this is the only place the real size is visible."""
+        if self._cache:
+            w, h = self._cache[0].size
+            self._preview_frame.config(text=f"Preview  (Output: {w}×{h}px)")
+        else:
+            self._preview_frame.config(text="Preview")
 
     def _redraw(self) -> None:
         if not self._cache:

@@ -14,6 +14,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
 - **MP4 video support** — open an MP4, caption every frame the same way as a GIF, and export as either an MP4 or a GIF, regardless of which one you started with
+- **Minimum output size** — final output is upscaled (never downscaled, aspect ratio preserved) to at least 1280×720 if the source is smaller; the Preview panel label shows the actual output size next to the on-screen preview, which can still display smaller to fit the window
 - **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
@@ -95,9 +96,10 @@ Caption Creator can save finished images and GIFs directly to your DeviantArt ac
 
 1. Click **DA Login** in the toolbar — your browser opens the DeviantArt authorization page; log in and authorize the app
 2. Once logged in, the **Send to DA…** button appears in the toolbar (it's hidden until login succeeds)
-3. Open an image or GIF and apply your caption styling
-4. Click **Send to DA…** — the file saves as a private draft on your DeviantArt account
-5. Click **Publish to Gallery** in the confirmation dialog to make it public
+3. Open an image, GIF, or video and apply your caption styling
+4. Click **Send to DA…** — a dialog prompts for a **Title** (required, starts empty) and a **Description** (pre-filled with your caption text, sent as DeviantArt's artist comments); both are editable before sending
+5. The file saves as a private draft on your DeviantArt account (animated content, including video sources, uploads as a GIF)
+6. Click **Publish to Gallery** in the confirmation dialog to make it public
 
 Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
 
@@ -135,7 +137,7 @@ Each format file supports the following fields:
 | `footer_font` | string | Tagline font |
 | `footer_size` | int | Tagline font size |
 
-See `formats/Standard.json` and `formats/X-Change.json` for examples.
+See `formats/Standard.json`, `formats/X-Change.json`, and their `(Vertical)` counterparts for examples.
 
 ---
 
