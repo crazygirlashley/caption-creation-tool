@@ -312,7 +312,7 @@ def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
 
 def _fit_font_size(text: str, font_family: str, max_size: int,
                    area_w: int, area_h: int, padding: int,
-                   stroke_width: int = 0) -> int:
+                   stroke_width: int = 0, bold: bool = False) -> int:
     """Binary-search for the largest font size where wrapped text fits in area_w×area_h."""
     if not text.strip():
         return max_size
@@ -320,7 +320,7 @@ def _fit_font_size(text: str, font_family: str, max_size: int,
     lo, hi, best = 6, max_size, 6
     while lo <= hi:
         mid = (lo + hi) // 2
-        font = _pil_font(font_family, mid)
+        font = _pil_font(font_family, mid, bold)
         lines = _wrap_lines(text, font, area_w - padding * 2 - stroke_width * 2, tmp_draw)
         total_h = len(lines) * int(mid * 1.3) + padding * 2
         if total_h <= area_h:
@@ -1632,11 +1632,11 @@ class CaptionApp:
                 # Vertical: panel spans full image width; cap_width is the panel height
                 fw = self._frames[0].size[0]
                 size = _fit_font_size(text, self._font_var.get(), max_size,
-                                      fw, width, pad, stroke_w)
+                                      fw, width, pad, stroke_w, bold)
             else:
                 fh = self._frames[0].size[1]
                 size = _fit_font_size(text, self._font_var.get(), max_size,
-                                      width, fh, pad, stroke_w)
+                                      width, fh, pad, stroke_w, bold)
         else:
             size = max_size
 
