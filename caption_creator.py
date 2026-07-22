@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import traceback
 from typing import Optional
 import webbrowser
@@ -129,28 +129,6 @@ _FONT_DIRS = [
 ]
 _FONT_DIR = _FONT_DIRS[0]
 
-_FONT_FILES = {
-    "Arial": "arial.ttf",
-    "Arial Bold": "arialbd.ttf",
-    "Comic Sans MS": "comic.ttf",
-    "Courier New": "cour.ttf",
-    "Georgia": "georgia.ttf",
-    "Impact": "impact.ttf",
-    "Tahoma": "tahoma.ttf",
-    "Times New Roman": "times.ttf",
-    "Trebuchet MS": "trebuc.ttf",
-    "Verdana": "verdana.ttf",
-}
-
-_FONT_BOLD_FILES = {
-    "Arial":          "arialbd.ttf",
-    "Georgia":        "georgiab.ttf",
-    "Tahoma":         "tahomabd.ttf",
-    "Times New Roman":"timesbd.ttf",
-    "Trebuchet MS":   "trebucbd.ttf",
-    "Verdana":        "verdanab.ttf",
-}
-
 _PILL_PRESETS = {
     "Pink":   ("#ffc0cb", "#dd2bbc"),   # (bg, stroke)
     "Blue":   ("#acdeff", "#1d61d1"),
@@ -161,6 +139,12 @@ _AARDVARK_NAME = "Aardvark Cafe"
 _AARDVARK_DAFONT = "https://www.dafont.com/aardvark-cafe.font"
 
 _FORMATS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "formats")
+
+# Formats shipped with the app — overwriting one of these locally is fine,
+# but only these four are pushed/committed to the repo by default.
+_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)"}
+
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
 
 def _load_formats() -> dict:
@@ -203,6 +187,33 @@ def _check_aardvark() -> Optional[str]:
     return _find_font_file("aardc")
 
 
+@functools.lru_cache(maxsize=1)
+def _scan_all_fonts() -> dict:
+    """Return {display_name: file_path} for every font file in the system/user font dirs.
+
+    Display name is read from each file's own name table (family + style, e.g.
+    "Arial", "Arial Bold") so entries match what the font is actually called,
+    not a guess from its filename. Cached — opening every font file is slow
+    enough to notice, and installed fonts don't change while the app is open.
+    """
+    fonts: dict = {}
+    for font_dir in _FONT_DIRS:
+        if not os.path.isdir(font_dir):
+            continue
+        for fname in os.listdir(font_dir):
+            if not fname.lower().endswith((".ttf", ".otf")):
+                continue
+            path = os.path.join(font_dir, fname)
+            try:
+                family, style = ImageFont.truetype(path, 12).getname()
+            except Exception:
+                continue
+            style = (style or "").strip()
+            display = f"{family} {style}" if style and style.lower() != "regular" else family
+            fonts.setdefault(display, path)
+    return fonts
+
+
 @functools.lru_cache(maxsize=256)
 def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     # Special case for Aardvark Cafe
@@ -215,22 +226,13 @@ def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeF
                 pass
         return ImageFont.load_default()
 
-    # Try bold variant first if requested
-    fname = None
-    if bold and family in _FONT_BOLD_FILES:
-        fname = _FONT_BOLD_FILES[family]
-    if fname is None:
-        fname = _FONT_FILES.get(family, "")
-
-    for font_dir in _FONT_DIRS:
-        candidate = os.path.join(font_dir, fname)
-        if os.path.exists(candidate):
-            try:
-                return ImageFont.truetype(candidate, size)
-            except Exception:
-                pass
-    # Fuzzy fallback
-    path = _find_font_file(family)
+    all_fonts = _scan_all_fonts()
+    path = all_fonts.get(f"{family} Bold") if bold else None
+    if path is None:
+        path = all_fonts.get(family)
+    if path is None:
+        # Fuzzy fallback for names the scan didn't match exactly
+        path = _find_font_file(family)
     if path:
         try:
             return ImageFont.truetype(path, size)
@@ -240,7 +242,10 @@ def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeF
 
 
 def _font_list() -> list:
-    fonts = list(_FONT_FILES.keys())
+    """All installed font display names, Aardvark Cafe pinned first if present."""
+    fonts = sorted(_scan_all_fonts().keys(), key=str.casefold)
+    if _AARDVARK_NAME in fonts:
+        fonts.remove(_AARDVARK_NAME)
     if _check_aardvark():
         fonts.insert(0, _AARDVARK_NAME)
     return fonts
@@ -624,6 +629,7 @@ class CaptionApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        self._on_format_change()  # sync all fields to the initially-selected format
         self._auto_detect_watermark()
         self.root.after(100, self._da_update_status)
         if self._warn_aardvark:
@@ -710,6 +716,10 @@ class CaptionApp:
                    command=lambda: self._safe_refresh(debounce_ms=0)).pack(side="right")
         ttk.Button(fmt_bar, text="↺", width=2,
                    command=self._reload_formats).pack(side="right", padx=(0, 2))
+        ttk.Button(fmt_bar, text="Save As…",
+                   command=self._save_format_as).pack(side="right", padx=(0, 2))
+        ttk.Button(fmt_bar, text="Save",
+                   command=self._save_format).pack(side="right", padx=(0, 2))
 
         # Pill preset bar — shown only for X-Change
         self._pill_frame = tk.Frame(right, bg=right.cget("bg"))
@@ -1512,6 +1522,90 @@ class CaptionApp:
         if self._format_var.get() not in self._formats and self._formats:
             self._format_var.set(next(iter(self._formats)))
         self._on_format_change()
+
+    def _collect_format_dict(self, name: str) -> Optional[dict]:
+        """Build a format JSON dict from current UI state.
+
+        Fields with no UI control (shadow, header_enabled, show_pill_presets,
+        layout) are carried over unchanged from the format currently loaded,
+        since editing never touches them.
+        """
+        base = dict(self._formats.get(self._format_var.get(), {}))
+        try:
+            base["name"] = name
+            base["dynamic_width"] = self._dynamic_width_var.get()
+            if self._dynamic_width_var.get():
+                base.pop("cap_panel_size", None)
+            else:
+                base["cap_panel_size"] = self._width_var.get()
+            base["page_bg_color"] = self._page_bg_color
+            base["font_color"] = self._fc_color
+            base["stroke_width"] = self._stroke_width_var.get()
+            base["stroke_color"] = self._stroke_color
+            base["font_family"] = self._font_var.get()
+            base["bold"] = self._bold_var.get()
+            base["padding"] = self._pad_var.get()
+            base["auto_size"] = self._auto_size_var.get()
+            base["align"] = self._align_var.get()
+            base["header_font"] = self._header_font_var.get()
+            base["header_size"] = self._header_size_var.get()
+            base["header_text"] = self._header_text_box.get("1.0", "end-1c")
+            base["footer_enabled"] = self._footer_enabled.get()
+            base["footer_font"] = self._footer_font_var.get()
+            base["footer_size"] = self._footer_size_var.get()
+            base["footer_text"] = self._footer_text_box.get("1.0", "end-1c")
+        except tk.TclError:
+            messagebox.showerror("Invalid Settings",
+                                  "Fix the highlighted fields before saving — "
+                                  "one or more values isn't a valid number.")
+            return None
+        return base
+
+    def _write_format_file(self, name: str, data: dict) -> None:
+        fname = "".join("_" if c in _INVALID_FILENAME_CHARS else c for c in name).strip()
+        path = os.path.join(_FORMATS_DIR, f"{fname}.json")
+        os.makedirs(_FORMATS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        log.info("FORMAT_SAVE  %s", fname)
+
+        self._formats[name] = data
+        self._fmt_combo.config(values=list(self._formats.keys()))
+        self._format_var.set(name)
+
+    def _save_format(self) -> None:
+        """Overwrite the currently selected format with the current UI settings."""
+        name = self._format_var.get()
+        if not name:
+            return
+        if name in _CORE_FORMAT_NAMES:
+            if not messagebox.askyesno(
+                    "Overwrite Built-in Format",
+                    f"'{name}' is one of the app's built-in formats.\n\n"
+                    "Overwriting it only changes your local copy — it won't be "
+                    "pushed or committed unless you say so. Continue?"):
+                return
+        data = self._collect_format_dict(name)
+        if data is None:
+            return
+        self._write_format_file(name, data)
+
+    def _save_format_as(self) -> None:
+        """Save the current UI settings as a brand-new (personal) format."""
+        name = simpledialog.askstring("Save Format As", "New format name:",
+                                       parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self._formats and not messagebox.askyesno(
+                "Overwrite Format", f"A format named '{name}' already exists. Overwrite it?"):
+            return
+        data = self._collect_format_dict(name)
+        if data is None:
+            return
+        self._write_format_file(name, data)
 
     def _on_format_change(self) -> None:
         fmt = self._format_var.get()

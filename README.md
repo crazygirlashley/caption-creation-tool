@@ -9,7 +9,8 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Standard format** — image on the left, styled text panel on the right
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
-- **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; user-selectable font
+- **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; choose from every font installed on your system
+- **Save/Save As formats** — tweak any format's settings and save them under the same name or as a brand-new format; new formats you create are personal and stay out of version control by default
 - **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size when the footer is enabled, or to a manually adjustable pixel height (shown only while the footer is off, since the 2× rule needs a footer size to scale against)
 - **Color eyedropper** — a **Pick** button next to Page BG, Text, and Stroke color swatches lets you click anywhere on the preview image to sample that pixel's color instead of using the color chooser
@@ -111,7 +112,9 @@ Click **Log Out** to clear the cached token (with a confirmation prompt) if you 
 
 ## Custom Formats
 
-Caption styles are defined as JSON files in the `formats/` folder. You can create your own format by adding a new `.json` file there — it will appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
+Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the four built-in formats (`Standard`, `X-Change`, and their `(Vertical)` counterparts) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
+
+You can also hand-edit or drop in a `.json` file directly — it'll appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
 
 Each format file supports the following fields:
 

@@ -10,3 +10,10 @@ da_settings.json
 
 # personal watermark images
 watermark/
+
+# personal caption formats — only the 4 built-in formats are committed by default
+formats/*.json
+!formats/Standard.json
+!formats/Standard (Vertical).json
+!formats/X-Change.json
+!formats/X-Change (Vertical).json
