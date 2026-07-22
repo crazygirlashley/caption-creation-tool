@@ -268,6 +268,21 @@ def _human_size(num_bytes: float) -> str:
     return f"{num_bytes:.1f} GB"
 
 
+def _pad_to_macro_block(arr: np.ndarray, block: int = 16) -> np.ndarray:
+    """Pad a HxWx3 array on the bottom/right (edge-replicated) so both
+    dimensions are multiples of `block`. Caption widths/heights are
+    arbitrary user-chosen integers, essentially never a multiple of 16, so
+    without this imageio/ffmpeg silently stretches every MP4 frame to the
+    nearest multiple — a real (if small) content distortion, not just a
+    cosmetic warning."""
+    h, w = arr.shape[:2]
+    pad_h = (-h) % block
+    pad_w = (-w) % block
+    if pad_h == 0 and pad_w == 0:
+        return arr
+    return np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
 def _hex_to_rgb(color: str) -> tuple:
     h = color.lstrip("#")
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -420,6 +435,7 @@ def build_composite(
     footer_size: int = 16,
     watermark_path: str = "",
     watermark_height: int = 60,
+    output_size_pct: float = 0.0,
 ) -> Image.Image:
     frame = frame.convert("RGBA")
     fw, fh = frame.size
@@ -498,12 +514,22 @@ def build_composite(
         out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3)))
         out.alpha_composite(txt_img)
 
-    # Enforce a minimum final output size — upscale (never downscale) preserving
-    # aspect ratio, so small sources don't distort when stretched to fit both axes.
-    scale = max(1.0, _MIN_OUTPUT_W / total_w, _MIN_OUTPUT_H / total_h)
-    if scale > 1.0:
-        new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
-        new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
+    # Enforce a minimum final output size — upscale (never downscale by
+    # default) preserving aspect ratio, so small sources don't distort when
+    # stretched to fit both axes. output_size_pct (0-100) then slides between
+    # that same 1280x720-touching scale (0%) and today's default — natural
+    # size, or the 1280x720 floor if natural is smaller (100%). For sources
+    # already bigger than the floor, this lets 0% genuinely downscale (for a
+    # smaller file) without stretching, since both ends are uniform scales of
+    # the same natural aspect ratio; for sources smaller than the floor, the
+    # two ends coincide (there's no room to shrink below the hard floor).
+    floor_scale = max(_MIN_OUTPUT_W / total_w, _MIN_OUTPUT_H / total_h)
+    default_scale = max(1.0, floor_scale)
+    pct = max(0.0, min(100.0, output_size_pct)) / 100.0
+    scale = floor_scale + (default_scale - floor_scale) * pct
+    new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
+    new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
+    if (new_w, new_h) != (total_w, total_h):
         out = out.resize((new_w, new_h), Image.LANCZOS)
 
     return out
@@ -554,6 +580,13 @@ class CaptionApp:
         self._size_var = tk.IntVar(value=72)
         self._width_var = tk.IntVar(value=320)
         self._dynamic_width_var = tk.BooleanVar(value=True)
+        # 100% = today's default output size (natural size, or the enforced
+        # 1280x720 floor if natural is smaller); 0% shrinks it — aspect ratio
+        # preserved, no stretching — down to that same 1280x720 floor, which
+        # is only a real downscale when the natural size exceeds it. See
+        # build_composite()'s output_size_pct handling.
+        self._output_override_var = tk.BooleanVar(value=False)
+        self._output_pct_var = tk.IntVar(value=100)
         self._pad_var = tk.IntVar(value=20)
         self._stroke_width_var = tk.IntVar(value=0)
         self._auto_size_var = tk.BooleanVar(value=True)
@@ -650,6 +683,17 @@ class CaptionApp:
         pf = ttk.LabelFrame(self.root, text="Preview", padding=4)
         pf.pack(side="left", fill="both", expand=True, padx=(4, 2), pady=(0, 4))
         self._preview_frame = pf
+
+        ttk.Checkbutton(pf, text="Output Size Override", variable=self._output_override_var,
+                        command=self._on_output_override_toggle).pack(side="top", anchor="w")
+        self._output_pct_row = ttk.Frame(pf)
+        self._output_pct_row.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Scale(self._output_pct_row, from_=0, to=100, orient="horizontal",
+                  variable=self._output_pct_var).pack(side="left", fill="x", expand=True)
+        self._output_pct_label = ttk.Label(self._output_pct_row, text="100%", width=5)
+        self._output_pct_label.pack(side="left", padx=(6, 0))
+        self._output_pct_row.pack_forget()  # hidden until the toggle above is checked
+
         self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
@@ -705,8 +749,10 @@ class CaptionApp:
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._header_font_var, self._header_size_var,
                   self._footer_font_var, self._footer_size_var,
-                  self._watermark_height_var):
+                  self._watermark_height_var, self._output_pct_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
+        self._output_pct_var.trace_add(
+            "write", lambda *_: self._output_pct_label.config(text=f"{self._output_pct_var.get()}%"))
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
 
     def _row(self, parent, r, label, widget, pady=4):
@@ -968,6 +1014,13 @@ class CaptionApp:
     def _on_dynamic_width_toggle(self) -> None:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
         self._apply_dynamic_width()
+
+    def _on_output_override_toggle(self) -> None:
+        if self._output_override_var.get():
+            self._output_pct_row.pack(side="top", fill="x", pady=(0, 4), before=self._canvas)
+        else:
+            self._output_pct_row.pack_forget()
+        self._safe_refresh()
 
     def _apply_dynamic_width(self) -> None:
         """When Dynamic Width is enabled, override cap width with 1.25x the image width."""
@@ -1383,7 +1436,10 @@ class CaptionApp:
         try:
             for i, frame in enumerate(self._iter_export_frames()):
                 composited = build_composite(frame, **params)
-                writer.append_data(np.array(composited.convert("RGB")))
+                arr = np.array(composited.convert("RGB"))
+                if as_mp4:
+                    arr = _pad_to_macro_block(arr)
+                writer.append_data(arr)
                 if i % 20 == 0 or i == total - 1:
                     self._status.config(text=f"{base_status}  [Exporting frame {i + 1}/{total}…]")
                     self.root.update_idletasks()
@@ -1612,6 +1668,8 @@ class CaptionApp:
                 footer_size=footer_sz,
                 watermark_path=self._watermark_path,
                 watermark_height=wm_h,
+                output_size_pct=(self._output_pct_var.get()
+                                 if self._output_override_var.get() else 100),
             )
         except tk.TclError:
             return None
