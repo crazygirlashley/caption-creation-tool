@@ -10,6 +10,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
 - **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; choose from every font installed on your system
+- **Caption side** — for horizontal-layout formats, place the caption panel to the left or right of the image (defaults to right); hidden for vertical-layout formats, which always caption below the image
 - **Save/Save As formats** — tweak any format's settings and save them under the same name or as a brand-new format; new formats you create are personal and stay out of version control by default
 - **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size when the footer is enabled, or to a manually adjustable pixel height (shown only while the footer is off, since the 2× rule needs a footer size to scale against)
@@ -19,6 +20,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Minimum output size** — final output is upscaled (never downscaled, aspect ratio preserved) to at least 1280×720 if the source is smaller; the Preview panel label shows the actual output size next to the on-screen preview, which can still display smaller to fit the window
 - **Output Size Override** — a checkbox above the Preview panel that reveals a 0–100% slider once checked: 100% is today's default (the composite's natural size, or the enforced 1280×720 floor if it's smaller), 0% shrinks it — aspect ratio preserved, no stretching — down to that same 1280×720 floor. Only a real downscale when the natural size is already bigger than the floor; small sources have no room to shrink below it, so both ends coincide
 - **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM); either way, **Save** and **Send to DA** composite and write one frame at a time straight to the output file instead of building the whole thing in memory first, so exporting doesn't need to hold the full file in RAM regardless of length
+- **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
 - **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
@@ -134,6 +136,7 @@ Each format file supports the following fields:
 | `dynamic_width` | bool | Auto-set the caption panel size to 1.25× the source image/GIF/video width, overriding `cap_panel_size`. Locks the Caption Width/Height spinbox in the UI while active |
 | `shadow` | bool | Drop shadow on all overlaid text |
 | `align` | `"left"` / `"center"` / `"right"` | Caption text alignment |
+| `caption_side` | `"left"` / `"right"` | Which side of the image the caption panel sits on (horizontal layout only; ignored for `"vertical"`) |
 | `show_pill_presets` | bool | Show pill color preset buttons |
 | `header_enabled` | bool | Show title overlay on image |
 | `header_text` | string | Default title text |

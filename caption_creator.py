@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
+import ctypes
 import functools
 import json
 import logging
 import logging.handlers
 import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -431,6 +434,7 @@ def build_composite(
     align: str = "center",
     fmt: str = "Standard",
     layout: str = "horizontal",
+    caption_side: str = "right",
     header_text: str = "",
     header_font: str = "Arial Bold",
     header_size: int = 28,
@@ -445,10 +449,19 @@ def build_composite(
     frame = frame.convert("RGBA")
     fw, fh = frame.size
 
-    # Panel geometry — cap_width acts as height in vertical layout
+    # Panel geometry — cap_width acts as height in vertical layout.
+    # Horizontal layouts can put the caption panel on either side of the
+    # image; image_x tracks where the image itself starts so the
+    # watermark/footer/header overlays below (all anchored to the image,
+    # not the canvas) shift along with it.
+    image_x = 0
     if layout == "vertical":
         panel_x, panel_y, panel_w, panel_h = 0, fh, fw, cap_width
         total_w, total_h = fw, fh + cap_width
+    elif caption_side == "left":
+        panel_x, panel_y, panel_w, panel_h = 0, 0, cap_width, fh
+        image_x = cap_width
+        total_w, total_h = fw + cap_width, fh
     else:
         panel_x, panel_y, panel_w, panel_h = fw, 0, cap_width, fh
         total_w, total_h = fw + cap_width, fh
@@ -456,7 +469,7 @@ def build_composite(
     out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 255))
     draw = ImageDraw.Draw(out)
 
-    out.paste(frame, (0, 0), frame)
+    out.paste(frame, (image_x, 0), frame)
     out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
               (panel_x, panel_y))
 
@@ -478,7 +491,7 @@ def build_composite(
                      align=align)
 
     # Watermark — bottom-left of image; track right edge for footer placement
-    wm_right = 8
+    wm_right = image_x + 8
     if watermark_path and os.path.exists(watermark_path):
         try:
             wm = Image.open(watermark_path).convert("RGBA")
@@ -486,15 +499,15 @@ def build_composite(
             wm = wm.resize((max(1, int(wm.width * scale)), watermark_height), Image.LANCZOS)
             wy = fh - watermark_height - 8
             if wy >= 0:
-                out.alpha_composite(wm, (8, wy))
-                wm_right = 8 + wm.width + 6
+                out.alpha_composite(wm, (image_x + 8, wy))
+                wm_right = image_x + 8 + wm.width + 6
         except Exception:
             pass
 
     # Footer text — overlaid on bottom-left of image, to the right of watermark
     if footer_enabled and footer_text.strip():
         fnt = _pil_font(footer_font, footer_size)
-        avail_w = fw - wm_right - 8
+        avail_w = fw - (wm_right - image_x) - 8
         if avail_w > 20:
             lines = _wrap_lines(footer_text.strip(), fnt, avail_w, txt_draw)
             line_h = txt_draw.textbbox((0, 0), "Ag", font=fnt)[3] + 2
@@ -511,7 +524,7 @@ def build_composite(
     # Title text overlaid at top-left corner of image
     if header_text.strip():
         fnt = _pil_font(header_font, header_size)
-        _draw_text_overlay(txt_draw, (8, 8), header_text.strip(), fnt,
+        _draw_text_overlay(txt_draw, (image_x + 8, 8), header_text.strip(), fnt,
                            font_color, stroke_width, stroke_color, shd_draw_ctx)
 
     # Composite shadow (single blur) then actual text on top
@@ -538,6 +551,75 @@ def build_composite(
         out = out.resize((new_w, new_h), Image.LANCZOS)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# GIF/MP4 export worker
+#
+# Exporting runs in a separate `python caption_creator.py --export-worker
+# <job.json>` process with its own detached console window (see
+# CaptionApp._run_export_in_console), rather than on the GUI's Tk thread —
+# a large export used to block the main loop long enough for Windows to mark
+# the app "Not Responding". The worker always re-reads frames from the
+# original source file on disk (never from the GUI's in-memory frame list,
+# which isn't shared across processes) and exits — closing its console —
+# as soon as the export finishes or fails.
+# ---------------------------------------------------------------------------
+
+def _iter_frames_from_path(path: str, kind: str):
+    """Yield PIL RGBA frames decoded straight from a GIF/MP4 file on disk."""
+    if kind == "mp4":
+        reader = imageio.get_reader(path, "ffmpeg")
+        try:
+            for frame in reader:
+                yield Image.fromarray(frame).convert("RGBA")
+        finally:
+            reader.close()
+    else:
+        img = Image.open(path)
+        for frm in ImageSequence.Iterator(img):
+            yield frm.copy().convert("RGBA")
+
+
+def _export_worker_main(job_path: str) -> None:
+    with open(job_path, "r", encoding="utf-8") as f:
+        job = json.load(f)
+
+    source_path = job["source_path"]
+    kind = job["kind"]
+    output_path = job["output_path"]
+    as_mp4 = job["as_mp4"]
+    params = job["params"]
+    fps = job["fps"]
+    total = job["total_frames"]
+    durations = job.get("durations")
+
+    try:
+        ctypes.windll.kernel32.SetConsoleTitleW("Caption Creator — Exporting…")
+    except Exception:
+        pass
+
+    print(f"Exporting {os.path.basename(output_path)}  ({total} frames, {fps:.2f} fps)")
+    print("This window closes automatically when the export finishes.\n")
+
+    if as_mp4:
+        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+    else:
+        duration = durations if durations else max(1, round(1000 / fps))
+        writer = imageio.get_writer(output_path, mode="I", duration=duration, loop=0)
+
+    try:
+        for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
+            composited = build_composite(frame, **params)
+            arr = np.array(composited.convert("RGB"))
+            if as_mp4:
+                arr = _pad_to_macro_block(arr)
+            writer.append_data(arr)
+            if i % 20 == 0 or i == total - 1:
+                print(f"\rExporting frame {i + 1}/{total}…", end="", flush=True)
+    finally:
+        writer.close()
+    print("\nDone.")
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +679,7 @@ class CaptionApp:
         self._auto_size_var = tk.BooleanVar(value=True)
         self._bold_var = tk.BooleanVar(value=False)
         self._align_var = tk.StringVar(value="center")
+        self._side_var = tk.StringVar(value="right")
 
         # Formats (loaded from formats/ dir)
         self._formats: dict = _load_formats()
@@ -757,7 +840,7 @@ class CaptionApp:
         # Traces
         for v in (self._font_var, self._size_var, self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
-                  self._align_var, self._header_font_var, self._header_size_var,
+                  self._align_var, self._side_var, self._header_font_var, self._header_size_var,
                   self._footer_font_var, self._footer_size_var,
                   self._watermark_height_var, self._output_pct_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
@@ -809,6 +892,18 @@ class CaptionApp:
         align_row.grid(row=r, column=1, sticky="w", padx=6)
         for label, value in (("←", "left"), ("↔", "center"), ("→", "right")):
             ttk.Radiobutton(align_row, text=label, variable=self._align_var,
+                            value=value).pack(side="left", padx=2)
+        r += 1
+
+        # Only meaningful for horizontal-layout formats — vertical formats
+        # always put the caption below the image, so this row is hidden for
+        # them (see _update_side_visibility, called from _on_format_change).
+        self._side_label = ttk.Label(f, text="Caption Side:")
+        self._side_label.grid(row=r, column=0, sticky="w", pady=4)
+        self._side_row = ttk.Frame(f)
+        self._side_row.grid(row=r, column=1, sticky="w", padx=6)
+        for label, value in (("Left", "left"), ("Right", "right")):
+            ttk.Radiobutton(self._side_row, text=label, variable=self._side_var,
                             value=value).pack(side="left", padx=2)
         r += 1
 
@@ -1052,6 +1147,17 @@ class CaptionApp:
         else:
             self._wm_height_label.grid()
             self._wm_height_spin.grid()
+
+    def _update_side_visibility(self) -> None:
+        """Caption Side only applies to horizontal-layout formats — vertical
+        formats always place the caption below the image."""
+        fmt_data = self._formats.get(self._format_var.get(), {})
+        if fmt_data.get("layout") == "vertical":
+            self._side_label.grid_remove()
+            self._side_row.grid_remove()
+        else:
+            self._side_label.grid()
+            self._side_row.grid()
 
     def _apply_preset(self, bg: str, stroke: str) -> None:
         self._page_bg_color = bg
@@ -1392,73 +1498,60 @@ class CaptionApp:
                 return 1000.0 / avg_ms
         return 10.0
 
-    def _iter_export_frames(self):
-        """Yield PIL frames of the current file, one at a time, for export.
-        Streams directly from disk if the source is deferred — so exporting
-        a huge GIF/video never needs more than a single frame in memory at
-        once, regardless of its total length — or yields from the frames
-        already loaded in self._frames otherwise."""
-        if self._deferred_path:
-            path, kind = self._deferred_path, self._deferred_kind
-            if kind == "mp4":
-                reader = imageio.get_reader(path, "ffmpeg")
-                try:
-                    for frame in reader:
-                        yield Image.fromarray(frame).convert("RGBA")
-                finally:
-                    reader.close()
-            else:
-                img = Image.open(path)
-                for frm in ImageSequence.Iterator(img):
-                    yield frm.copy().convert("RGBA")
-        else:
-            yield from self._frames
-
-    def _stream_export(self, output_path: str, as_mp4: bool) -> None:
-        """Composite and write every frame of the current file directly to
-        output_path, one frame at a time, instead of building the full
-        source and composited frame lists first — this is what makes it
-        possible to export files too large to ever fully fit in RAM at once.
-        Updates self._status with progress as it goes; the caller is
-        responsible for restoring the status text afterward."""
-        params = self._collect_render_params()
-        if params is None:
-            raise RuntimeError("Invalid render parameters")
-
+    def _run_export_in_console(self, output_path: str, as_mp4: bool, params: dict,
+                                on_success, on_error) -> None:
+        """Spawn a detached `--export-worker` subprocess (its own console
+        window) to stream the GIF/MP4 export, instead of doing it on the Tk
+        main thread — a large export used to block the main loop long enough
+        for Windows to mark the window "Not Responding". The console closes
+        on its own when the export finishes; on_success()/on_error() (no
+        args) are invoked on the main thread once the subprocess exits."""
         total = self._deferred_total_frames if self._deferred_path else len(self._frames)
         fps = self._export_fps()
+        # Getting exact per-frame GIF durations requires the durations already
+        # loaded in memory — the worker process re-reads frames from disk and
+        # has no access to those, so deferred (never-fully-loaded) sources and
+        # MP4 output fall back to one uniform duration derived from fps.
+        durations = (list(self._durations)
+                     if (not self._deferred_path and not as_mp4) else None)
 
-        if as_mp4:
-            writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
-        else:
-            if self._deferred_path:
-                # Streaming from disk — getting exact per-frame durations would
-                # need a second full pass just to read timing metadata, so
-                # large/deferred GIFs use one uniform duration derived from fps
-                # instead. Already-loaded files keep their exact per-frame
-                # durations below, since those are already in memory for free.
-                duration = max(1, round(1000 / fps))
-            else:
-                duration = self._durations if self._durations else max(1, round(1000 / fps))
-            writer = imageio.get_writer(output_path, mode="I", duration=duration, loop=0)
+        job = {
+            "source_path": self._source_path,
+            "kind": "mp4" if self._is_video else "gif",
+            "output_path": output_path,
+            "as_mp4": as_mp4,
+            "params": params,
+            "fps": fps,
+            "total_frames": total,
+            "durations": durations,
+        }
+        job_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8")
+        json.dump(job, job_file)
+        job_file.close()
 
-        base_status = self._status.cget("text")
-        try:
-            for i, frame in enumerate(self._iter_export_frames()):
-                composited = build_composite(frame, **params)
-                arr = np.array(composited.convert("RGB"))
-                if as_mp4:
-                    arr = _pad_to_macro_block(arr)
-                writer.append_data(arr)
-                if i % 20 == 0 or i == total - 1:
-                    self._status.config(text=f"{base_status}  [Exporting frame {i + 1}/{total}…]")
-                    self.root.update_idletasks()
-        finally:
-            writer.close()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--export-worker", job_file.name],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+
+        def _wait() -> None:
+            rc = proc.wait()
+            try:
+                os.unlink(job_file.name)
+            except OSError:
+                pass
+            self.root.after(0, on_success if rc == 0 else on_error)
+
+        threading.Thread(target=_wait, daemon=True).start()
 
     def _save(self) -> None:
         if not self._cache:
             messagebox.showwarning("Nothing to save", "Open an image, GIF, or video first.")
+            return
+        if getattr(self, "_export_in_progress", False):
+            messagebox.showinfo("Export Running",
+                                 "An export is already in progress — check its console window.")
             return
 
         if self._is_anim:
@@ -1473,18 +1566,31 @@ class CaptionApp:
             if not path:
                 return
 
-            # Streams frame-by-frame (see _stream_export) instead of building the
-            # full source and composited frame lists first, regardless of whether
-            # the source is still deferred (a large-file placeholder) or fully loaded.
+            params = self._collect_render_params()
+            if params is None:
+                return
+
+            # Exported by a detached console subprocess (see
+            # _run_export_in_console) instead of building the full source and
+            # composited frame lists first on the Tk thread.
             self._build_cancel.set()
             if self._refresh_job:
                 self.root.after_cancel(self._refresh_job)
                 self._refresh_job = None
             base_status = self._status.cget("text").replace(" [Rendering…]", "")
-            try:
-                self._stream_export(path, as_mp4=path.lower().endswith(".mp4"))
-            except Exception:
-                log.exception("SAVE_RENDER_ERROR")
+            self._status.config(text=base_status + " [Exporting in console window…]")
+            self._export_in_progress = True
+
+            def _on_success() -> None:
+                self._export_in_progress = False
+                self._status.config(text=base_status)
+                log.info("FILE_SAVE  %s", os.path.basename(path))
+                messagebox.showinfo("Saved", f"Saved:\n{path}")
+
+            def _on_error() -> None:
+                self._export_in_progress = False
+                self._status.config(text=base_status)
+                log.error("SAVE_RENDER_ERROR — see console window / crash log")
                 # A failed streaming export leaves a truncated file at the
                 # destination path rather than a separate temp file — remove it
                 # so a partial/corrupt file isn't left where a good one was expected.
@@ -1493,20 +1599,21 @@ class CaptionApp:
                 except OSError:
                     pass
                 messagebox.showerror("Render Error", "Failed to render/export all frames for saving.")
-                return
-            finally:
-                self._status.config(text=base_status)
-        else:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".png",
-                filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("BMP", "*.bmp")],
-            )
-            if not path:
-                return
-            out = self._cache[0]
-            if path.lower().endswith((".jpg", ".jpeg")):
-                out = out.convert("RGB")
-            out.save(path)
+
+            self._run_export_in_console(path, path.lower().endswith(".mp4"),
+                                         params, _on_success, _on_error)
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("BMP", "*.bmp")],
+        )
+        if not path:
+            return
+        out = self._cache[0]
+        if path.lower().endswith((".jpg", ".jpeg")):
+            out = out.convert("RGB")
+        out.save(path)
 
         log.info("FILE_SAVE  %s", os.path.basename(path))
         messagebox.showinfo("Saved", f"Saved:\n{path}")
@@ -1547,6 +1654,7 @@ class CaptionApp:
             base["padding"] = self._pad_var.get()
             base["auto_size"] = self._auto_size_var.get()
             base["align"] = self._align_var.get()
+            base["caption_side"] = self._side_var.get()
             base["header_font"] = self._header_font_var.get()
             base["header_size"] = self._header_size_var.get()
             base["header_text"] = self._header_text_box.get("1.0", "end-1c")
@@ -1629,6 +1737,8 @@ class CaptionApp:
         self._pad_var.set(data.get("padding", 20))
         self._auto_size_var.set(data.get("auto_size", False))
         self._align_var.set(data.get("align", "center"))
+        self._side_var.set(data.get("caption_side", "right"))
+        self._update_side_visibility()
 
         # Panel size and label
         self._dynamic_width_var.set(data.get("dynamic_width", False))
@@ -1742,6 +1852,7 @@ class CaptionApp:
             align=self._align_var.get(),
             fmt=fmt,
             layout=layout,
+            caption_side=self._side_var.get(),
         )
 
         if header_enabled:
@@ -2114,40 +2225,67 @@ class CaptionApp:
                 self._da_in_progress = False
                 return
 
-        # Write temp file. Animated content streams frame-by-frame (see
-        # _stream_export) instead of building the full source and composited
-        # frame lists first, regardless of whether the source is still
-        # deferred (a large-file placeholder) or fully loaded.
-        import tempfile
+        # Write temp file. Animated content is exported by a detached console
+        # subprocess (see _run_export_in_console), same as Save, regardless of
+        # whether the source is still deferred (a large-file placeholder) or
+        # fully loaded.
         suffix = (".mp4" if upload_format == "mp4" else ".gif") if self._is_anim else ".png"
         self._build_cancel.set()
         if self._refresh_job:
             self.root.after_cancel(self._refresh_job)
             self._refresh_job = None
         base_status = self._status.cget("text").replace(" [Rendering…]", "")
-        tmp_path = None
-        try:
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            tmp_path = tmp.name
-            tmp.close()
-            if self._is_anim:
-                self._stream_export(tmp_path, as_mp4=(upload_format == "mp4"))
-            else:
-                self._cache[0].save(tmp_path)
-        except Exception:
-            log.exception("DA_SEND_EXPORT_ERROR")
-            self._da_in_progress = False
-            if tmp_path:
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        if self._is_anim:
+            params = self._collect_render_params()
+            if params is None:
+                self._da_in_progress = False
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+                return
+
+            self._status.config(text=base_status + " [Exporting in console window…]")
+
+            def _on_export_success() -> None:
+                self._status.config(text=base_status)
+                self._start_da_upload(client_id, tmp_path, title, description)
+
+            def _on_export_error() -> None:
+                self._status.config(text=base_status)
+                self._da_in_progress = False
+                log.error("DA_SEND_EXPORT_ERROR — see console window / crash log")
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
+
+            self._run_export_in_console(tmp_path, upload_format == "mp4",
+                                         params, _on_export_success, _on_export_error)
+            return
+
+        try:
+            self._cache[0].save(tmp_path)
+        except Exception:
+            log.exception("DA_SEND_EXPORT_ERROR")
+            self._da_in_progress = False
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
             return
-        finally:
-            self._status.config(text=base_status)
+        self._status.config(text=base_status)
+        self._start_da_upload(client_id, tmp_path, title, description)
 
-        # Upload runs in a background thread; token must already be cached (use DA Login first)
+    def _start_da_upload(self, client_id: str, tmp_path: str, title: str, description: str) -> None:
+        """Upload the already-rendered tmp_path to DeviantArt as a private draft,
+        in a background thread; token must already be cached (use DA Login first)."""
         self._status.config(text=self._status.cget("text") + " [Saving draft…]")
 
         def _upload():
@@ -2290,4 +2428,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--export-worker":
+        _export_worker_main(sys.argv[2])
+    else:
+        main()
