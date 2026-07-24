@@ -319,23 +319,34 @@ def _hex_to_rgb(color: str) -> tuple:
 
 def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
                 draw: ImageDraw.ImageDraw) -> list:
+    # Measures each word once and sums cached widths, rather than
+    # re-measuring the whole accumulated line on every word (that earlier
+    # approach was near-quadratic in words-per-line — negligible for a
+    # short caption, but for a few hundred words wrapped into a narrow
+    # panel at a small auto-fit font size, i.e. many words per line, it was
+    # the actual multi-second cost behind the UI going "Not Responding" on
+    # a large paste). This ignores inter-word kerning, which is visually
+    # indistinguishable from the exact measurement in practice.
+    space_w = draw.textbbox((0, 0), " ", font=font)[2]
     lines = []
     for paragraph in (text.splitlines() or [""]):
         words = paragraph.split()
         if not words:
             lines.append("")
             continue
-        current = ""
+        current_words: list = []
+        current_w = 0
         for word in words:
-            trial = f"{current} {word}".strip()
-            w = draw.textbbox((0, 0), trial, font=font)[2]
-            if w <= max_px:
-                current = trial
+            word_w = draw.textbbox((0, 0), word, font=font)[2]
+            added_w = word_w if not current_words else space_w + word_w
+            if current_words and current_w + added_w > max_px:
+                lines.append(" ".join(current_words))
+                current_words = [word]
+                current_w = word_w
             else:
-                if current:
-                    lines.append(current)
-                current = word
-        lines.append(current)
+                current_words.append(word)
+                current_w += added_w
+        lines.append(" ".join(current_words))
     return lines
 
 
@@ -2067,7 +2078,12 @@ class CaptionApp:
         )
 
     def _refresh_preview(self) -> None:
-        """Build the first frame only on the main thread for immediate visual feedback."""
+        """Build the first frame in a background thread and post it back when
+        done, instead of blocking the main thread — Auto-fit's font-size
+        search does many text-measurement passes, which for a large caption
+        (a few hundred words) can take long enough to trip Windows' "Not
+        Responding" state if run inline. A newer call supersedes any build
+        still in flight."""
         if not self._frames:
             return
         self._stop_anim()
@@ -2076,19 +2092,38 @@ class CaptionApp:
         if params is None:
             return
 
-        t0 = time.perf_counter()
-        try:
-            first = build_composite(self._frames[0], **params)
-        except Exception:
-            log.exception("PREVIEW_ERROR")
-            return
-        elapsed = time.perf_counter() - t0
-        if elapsed > 0.5:
-            log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
+        self._build_cancel.set()
+        self._build_cancel = threading.Event()
+        cancel = self._build_cancel
+        frame = self._frames[0]
 
+        txt = self._status.cget("text")
+        if "[Rendering" not in txt:
+            self._status.config(text=txt + " [Rendering…]")
+
+        def _build() -> None:
+            t0 = time.perf_counter()
+            try:
+                first = build_composite(frame, **params)
+            except Exception:
+                log.exception("PREVIEW_ERROR")
+                return
+            elapsed = time.perf_counter() - t0
+            if elapsed > 0.5:
+                log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
+            if not cancel.is_set():
+                self.root.after(0, lambda r=first: self._on_preview_built(r))
+
+        threading.Thread(target=_build, daemon=True).start()
+
+    def _on_preview_built(self, first: Image.Image) -> None:
+        """Called on the main thread when the background single-frame
+        preview build finishes."""
         self._cache = [first]
         self._cache_complete = not self._is_anim
         self._anim_idx = 0
+        txt = self._status.cget("text")
+        self._status.config(text=txt.replace(" [Rendering…]", ""))
         self._update_preview_label()
         self._redraw()
 
