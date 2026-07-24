@@ -261,6 +261,11 @@ def _font_list() -> list:
 _MIN_OUTPUT_W = 1280
 _MIN_OUTPUT_H = 720
 
+# Ceiling the Auto-fit binary search grows toward — the Font Size field just
+# displays whatever size that search lands on, it's not itself a cap (see
+# CaptionApp._collect_render_params).
+_MAX_AUTO_FONT_SIZE = 200
+
 # Raw RGBA frame-data threshold above which we warn before loading a GIF/video.
 # The app holds source frames AND a separately-rendered cache simultaneously
 # (plus temporary RGB copies during save/upload), so actual peak usage runs
@@ -665,6 +670,10 @@ class CaptionApp:
         available_fonts = _font_list()
         self._font_var = tk.StringVar(value=available_fonts[0] if available_fonts else "Arial")
         self._size_var = tk.IntVar(value=72)
+        # Set while _collect_render_params programmatically updates _size_var
+        # to reflect Auto-fit's computed size, so that write doesn't loop
+        # back into another refresh via the trace below.
+        self._updating_size_display = False
         self._width_var = tk.IntVar(value=320)
         self._dynamic_width_var = tk.BooleanVar(value=True)
         # 100% = today's default output size (natural size, or the enforced
@@ -838,12 +847,18 @@ class CaptionApp:
         self._build_watermark_tab(wm_tab)
 
         # Traces
-        for v in (self._font_var, self._size_var, self._width_var, self._pad_var,
+        for v in (self._font_var, self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._side_var, self._header_font_var, self._header_size_var,
                   self._footer_font_var, self._footer_size_var,
                   self._watermark_height_var, self._output_pct_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
+        # _size_var also gets programmatically overwritten by Auto-fit itself
+        # (see _collect_render_params) — skip those writes so they don't
+        # recurse back into another refresh.
+        self._size_var.trace_add(
+            "write",
+            lambda *_: None if self._updating_size_display else self._safe_refresh())
         self._output_pct_var.trace_add(
             "write", lambda *_: self._output_pct_label.config(text=f"{self._output_pct_var.get()}%"))
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
@@ -907,8 +922,8 @@ class CaptionApp:
                             value=value).pack(side="left", padx=2)
         r += 1
 
-        ttk.Label(f, text="Max Font Size:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=8, to=200, textvariable=self._size_var,
+        ttk.Label(f, text="Font Size:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Spinbox(f, from_=8, to=_MAX_AUTO_FONT_SIZE, textvariable=self._size_var,
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
@@ -930,10 +945,11 @@ class CaptionApp:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
         r += 1
 
-        ttk.Checkbutton(f, text="Dynamic Width (1.25× image width)",
-                        variable=self._dynamic_width_var,
-                        command=self._on_dynamic_width_toggle).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._dynamic_width_check = ttk.Checkbutton(
+            f, text="Dynamic Width (1.25× image width)",
+            variable=self._dynamic_width_var,
+            command=self._on_dynamic_width_toggle)
+        self._dynamic_width_check.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
 
         ttk.Label(f, text="Padding:").grid(row=r, column=0, sticky="w", pady=4)
@@ -1128,11 +1144,15 @@ class CaptionApp:
         self._safe_refresh()
 
     def _apply_dynamic_width(self) -> None:
-        """When Dynamic Width is enabled, override cap width with 1.25x the image width."""
+        """When Dynamic Width/Height is enabled, override the caption panel
+        size with 1.25x the source image's width (horizontal layout) or
+        height (vertical layout, where cap_width acts as the panel height)."""
         if not self._dynamic_width_var.get() or not self._frames:
             return
-        fw = self._frames[0].size[0]
-        self._width_var.set(int(round(fw * 1.25)))
+        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        fw, fh = self._frames[0].size
+        src = fh if layout == "vertical" else fw
+        self._width_var.set(int(round(src * 1.25)))
 
     def _on_footer_toggle(self) -> None:
         self._update_watermark_height_visibility()
@@ -1747,8 +1767,10 @@ class CaptionApp:
             self._width_var.set(data["cap_panel_size"])
         if data.get("layout") == "vertical":
             self._cap_size_label.config(text="Caption Height:")
+            self._dynamic_width_check.config(text="Dynamic Height (1.25× image height)")
         else:
             self._cap_size_label.config(text="Caption Width:")
+            self._dynamic_width_check.config(text="Dynamic Width (1.25× image width)")
 
         # Header
         hfont = data.get("header_font", "Arial")
@@ -1812,7 +1834,7 @@ class CaptionApp:
         """Return all build_composite kwargs from current UI state, or None if invalid."""
         text = self._text_box.get("1.0", "end-1c")
         try:
-            max_size = self._size_var.get()
+            field_size = self._size_var.get()
             width = self._width_var.get()
             pad = self._pad_var.get()
             stroke_w = self._stroke_width_var.get()
@@ -1835,14 +1857,23 @@ class CaptionApp:
             if layout == "vertical":
                 # Vertical: panel spans full image width; cap_width is the panel height
                 fw = self._frames[0].size[0]
-                size = _fit_font_size(text, self._font_var.get(), max_size,
+                size = _fit_font_size(text, self._font_var.get(), _MAX_AUTO_FONT_SIZE,
                                       fw, width, pad, stroke_w, bold)
             else:
                 fh = self._frames[0].size[1]
-                size = _fit_font_size(text, self._font_var.get(), max_size,
+                size = _fit_font_size(text, self._font_var.get(), _MAX_AUTO_FONT_SIZE,
                                       width, fh, pad, stroke_w, bold)
+            # Reflect the size Auto-fit actually landed on in the Font Size
+            # field. Guarded so this programmatic update doesn't re-trigger
+            # the field's own write-trace and recurse back into a refresh.
+            if size != field_size:
+                self._updating_size_display = True
+                try:
+                    self._size_var.set(size)
+                finally:
+                    self._updating_size_display = False
         else:
-            size = max_size
+            size = field_size
 
         kwargs: dict = dict(
             stroke_width=stroke_w,

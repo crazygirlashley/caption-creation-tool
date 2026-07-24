@@ -47,4 +47,8 @@ if "%LOCAL_REV%"=="%REMOTE_REV%" (
 
 :run
 python "%SCRIPT_DIR%caption_creator.py"
-pause
+if errorlevel 1 (
+    echo.
+    echo Caption Creator exited with an error -- see above.
+    pause
+)
