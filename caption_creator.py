@@ -439,6 +439,32 @@ def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
         ty += line_h
 
 
+def _panel_total_size(fw: int, fh: int, cap_width: int, layout: str) -> tuple:
+    """Composite dimensions before the minimum-output-size floor/override
+    scaling — shared by build_composite and the Output Size Override
+    slider's default-position calculation (CaptionApp._default_output_pct)."""
+    if layout == "vertical":
+        return fw, fh + cap_width
+    return fw + cap_width, fh
+
+
+def _output_scale_bounds(total_w: int, total_h: int) -> tuple:
+    """(floor_scale, default_scale, ceiling_scale) for a composite of size
+    total_w x total_h:
+    - floor_scale: the scale that makes the composite exactly touch the
+      1280x720 floor (upscaling a smaller source, or downscaling a larger
+      one) — the Output Size Override slider's 0% end.
+    - default_scale: today's normal (non-overridden) output scale — natural
+      size, or upscaled to the floor if natural is smaller.
+    - ceiling_scale: the slider's 100% end, double default_scale, giving
+      headroom to upscale beyond the normal default when wanted.
+    """
+    floor_scale = max(_MIN_OUTPUT_W / total_w, _MIN_OUTPUT_H / total_h)
+    default_scale = max(1.0, floor_scale)
+    ceiling_scale = default_scale * 2.0
+    return floor_scale, default_scale, ceiling_scale
+
+
 def build_composite(
     frame: Image.Image,
     text: str,
@@ -465,6 +491,7 @@ def build_composite(
     footer_size: int = 16,
     watermark_path: str = "",
     watermark_height: int = 60,
+    output_override: bool = False,
     output_size_pct: float = 0.0,
 ) -> Image.Image:
     frame = frame.convert("RGBA")
@@ -476,16 +503,14 @@ def build_composite(
     # watermark/footer/header overlays below (all anchored to the image,
     # not the canvas) shift along with it.
     image_x = 0
+    total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
     if layout == "vertical":
         panel_x, panel_y, panel_w, panel_h = 0, fh, fw, cap_width
-        total_w, total_h = fw, fh + cap_width
     elif caption_side == "left":
         panel_x, panel_y, panel_w, panel_h = 0, 0, cap_width, fh
         image_x = cap_width
-        total_w, total_h = fw + cap_width, fh
     else:
         panel_x, panel_y, panel_w, panel_h = fw, 0, cap_width, fh
-        total_w, total_h = fw + cap_width, fh
 
     out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 255))
     draw = ImageDraw.Draw(out)
@@ -555,17 +580,18 @@ def build_composite(
 
     # Enforce a minimum final output size — upscale (never downscale by
     # default) preserving aspect ratio, so small sources don't distort when
-    # stretched to fit both axes. output_size_pct (0-100) then slides between
-    # that same 1280x720-touching scale (0%) and today's default — natural
-    # size, or the 1280x720 floor if natural is smaller (100%). For sources
-    # already bigger than the floor, this lets 0% genuinely downscale (for a
-    # smaller file) without stretching, since both ends are uniform scales of
-    # the same natural aspect ratio; for sources smaller than the floor, the
-    # two ends coincide (there's no room to shrink below the hard floor).
-    floor_scale = max(_MIN_OUTPUT_W / total_w, _MIN_OUTPUT_H / total_h)
-    default_scale = max(1.0, floor_scale)
-    pct = max(0.0, min(100.0, output_size_pct)) / 100.0
-    scale = floor_scale + (default_scale - floor_scale) * pct
+    # stretched to fit both axes. Without an override, that's just
+    # default_scale. With the Output Size Override active, output_size_pct
+    # (0-100) slides between the 1280x720-touching floor (0%) and double
+    # today's default (100%) — giving room to shrink toward the floor or
+    # upscale beyond the normal default, on top of the plain non-overridden
+    # behavior. See _output_scale_bounds for the three reference scales.
+    floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
+    if output_override:
+        pct = max(0.0, min(100.0, output_size_pct)) / 100.0
+        scale = floor_scale + (ceiling_scale - floor_scale) * pct
+    else:
+        scale = default_scale
     new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
     new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
     if (new_w, new_h) != (total_w, total_h):
@@ -1217,10 +1243,33 @@ class CaptionApp:
 
     def _on_output_override_toggle(self) -> None:
         if self._output_override_var.get():
+            # Start the slider wherever reproduces today's normal output
+            # size for the current file — checking the box shouldn't itself
+            # change anything until you actually move the slider.
+            self._output_pct_var.set(self._default_output_pct())
             self._output_pct_row.pack(side="top", fill="x", pady=(0, 4), before=self._canvas)
         else:
             self._output_pct_row.pack_forget()
         self._safe_refresh()
+
+    def _default_output_pct(self) -> int:
+        """The Output Size Override slider position that reproduces today's
+        normal (non-overridden) output size for the currently loaded file —
+        varies per image, since it depends on how the source's natural size
+        compares to the 1280x720 floor. See _output_scale_bounds."""
+        if not self._frames:
+            return 0
+        params = self._collect_render_params()
+        if params is None:
+            return 0
+        fw, fh = self._frames[0].size
+        total_w, total_h = _panel_total_size(fw, fh, params["cap_width"], params["layout"])
+        floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
+        span = ceiling_scale - floor_scale
+        if span <= 0:
+            return 0
+        pct = round(100 * (default_scale - floor_scale) / span)
+        return max(0, min(100, pct))
 
     def _apply_dynamic_width(self) -> None:
         """When Dynamic Width/Height is enabled, override the caption panel
@@ -2000,8 +2049,8 @@ class CaptionApp:
                 footer_size=footer_sz,
                 watermark_path=self._watermark_path,
                 watermark_height=wm_h,
-                output_size_pct=(self._output_pct_var.get()
-                                 if self._output_override_var.get() else 100),
+                output_override=self._output_override_var.get(),
+                output_size_pct=self._output_pct_var.get(),
             )
         except tk.TclError:
             return None

@@ -20,7 +20,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Animated GIF support** — all frames are processed; background rendering keeps the UI responsive
 - **MP4 video support** — open an MP4, caption every frame the same way as a GIF, and export as either an MP4 or a GIF, regardless of which one you started with
 - **Minimum output size** — final output is upscaled (never downscaled, aspect ratio preserved) to at least 1280×720 if the source is smaller; the Preview panel label shows the actual output size next to the on-screen preview, which can still display smaller to fit the window
-- **Output Size Override** — a checkbox above the Preview panel that reveals a 0–100% slider once checked: 100% is today's default (the composite's natural size, or the enforced 1280×720 floor if it's smaller), 0% shrinks it — aspect ratio preserved, no stretching — down to that same 1280×720 floor. Only a real downscale when the natural size is already bigger than the floor; small sources have no room to shrink below it, so both ends coincide
+- **Output Size Override** — a checkbox above the Preview panel that reveals a 0–100% slider once checked. 0% is the 1280×720 floor (shrinks a source that's already bigger than it, aspect ratio preserved, no stretching — small sources have no room to shrink below it). 100% is *double* today's normal default size (the composite's natural size, or upscaled to the floor if it's smaller), giving headroom to upscale beyond the usual default when you want a bigger export. Checking the box doesn't change anything by itself — the slider starts wherever reproduces today's normal output size for the file you have open (that position depends on the file, since it's wherever the default sits between the 0% floor and the 100% ceiling), so you only get a different size once you actually move it
 - **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM); either way, **Save** and **Send to DA** composite and write one frame at a time straight to the output file instead of building the whole thing in memory first, so exporting doesn't need to hold the full file in RAM regardless of length
 - **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
@@ -56,6 +56,17 @@ release on every launch and updates in place before starting the app if one's
 available — `formats/`, `watermark/`, your DeviantArt login, and the crash log
 are never touched by an update, so custom formats and settings always survive.
 Re-running `install.bat` later re-installs into the same location the same way.
+
+#### Which .exe do I run?
+
+Every release contains two executables — always launch the first one, not the second:
+
+| File | What it is |
+|---|---|
+| **`CaptionCreatorLauncher.exe`** | **Start here.** Checks GitHub for a newer release, updates in place if one's found, then opens the app. This is what `install.bat`'s Desktop shortcut points to. |
+| `CaptionCreator.exe` | The app itself. `CaptionCreatorLauncher.exe` starts this automatically — you only need to run it directly if you specifically want to skip the update check. |
+
+If you extracted the release zip by hand instead of using `install.bat`, run `CaptionCreatorLauncher.exe`, not `CaptionCreator.exe`, for the same reason.
 
 ### Manual install (running from source)
 
