@@ -7,6 +7,7 @@ import json
 import logging
 import logging.handlers
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,12 +24,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
 import da_client
+from app_paths import BASE_DIR, RESOURCE_DIR
 
 # ---------------------------------------------------------------------------
 # Crash / hang logging
 # ---------------------------------------------------------------------------
 
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "caption_creator_crash.log")
+_LOG_PATH = os.path.join(BASE_DIR, "caption_creator_crash.log")
 
 _handler = logging.handlers.RotatingFileHandler(
     _LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
@@ -141,13 +143,27 @@ _PILL_PRESETS = {
 _AARDVARK_NAME = "Aardvark Cafe"
 _AARDVARK_DAFONT = "https://www.dafont.com/aardvark-cafe.font"
 
-_FORMATS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "formats")
+_FORMATS_DIR = os.path.join(BASE_DIR, "formats")
 
 # Formats shipped with the app — overwriting one of these locally is fine,
 # but only these four are pushed/committed to the repo by default.
 _CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)"}
 
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def _ensure_formats_seeded() -> None:
+    """On a fresh install, formats/ won't exist yet under BASE_DIR — seed it
+    from the read-only copy of the 4 built-in formats bundled alongside the
+    frozen app (RESOURCE_DIR). No-op when running from source, where the two
+    dirs are the same and formats/ is already tracked in git."""
+    if os.path.isdir(_FORMATS_DIR) and os.listdir(_FORMATS_DIR):
+        return
+    os.makedirs(_FORMATS_DIR, exist_ok=True)
+    seed_dir = os.path.join(RESOURCE_DIR, "formats")
+    if os.path.isdir(seed_dir) and os.path.abspath(seed_dir) != os.path.abspath(_FORMATS_DIR):
+        for fname in os.listdir(seed_dir):
+            shutil.copy(os.path.join(seed_dir, fname), os.path.join(_FORMATS_DIR, fname))
 
 
 def _load_formats() -> dict:
@@ -691,6 +707,7 @@ class CaptionApp:
         self._side_var = tk.StringVar(value="right")
 
         # Formats (loaded from formats/ dir)
+        _ensure_formats_seeded()
         self._formats: dict = _load_formats()
         default_fmt = "Standard" if "Standard" in self._formats else (
             next(iter(self._formats), "Standard"))
@@ -716,6 +733,7 @@ class CaptionApp:
 
         # Async render state
         self._refresh_job: Optional[str] = None
+        self._preview_debounce_job: Optional[str] = None
         self._build_cancel = threading.Event()
         self._cache_complete: bool = True
 
@@ -736,6 +754,8 @@ class CaptionApp:
         self._build_cancel.set()
         if self._refresh_job:
             self.root.after_cancel(self._refresh_job)
+        if self._preview_debounce_job:
+            self.root.after_cancel(self._preview_debounce_job)
         self._watchdog.stop()
         self.root.destroy()
 
@@ -847,10 +867,15 @@ class CaptionApp:
         self._build_watermark_tab(wm_tab)
 
         # Traces
-        for v in (self._font_var, self._width_var, self._pad_var,
+        # Font StringVars (_font_var/_header_font_var/_footer_font_var) are
+        # deliberately excluded here — they're also the font Comboboxes'
+        # textvariable, so every keystroke while searching would otherwise
+        # re-render with a partial, likely-invalid font name. Those are
+        # refreshed explicitly on commit instead (see _setup_font_autocomplete).
+        for v in (self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
-                  self._align_var, self._side_var, self._header_font_var, self._header_size_var,
-                  self._footer_font_var, self._footer_size_var,
+                  self._align_var, self._side_var, self._header_size_var,
+                  self._footer_size_var,
                   self._watermark_height_var, self._output_pct_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         # _size_var also gets programmatically overwritten by Auto-fit itself
@@ -867,6 +892,55 @@ class CaptionApp:
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=pady)
         widget.grid(row=r, column=1, sticky="ew", padx=(6, 0), pady=pady)
 
+    def _setup_font_autocomplete(self, combo: ttk.Combobox) -> None:
+        """Let the user type into a font Combobox, narrowing the dropdown to
+        matching installed font names as they type. The preview only
+        re-renders once a font is actually chosen — clicked from the list or
+        confirmed with Enter — not on every keystroke while still searching
+        (the font's StringVar isn't in the auto-refresh trace list for this
+        reason; see _build_ui)."""
+        all_fonts = list(combo["values"])
+        nav_keys = {"Up", "Down", "Left", "Right", "Return", "Escape", "Tab",
+                    "Shift_L", "Shift_R", "Control_L", "Control_R"}
+
+        def _on_keyrelease(event: tk.Event) -> None:
+            if event.keysym in nav_keys:
+                return
+            typed = combo.get().lower()
+            matches = [f for f in all_fonts if typed in f.lower()] if typed else all_fonts
+            combo["values"] = matches
+            if matches:
+                # A synthetic <Down> here (ttk's own way of opening the
+                # dropdown) can snap -values back to the unfiltered list when
+                # fired from inside this same keyrelease handler. Calling
+                # ttk's post proc directly sidesteps that re-entrancy, and
+                # refocusing the entry afterward (Post can hand focus to the
+                # popup listbox) keeps typing landing in the entry.
+                combo.tk.call("ttk::combobox::Post", combo)
+                combo.focus_set()
+                combo.icursor("end")
+
+        def _reset_values(*_) -> None:
+            combo["values"] = all_fonts
+
+        def _commit(*_) -> None:
+            combo["values"] = all_fonts
+            if combo.get() in all_fonts:
+                self._safe_refresh()
+
+        combo.bind("<KeyRelease>", _on_keyrelease)
+        combo.bind("<<ComboboxSelected>>", _commit)
+        combo.bind("<Return>", _commit)
+        # Opening the dropdown (typing, or just clicking the arrow) causes a
+        # transient focus shift to the popup listbox, which fires <FocusOut>
+        # on the entry even though nothing was actually changed. Binding a
+        # refresh here made every dropdown open re-render the full preview
+        # unconditionally — for a real file that's a multi-second synchronous
+        # render, which read as the app freezing/crashing. FocusOut only
+        # restores the unfiltered list now; committing a typed-but-unselected
+        # font happens on Enter instead (see _commit above).
+        combo.bind("<FocusOut>", _reset_values)
+
     def _build_caption_tab(self, f: ttk.Frame) -> None:
         f.columnconfigure(1, weight=1)
         r = 0
@@ -876,7 +950,7 @@ class CaptionApp:
                                  relief="solid", bd=1, padx=4, pady=4)
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         self._text_box.insert("1.0", "Your caption here")
-        self._text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
+        self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
         r += 1
 
         ttk.Label(f, text="Page BG Color:").grid(row=r, column=0, sticky="w", pady=4)
@@ -890,8 +964,9 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Font:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Combobox(f, textvariable=self._font_var, values=_font_list(),
-                     width=16, state="readonly").grid(row=r, column=1, sticky="ew", padx=6)
+        font_combo = ttk.Combobox(f, textvariable=self._font_var, values=_font_list(), width=16)
+        font_combo.grid(row=r, column=1, sticky="ew", padx=6)
+        self._setup_font_autocomplete(font_combo)
         r += 1
 
         auto_row = ttk.Frame(f)
@@ -980,12 +1055,14 @@ class CaptionApp:
                                         relief="solid", bd=1, padx=3, pady=3)
         self._header_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._header_text_box.insert("1.0", "")
-        self._header_text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
+        self._header_text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
         r += 1
 
         ttk.Label(f, text="Header Font:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Combobox(f, textvariable=self._header_font_var, values=_font_list(),
-                     width=16, state="readonly").grid(row=r, column=1, sticky="ew", padx=6)
+        header_font_combo = ttk.Combobox(f, textvariable=self._header_font_var,
+                                         values=_font_list(), width=16)
+        header_font_combo.grid(row=r, column=1, sticky="ew", padx=6)
+        self._setup_font_autocomplete(header_font_combo)
         r += 1
 
         ttk.Label(f, text="Header Size:").grid(row=r, column=0, sticky="w", pady=4)
@@ -1008,12 +1085,14 @@ class CaptionApp:
                                         relief="solid", bd=1, padx=3, pady=3)
         self._footer_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._footer_text_box.insert("1.0", "")
-        self._footer_text_box.bind("<KeyRelease>", lambda _: self._safe_refresh())
+        self._footer_text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
         r += 1
 
         ttk.Label(f, text="Footer Font:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Combobox(f, textvariable=self._footer_font_var, values=_font_list(),
-                     width=16, state="readonly").grid(row=r, column=1, sticky="ew", padx=6)
+        footer_font_combo = ttk.Combobox(f, textvariable=self._footer_font_var,
+                                         values=_font_list(), width=16)
+        footer_font_combo.grid(row=r, column=1, sticky="ew", padx=6)
+        self._setup_font_autocomplete(footer_font_combo)
         r += 1
 
         ttk.Label(f, text="Footer Size:").grid(row=r, column=0, sticky="w", pady=4)
@@ -1191,7 +1270,7 @@ class CaptionApp:
     # ------------------------------------------------------------------
 
     _WM_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
-    _WM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watermark")
+    _WM_DIR = os.path.join(BASE_DIR, "watermark")
 
     def _auto_detect_watermark(self) -> None:
         """Load the watermark folder's sole image automatically; disable if 0 or 2+."""
@@ -1448,6 +1527,9 @@ class CaptionApp:
         if self._refresh_job:
             self.root.after_cancel(self._refresh_job)
             self._refresh_job = None
+        if self._preview_debounce_job:
+            self.root.after_cancel(self._preview_debounce_job)
+            self._preview_debounce_job = None
         self._build_cancel = threading.Event()
         self._frames.clear()
         self._durations.clear()
@@ -1550,10 +1632,16 @@ class CaptionApp:
         json.dump(job, job_file)
         job_file.close()
 
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--export-worker", job_file.name],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-        )
+        if getattr(sys, "frozen", False):
+            # Frozen: sys.executable is CaptionCreator.exe itself, not
+            # python.exe — there's no separate .py script to pass. Re-invoke
+            # the exe with --export-worker; the __main__ dispatch below
+            # handles this the same way whether frozen or not.
+            argv = [sys.executable, "--export-worker", job_file.name]
+        else:
+            argv = [sys.executable, os.path.abspath(__file__), "--export-worker", job_file.name]
+
+        proc = subprocess.Popen(argv, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
         def _wait() -> None:
             rc = proc.wait()
@@ -1802,6 +1890,14 @@ class CaptionApp:
 
         self._apply_dynamic_width()
         self._safe_refresh()
+
+    def _on_text_keyrelease(self, debounce_ms: int = 300) -> None:
+        """Wait for a pause in typing before updating the preview — re-rendering
+        on every keystroke (especially with Auto-fit's font-size search) is
+        visibly janky for fast typists."""
+        if self._preview_debounce_job:
+            self.root.after_cancel(self._preview_debounce_job)
+        self._preview_debounce_job = self.root.after(debounce_ms, self._safe_refresh)
 
     def _safe_refresh(self, debounce_ms: int = 400) -> None:
         """Validate vars, show 1-frame preview immediately, schedule full GIF rebuild."""
@@ -2454,6 +2550,22 @@ class CaptionApp:
 def main() -> None:
     root = tk.Tk()
     root.geometry("1100x680")
+
+    # logo.png is the window/taskbar icon shown top-left next to the title —
+    # separate from assets/icon.png, which is only used for the .exe/shortcut
+    # icon (baked in at build time, see packaging/build.spec).
+    logo_path = os.path.join(RESOURCE_DIR, "assets", "logo.png")
+    if os.path.isfile(logo_path):
+        try:
+            logo_img = Image.open(logo_path).convert("RGBA")
+            logo_img.thumbnail((256, 256), Image.LANCZOS)
+            # Kept as a local var, not GC'd — this frame stays on the stack
+            # for the app's whole lifetime, since mainloop() blocks below.
+            logo_photo = ImageTk.PhotoImage(logo_img)
+            root.iconphoto(True, logo_photo)
+        except Exception:
+            log.warning("LOGO_LOAD_ERROR", exc_info=True)
+
     CaptionApp(root)
     root.mainloop()
 

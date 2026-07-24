@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 
+# PyInstaller build output — rebuild with: pyinstaller packaging/build.spec
+build/
+dist/
+packaging/icon.ico
+
 # runtime logs (rotated backups: .log.1, .log.2, .log.3)
 caption_creator_crash.log*
 

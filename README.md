@@ -30,29 +30,47 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 ## Requirements
 
 - **Windows 10 or later**
-- **Python 3.12+** — [python.org/downloads](https://www.python.org/downloads/)
-- **Pillow**, **requests**, **imageio**, and **imageio-ffmpeg** (installed via pip — see below). `imageio-ffmpeg` bundles its own ffmpeg binary, so no separate system-wide ffmpeg install is needed.
+- For the **Quick install** below: nothing else — the download is a standalone build with Python, Tk, and ffmpeg all bundled in.
+- For the **Manual install** (running from source): **Python 3.12+** — [python.org/downloads](https://www.python.org/downloads/), plus **Pillow**, **requests**, **imageio**, and **imageio-ffmpeg** via pip. `imageio-ffmpeg` bundles its own ffmpeg binary, so no separate system-wide ffmpeg install is needed either way.
 
-> Tkinter is included with the standard Python installer on Windows. If `import tkinter` fails, re-run the Python installer and ensure the **tcl/tk and IDLE** optional feature is checked.
+> Tkinter is included with the standard Python installer on Windows. If `import tkinter` fails when running from source, re-run the Python installer and ensure the **tcl/tk and IDLE** optional feature is checked.
 
 ---
 
 ## Installation
 
-### 1. Clone the repository
+### Quick install (Windows)
+
+Download [`install.bat`](install.bat) and run it — no Python or Git required on
+your machine, it downloads a self-contained build. It asks where to install
+(defaults to `%LOCALAPPDATA%\Programs\CaptionCreator`, a standard per-user
+location — no admin rights needed, but you can type any path you'd rather use
+instead), and offers to add a Desktop shortcut.
+
+The shortcut launches `CaptionCreatorLauncher.exe`, which checks for a newer
+release on every launch and updates in place before starting the app if one's
+available — `formats/`, `watermark/`, your DeviantArt login, and the crash log
+are never touched by an update, so custom formats and settings always survive.
+Re-running `install.bat` later re-installs into the same location the same way.
+
+### Manual install (running from source)
+
+For development, or if you'd rather run it straight from Python:
+
+#### 1. Clone the repository
 
 ```
 git clone https://github.com/crazygirlashley/caption-creation-tool.git
 cd caption-creation-tool
 ```
 
-### 2. Install Python dependencies
+#### 2. Install Python dependencies
 
 ```
 pip install -r requirements.txt
 ```
 
-### 3. (Optional) Install the Aardvark Cafe font
+#### 3. (Optional) Install the Aardvark Cafe font
 
 The X-Change title and tagline use **Aardvark Cafe**, a free font available on DaFont.
 
@@ -61,7 +79,7 @@ The X-Change title and tagline use **Aardvark Cafe**, a free font available on D
 
 The app detects the font automatically on startup. If it isn't installed, a fallback font is used and you'll be prompted with a download link.
 
-### 4. (Optional) Add a watermark
+#### 4. (Optional) Add a watermark
 
 Place a single image (PNG, JPG, BMP, GIF, or WebP) in the `watermark/` folder:
 
@@ -76,14 +94,19 @@ If exactly one image is present, it loads automatically at startup and appears i
 
 ## Running the App
 
-**Option A — Python directly:**
+**If you used the Quick install:** use the Desktop shortcut, or run
+`CaptionCreatorLauncher.exe` directly from the install folder.
+
+**If you're running from source (Manual install):**
+
+Option A — Python directly:
 ```
 python caption_creator.py
 ```
 
-**Option B — Batch launcher (Windows):**
+Option B — Batch launcher (Windows):
 
-Double-click `run.bat`. It uses `python` from your system PATH, so no editing needed as long as Python is installed and on PATH. If this is a git checkout, it also checks for updates first: `git fetch`, compares against `origin`, and pulls with `--ff-only` if you're behind. It never overwrites local changes or force-pulls — if a fast-forward isn't possible (e.g. you have local edits), it just prints a note and launches the current version as-is. If git isn't installed or this isn't a git checkout, the update check is skipped silently.
+Double-click `run.bat`. It uses `python` from your system PATH, so no editing needed as long as Python is installed and on PATH. If this is a git checkout, it also checks for updates first: `git fetch`, compares against `origin`, and pulls with `--ff-only` if you're behind. It never overwrites local changes or force-pulls — if a fast-forward isn't possible (e.g. you have local edits), it just prints a note and launches the current version as-is. If git isn't installed or this isn't a git checkout, the update check is skipped silently. The console window closes on its own once the app exits normally; it only stays open (with `pause`) if `caption_creator.py` exits with an error, so you can read what happened.
 
 ---
 
@@ -151,20 +174,58 @@ See `formats/Standard.json`, `formats/X-Change.json`, and their `(Vertical)` cou
 
 ---
 
+## Building a Release (maintainers)
+
+The Quick install downloads a prebuilt release rather than running from source,
+so publishing one requires a local build first:
+
+1. Bump the `VERSION` file (e.g. `0.2.0`) and commit it.
+2. `pip install pyinstaller`
+3. `pyinstaller packaging/build.spec` — produces `dist/CaptionCreator/`
+   containing `CaptionCreator.exe`, `CaptionCreatorLauncher.exe`, a shared
+   `_internal/` dependency folder, and `version.txt`.
+4. Zip the *contents* of `dist/CaptionCreator/` (not the folder itself) as
+   `CaptionCreator-win64.zip`.
+5. Create a GitHub Release tagged `v<VERSION>` (e.g. `v0.2.0` — the launcher
+   strips a leading `v` when comparing) and attach that zip as a release
+   asset. `install.bat` and `CaptionCreatorLauncher.exe` both fetch it from
+   `.../releases/latest/download/CaptionCreator-win64.zip`, a stable URL
+   that always resolves to whatever the newest published release is.
+
+`app_paths.py` is what makes the two builds coexist correctly: it resolves a
+writable `BASE_DIR` (next to the exe when frozen, next to `caption_creator.py`
+when run from source) for `formats/`, `watermark/`, DA credentials, and the
+crash log, separately from a read-only `RESOURCE_DIR` (PyInstaller's bundled
+`_internal/` when frozen) for `assets/` and the seed copies of the 4 built-in
+formats. The launcher only ever replaces `CaptionCreator.exe` and `_internal/`
+on update — nothing in `BASE_DIR` is part of the release zip, so it's never
+touched.
+
+---
+
 ## Project Structure
 
 ```
 caption-creation-tool/
-├── caption_creator.py     # Main application
-├── da_client.py           # DeviantArt API client (OAuth2 PKCE, draft upload)
-├── formats/               # Format definitions (JSON) — add your own here
+├── app_paths.py            # Frozen-aware BASE_DIR/RESOURCE_DIR resolution
+├── caption_creator.py      # Main application
+├── da_client.py             # DeviantArt API client (OAuth2 PKCE, draft upload)
+├── assets/                   # App branding
+│   ├── logo.png                # Window/taskbar icon
+│   └── icon.png                 # .exe / Desktop shortcut icon (built releases only)
+├── formats/                 # Format definitions (JSON) — add your own here
 │   ├── Standard.json
 │   ├── Standard (Vertical).json
 │   ├── X-Change.json
 │   └── X-Change (Vertical).json
-├── requirements.txt       # Python dependencies
-├── run.bat                # Windows launcher
-├── watermark/             # Drop a single watermark image here (gitignored)
+├── packaging/                # PyInstaller build (see "Building a Release")
+│   ├── build.spec               # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe
+│   └── launcher.py               # Update checker + launcher source
+├── VERSION                   # Plain-text version string, source of truth for releases
+├── install.bat               # Windows installer — downloads the latest built release
+├── requirements.txt          # Python dependencies (source/dev use)
+├── run.bat                    # Windows launcher (source/dev use)
+├── watermark/                 # Drop a single watermark image here (gitignored)
 └── .gitignore
 ```
 

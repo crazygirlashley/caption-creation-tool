@@ -15,9 +15,10 @@ from typing import Optional
 
 import requests
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
-_SETTINGS_PATH = os.path.join(_DIR, "da_settings.json")
-_TOKENS_PATH = os.path.join(_DIR, "da_tokens.json")
+from app_paths import BASE_DIR
+
+_SETTINGS_PATH = os.path.join(BASE_DIR, "da_settings.json")
+_TOKENS_PATH = os.path.join(BASE_DIR, "da_tokens.json")
 
 _DA_AUTH_URL = "https://www.deviantart.com/oauth2/authorize"
 _DA_TOKEN_URL = "https://www.deviantart.com/oauth2/token"
