@@ -1,5 +1,7 @@
 # Caption Creator
 
+[![Latest release](https://img.shields.io/github/v/release/crazygirlashley/caption-creation-tool)](https://github.com/crazygirlashley/caption-creation-tool/releases/latest)
+
 A Windows desktop app for creating X-Change-style captioned images, animated GIFs, and MP4 videos. Place a styled text panel beside any image, overlay title and tagline text, apply pill color presets, and send the finished output directly to DeviantArt.
 
 ---
@@ -42,7 +44,9 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 ### Quick install (Windows)
 
 Download [`install.bat`](install.bat) and run it — no Python or Git required on
-your machine, it downloads a self-contained build. It asks where to install
+your machine, it downloads a self-contained build from the
+[latest release](https://github.com/crazygirlashley/caption-creation-tool/releases/latest).
+It asks where to install
 (defaults to `%LOCALAPPDATA%\Programs\CaptionCreator`, a standard per-user
 location — no admin rights needed, but you can type any path you'd rather use
 instead), and offers to add a Desktop shortcut.
