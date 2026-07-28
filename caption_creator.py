@@ -3,6 +3,7 @@
 
 import ctypes
 import functools
+import io
 import json
 import logging
 import logging.handlers
@@ -288,6 +289,16 @@ _MAX_AUTO_FONT_SIZE = 200
 # several times higher than this raw estimate — kept conservative accordingly.
 _LARGE_MEDIA_WARN_BYTES = 400 * 1024 * 1024
 
+# DeviantArt's hard cap on a single upload — the estimated-size label and the
+# Save/Send-to-DA warnings below are both built around this figure.
+_DA_MAX_UPLOAD_BYTES = 80 * 1024 * 1024
+
+# How many frames to decode+encode as a sample when estimating the output
+# size of a still-deferred (large, not-yet-materialized) GIF/video — see
+# CaptionApp._estimate_deferred_bytes. Bounded so the estimate stays cheap
+# regardless of how huge the real source is.
+_DEFERRED_SIZE_SAMPLE_FRAMES = 30
+
 
 def _human_size(num_bytes: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -295,6 +306,14 @@ def _human_size(num_bytes: float) -> str:
             return f"{num_bytes:.1f} {unit}"
         num_bytes /= 1024
     return f"{num_bytes:.1f} GB"
+
+
+def _over_da_limit_msg(num_bytes: int) -> Optional[str]:
+    """None if num_bytes fits DeviantArt's upload cap, else a warning string."""
+    if num_bytes <= _DA_MAX_UPLOAD_BYTES:
+        return None
+    return (f"This file is {_human_size(num_bytes)}, which exceeds DeviantArt's "
+            f"{_human_size(_DA_MAX_UPLOAD_BYTES)} upload limit.")
 
 
 def _pad_to_macro_block(arr: np.ndarray, block: int = 16) -> np.ndarray:
@@ -673,6 +692,19 @@ def build_composite(
     return out
 
 
+def _resolve_gif_colors(raw: dict) -> Optional[int]:
+    """None (no quantization) unless GIF compression is enabled and the
+    color count is below 256 — 256 is a documented no-op since GIF already
+    tops out at 256 colors/frame. Centralizes the "is this actually a
+    no-op" check so the live estimate, the deferred-sample estimate, and
+    the real export worker all derive an identical value from the same two
+    raw fields."""
+    if not raw.get("gif_compress"):
+        return None
+    colors = raw.get("gif_colors", 256)
+    return colors if colors < 256 else None
+
+
 # ---------------------------------------------------------------------------
 # GIF/MP4 export worker
 #
@@ -713,6 +745,7 @@ def _export_worker_main(job_path: str) -> None:
     fps = job["fps"]
     total = job["total_frames"]
     durations = job.get("durations")
+    gif_colors = job.get("gif_colors")
 
     try:
         ctypes.windll.kernel32.SetConsoleTitleW("Caption Creator — Exporting…")
@@ -731,7 +764,10 @@ def _export_worker_main(job_path: str) -> None:
     try:
         for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
             composited = build_composite(frame, **params)
-            arr = np.array(composited.convert("RGB"))
+            rgb = composited.convert("RGB")
+            if not as_mp4 and gif_colors is not None:
+                rgb = rgb.quantize(colors=gif_colors).convert("RGB")
+            arr = np.array(rgb)
             if as_mp4:
                 arr = _pad_to_macro_block(arr)
             writer.append_data(arr)
@@ -740,6 +776,59 @@ def _export_worker_main(job_path: str) -> None:
     finally:
         writer.close()
     print("\nDone.")
+
+
+# ---------------------------------------------------------------------------
+# Output-size estimation
+#
+# Both helpers below encode with the exact same settings the real Save/Send
+# export paths use, rather than guessing from a formula, so the number shown
+# in the UI matches what actually lands on disk.
+# ---------------------------------------------------------------------------
+
+def _estimate_static_bytes(img: Image.Image) -> int:
+    """PNG-encoded size of a static output. PNG is Save's default extension
+    and, being lossless, the largest of the choices offered there — so this
+    is a conservative (worst-case) estimate for a static image."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.tell()
+
+
+def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
+                          gif_colors: Optional[int] = None) -> int:
+    """Encode already-composited frames with the same writer settings
+    _export_worker_main uses, to a throwaway temp file, and return its size.
+    Slow enough (a real GIF/MP4 encode) that callers must run this off the
+    Tk thread."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4" if as_mp4 else ".gif", delete=False)
+    tmp_path = tmp.name
+    tmp.close()  # release our handle before imageio opens the same path
+    try:
+        if as_mp4:
+            writer = imageio.get_writer(tmp_path, fps=fps, codec="libx264", quality=8)
+        else:
+            duration = durations if durations else max(1, round(1000 / fps))
+            writer = imageio.get_writer(tmp_path, mode="I", duration=duration, loop=0)
+        try:
+            for frame in frames:
+                rgb = frame.convert("RGB")
+                # Only affects the estimate number, not this in-memory frame
+                # or the on-screen preview — see _redraw()/self._cache.
+                if not as_mp4 and gif_colors is not None:
+                    rgb = rgb.quantize(colors=gif_colors).convert("RGB")
+                arr = np.array(rgb)
+                if as_mp4:
+                    arr = _pad_to_macro_block(arr)
+                writer.append_data(arr)
+        finally:
+            writer.close()
+        return os.path.getsize(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +887,8 @@ class CaptionApp:
         # build_composite()'s output_size_pct handling.
         self._output_override_var = tk.BooleanVar(value=False)
         self._output_pct_var = tk.IntVar(value=100)
+        self._gif_compress_var = tk.BooleanVar(value=False)
+        self._gif_colors_var = tk.IntVar(value=256)  # 256 = no-op (GIF already tops out at 256/frame)
         self._pad_var = tk.IntVar(value=20)
         self._stroke_width_var = tk.IntVar(value=0)
         self._auto_size_var = tk.BooleanVar(value=True)
@@ -911,6 +1002,22 @@ class CaptionApp:
         self._output_pct_label.pack(side="left", padx=(6, 0))
         self._output_pct_row.pack_forget()  # hidden until the toggle above is checked
 
+        self._gif_compress_frame = ttk.Frame(pf)
+        ttk.Checkbutton(self._gif_compress_frame, text="Compress GIF Output",
+                        variable=self._gif_compress_var,
+                        command=self._on_gif_compress_toggle).pack(side="top", anchor="w")
+        self._gif_colors_row = ttk.Frame(self._gif_compress_frame)
+        self._gif_colors_row.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Scale(self._gif_colors_row, from_=2, to=256, orient="horizontal",
+                  variable=self._gif_colors_var).pack(side="left", fill="x", expand=True)
+        self._gif_colors_label = ttk.Label(self._gif_colors_row, text="256 colors", width=10)
+        self._gif_colors_label.pack(side="left", padx=(6, 0))
+        self._gif_colors_row.pack_forget()  # hidden until the toggle above is checked
+        self._gif_compress_frame.pack_forget()  # hidden until an eligible GIF source loads
+
+        self._size_est_label = ttk.Label(pf, text="", foreground="#888")
+        self._size_est_label.pack(side="top", anchor="w", pady=(0, 4))
+
         self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
@@ -975,7 +1082,7 @@ class CaptionApp:
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._side_var, self._header_size_var,
                   self._footer_size_var,
-                  self._watermark_height_var, self._output_pct_var):
+                  self._watermark_height_var, self._output_pct_var, self._gif_colors_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         # _size_var also gets programmatically overwritten by Auto-fit itself
         # (see _collect_render_params) — skip those writes so they don't
@@ -985,6 +1092,8 @@ class CaptionApp:
             lambda *_: None if self._updating_size_display else self._safe_refresh())
         self._output_pct_var.trace_add(
             "write", lambda *_: self._output_pct_label.config(text=f"{self._output_pct_var.get()}%"))
+        self._gif_colors_var.trace_add(
+            "write", lambda *_: self._gif_colors_label.config(text=f"{self._gif_colors_var.get()} colors"))
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
 
     def _row(self, parent, r, label, widget, pady=4):
@@ -1325,6 +1434,16 @@ class CaptionApp:
             self._output_pct_row.pack_forget()
         self._safe_refresh()
 
+    def _on_gif_compress_toggle(self) -> None:
+        if self._gif_compress_var.get():
+            # 256 = no-op — checking the box shouldn't itself change
+            # anything until you actually drag the slider down.
+            self._gif_colors_var.set(256)
+            self._gif_colors_row.pack(side="top", fill="x", pady=(0, 4))
+        else:
+            self._gif_colors_row.pack_forget()
+        self._safe_refresh()
+
     def _default_output_pct(self) -> int:
         """The Output Size Override slider position that reproduces today's
         normal (non-overridden) output size for the currently loaded file —
@@ -1604,6 +1723,26 @@ class CaptionApp:
             if packed:
                 self._single_frame_check.pack_forget()
 
+    def _update_gif_compress_visibility(self) -> None:
+        """The GIF compression toggle only makes sense for native GIF sources
+        — an MP4 source's live estimate/label is always computed as MP4
+        regardless of what format the user eventually picks in the Save
+        dialog, so the slider would visibly do nothing on screen today."""
+        relevant = self._is_anim and not self._is_video
+        packed = self._gif_compress_frame.winfo_manager() == "pack"
+        if relevant:
+            if not packed:
+                self._gif_compress_frame.pack(side="top", fill="x", before=self._size_est_label)
+        else:
+            if packed:
+                self._gif_compress_frame.pack_forget()
+            # Don't let a compressed setting from a prior GIF silently carry
+            # into an unrelated file with no visible control to see/undo it.
+            if self._gif_compress_var.get():
+                self._gif_compress_var.set(False)
+                self._gif_colors_var.set(256)
+                self._gif_colors_row.pack_forget()
+
     def _on_single_frame_toggle(self) -> None:
         """Manually collapse the loaded animation down to one preview frame
         (freeing memory while editing), or restore the full frame set."""
@@ -1706,6 +1845,7 @@ class CaptionApp:
         self._source_path = path
         self._single_frame_var.set(bool(self._deferred_path))
         self._update_single_frame_visibility()
+        self._update_gif_compress_visibility()
 
         self._anim_idx = 0
         self._apply_dynamic_width()
@@ -1723,7 +1863,7 @@ class CaptionApp:
         return 10.0
 
     def _run_export_in_console(self, output_path: str, as_mp4: bool, params: dict,
-                                on_success, on_error) -> None:
+                                gif_colors: Optional[int], on_success, on_error) -> None:
         """Spawn a detached `--export-worker` subprocess (its own console
         window) to stream the GIF/MP4 export, instead of doing it on the Tk
         main thread — a large export used to block the main loop long enough
@@ -1748,6 +1888,7 @@ class CaptionApp:
             "fps": fps,
             "total_frames": total,
             "durations": durations,
+            "gif_colors": gif_colors,
         }
         job_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, encoding="utf-8")
@@ -1799,6 +1940,7 @@ class CaptionApp:
             params = self._collect_render_params()
             if params is None:
                 return
+            gif_colors = _resolve_gif_colors(self._gather_raw_params() or {})
 
             # Exported by a detached console subprocess (see
             # _run_export_in_console) instead of building the full source and
@@ -1815,7 +1957,11 @@ class CaptionApp:
                 self._export_in_progress = False
                 self._status.config(text=base_status)
                 log.info("FILE_SAVE  %s", os.path.basename(path))
-                messagebox.showinfo("Saved", f"Saved:\n{path}")
+                msg = f"Saved:\n{path}"
+                over_msg = _over_da_limit_msg(os.path.getsize(path))
+                if over_msg:
+                    msg += f"\n\n⚠ {over_msg}"
+                messagebox.showinfo("Saved", msg)
 
             def _on_error() -> None:
                 self._export_in_progress = False
@@ -1831,7 +1977,7 @@ class CaptionApp:
                 messagebox.showerror("Render Error", "Failed to render/export all frames for saving.")
 
             self._run_export_in_console(path, path.lower().endswith(".mp4"),
-                                         params, _on_success, _on_error)
+                                         params, gif_colors, _on_success, _on_error)
             return
 
         path = filedialog.asksaveasfilename(
@@ -1846,7 +1992,11 @@ class CaptionApp:
         out.save(path)
 
         log.info("FILE_SAVE  %s", os.path.basename(path))
-        messagebox.showinfo("Saved", f"Saved:\n{path}")
+        msg = f"Saved:\n{path}"
+        over_msg = _over_da_limit_msg(os.path.getsize(path))
+        if over_msg:
+            msg += f"\n\n⚠ {over_msg}"
+        messagebox.showinfo("Saved", msg)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -2116,6 +2266,8 @@ class CaptionApp:
                 watermark_height=wm_h,
                 output_override=self._output_override_var.get(),
                 output_size_pct=self._output_pct_var.get(),
+                gif_compress=self._gif_compress_var.get(),
+                gif_colors=self._gif_colors_var.get(),
             )
         except tk.TclError:
             return None
@@ -2186,12 +2338,20 @@ class CaptionApp:
             elapsed = time.perf_counter() - t0
             if elapsed > 0.5:
                 log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
+            # Only worth estimating here for static images — for GIF/MP4
+            # sources this is just the first frame, not the real output;
+            # _rebuild_all_async supplies the real estimate for those once
+            # every frame has been built.
+            size_bytes = None if self._is_anim else _estimate_static_bytes(first)
             if not cancel.is_set():
-                self.root.after(0, lambda r=first, s=size: self._on_preview_built(r, s, raw["field_size"]))
+                self.root.after(
+                    0, lambda r=first, s=size, sb=size_bytes:
+                        self._on_preview_built(r, s, raw["field_size"], sb))
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_preview_built(self, first: Image.Image, size: int, field_size: int) -> None:
+    def _on_preview_built(self, first: Image.Image, size: int, field_size: int,
+                           size_bytes: Optional[int]) -> None:
         """Called on the main thread when the background single-frame
         preview build finishes."""
         self._apply_resolved_font_size(size, field_size)
@@ -2201,7 +2361,49 @@ class CaptionApp:
         txt = self._status.cget("text")
         self._status.config(text=txt.replace(" [Rendering…]", ""))
         self._update_preview_label()
+        if not self._is_anim:
+            self._set_size_estimate(size_bytes, "PNG")
         self._redraw()
+
+    def _estimate_deferred_bytes(self) -> None:
+        """For a still-deferred (large) source, estimate final output size
+        from a small decoded-and-encoded sample rather than materializing
+        every frame — full materialization is exactly what deferral exists
+        to avoid. Decodes/composites only the first _SAMPLE_FRAMES frames
+        straight from disk, encodes that sample with the real writer
+        settings, then scales bytes-per-frame up to the true frame count.
+        Runs entirely off the Tk thread; updates the label when done."""
+        raw = self._gather_raw_params()
+        if raw is None:
+            return
+        path, kind = self._deferred_path, self._deferred_kind
+        total = self._deferred_total_frames or 1
+        as_mp4 = self._is_video
+        fps = self._export_fps()
+        gif_colors = _resolve_gif_colors(raw)
+        sample_n = min(_DEFERRED_SIZE_SAMPLE_FRAMES, total)
+
+        def _build() -> None:
+            try:
+                kwargs, _size = _resolve_composite_kwargs(raw)
+                sample = []
+                for i, frame in enumerate(_iter_frames_from_path(path, kind)):
+                    if i >= sample_n:
+                        break
+                    sample.append(build_composite(frame, **kwargs))
+                if not sample:
+                    return
+                sample_bytes = _estimate_anim_bytes(sample, as_mp4, fps, None, gif_colors)
+                size_bytes = round(sample_bytes / len(sample) * total)
+            except Exception:
+                log.exception("SIZE_ESTIMATE_ERROR  (deferred sample)")
+                size_bytes = None
+            label = ("MP4" if as_mp4 else "GIF") + ", approx"
+            if gif_colors is not None:
+                label += ", compressed"
+            self.root.after(0, lambda sb=size_bytes: self._set_size_estimate(sb, label))
+
+        threading.Thread(target=_build, daemon=True).start()
 
     def _rebuild_all_async(self) -> None:
         """Build all GIF frames in a background thread; post results back to
@@ -2217,6 +2419,9 @@ class CaptionApp:
             # rebuild yet. Rebuilding it would trivially "complete" and mark
             # _cache_complete True, which would wrongly skip materializing the
             # full source at save/send time. Full processing happens there instead.
+            # The size estimate still needs to come from somewhere, though —
+            # see _estimate_deferred_bytes.
+            self._estimate_deferred_bytes()
             return
 
         raw = self._gather_raw_params()
@@ -2228,6 +2433,13 @@ class CaptionApp:
         self._build_cancel = threading.Event()
         cancel = self._build_cancel
         frames = self._frames[:]  # snapshot so the thread doesn't see file reloads
+        # Snapshot the other pieces the size-estimate encode below needs, for
+        # the same reason — Tk state isn't safe to read from the background
+        # thread once it starts.
+        as_mp4 = self._is_video
+        fps = self._export_fps()
+        durations = list(self._durations) if (self._durations and not as_mp4) else None
+        gif_colors = _resolve_gif_colors(raw)
 
         txt = self._status.cget("text")
         if "[Rendering" not in txt:
@@ -2249,12 +2461,22 @@ class CaptionApp:
                 except Exception:
                     log.exception("FRAME_BUILD_ERROR  frame=%d", i)
                     return
+            if cancel.is_set():
+                return
+            try:
+                size_bytes = _estimate_anim_bytes(results, as_mp4, fps, durations, gif_colors)
+            except Exception:
+                log.exception("SIZE_ESTIMATE_ERROR")
+                size_bytes = None
             if not cancel.is_set():
-                self.root.after(0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"]))
+                self.root.after(
+                    0, lambda r=results, s=size, sb=size_bytes, gc=gif_colors:
+                        self._on_rebuild_done(r, s, raw["field_size"], sb, gc))
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_rebuild_done(self, results: list, size: int, field_size: int) -> None:
+    def _on_rebuild_done(self, results: list, size: int, field_size: int,
+                          size_bytes: Optional[int], gif_colors: Optional[int]) -> None:
         """Called on the main thread when the background GIF build finishes."""
         self._apply_resolved_font_size(size, field_size)
         self._cache = results
@@ -2264,6 +2486,10 @@ class CaptionApp:
         log.info("GIF_REBUILD_DONE  frames=%d", len(results))
         self._anim_idx = 0
         self._update_preview_label()
+        label = "MP4" if self._is_video else "GIF"
+        if gif_colors is not None:
+            label += ", compressed"
+        self._set_size_estimate(size_bytes, label)
         self._start_anim()
 
     # ------------------------------------------------------------------
@@ -2498,6 +2724,26 @@ class CaptionApp:
         self.root.wait_window(dlg)
         return result[0]
 
+    def _confirm_oversized_upload(self, tmp_path: str) -> bool:
+        """Warn before uploading a file over DeviantArt's 80MB cap. Returns
+        True if it's fine to proceed (under the cap, or the user chose to
+        upload anyway); on a "no", cleans up tmp_path and _da_in_progress
+        itself so callers can just return."""
+        over_msg = _over_da_limit_msg(os.path.getsize(tmp_path))
+        if not over_msg:
+            return True
+        proceed = messagebox.askyesno(
+            "File Too Large",
+            f"{over_msg}\nDeviantArt will likely reject this upload.\n\nUpload anyway?")
+        if proceed:
+            return True
+        self._da_in_progress = False
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
     def _da_send(self) -> None:
         """Export the current output and save it as a private draft on DeviantArt."""
         if not self._cache:
@@ -2545,12 +2791,14 @@ class CaptionApp:
                 except OSError:
                     pass
                 return
+            gif_colors = _resolve_gif_colors(self._gather_raw_params() or {})
 
             self._status.config(text=base_status + " [Exporting in console window…]")
 
             def _on_export_success() -> None:
                 self._status.config(text=base_status)
-                self._start_da_upload(client_id, tmp_path, title, description)
+                if self._confirm_oversized_upload(tmp_path):
+                    self._start_da_upload(client_id, tmp_path, title, description)
 
             def _on_export_error() -> None:
                 self._status.config(text=base_status)
@@ -2563,7 +2811,7 @@ class CaptionApp:
                 messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
 
             self._run_export_in_console(tmp_path, upload_format == "mp4",
-                                         params, _on_export_success, _on_export_error)
+                                         params, gif_colors, _on_export_success, _on_export_error)
             return
 
         try:
@@ -2578,7 +2826,8 @@ class CaptionApp:
             messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
             return
         self._status.config(text=base_status)
-        self._start_da_upload(client_id, tmp_path, title, description)
+        if self._confirm_oversized_upload(tmp_path):
+            self._start_da_upload(client_id, tmp_path, title, description)
 
     def _start_da_upload(self, client_id: str, tmp_path: str, title: str, description: str) -> None:
         """Upload the already-rendered tmp_path to DeviantArt as a private draft,
@@ -2681,6 +2930,28 @@ class CaptionApp:
             self._preview_frame.config(text=f"Preview  (Output: {w}×{h}px)")
         else:
             self._preview_frame.config(text="Preview")
+
+    def _set_size_estimate(self, num_bytes: Optional[int], label: str) -> None:
+        """Update the estimated-output-size label next to the Preview panel,
+        flagging anything that would exceed DeviantArt's 80MB upload cap.
+        num_bytes is None either because nothing has been built yet or
+        because the encode itself failed (see _rebuild_all_async)."""
+        if not self._cache:
+            self._size_est_label.config(text="", foreground="#888")
+            return
+        if num_bytes is None:
+            self._size_est_label.config(text="Est. size: unavailable", foreground="#888")
+            return
+        text = f"Est. size ({label}): {_human_size(num_bytes)}"
+        over_msg = _over_da_limit_msg(num_bytes)
+        if over_msg:
+            text += "  ⚠ exceeds DeviantArt's 80 MB upload limit"
+            color = "#c0392b"
+        elif num_bytes > _DA_MAX_UPLOAD_BYTES * 0.9:
+            color = "#b8860b"
+        else:
+            color = "#888"
+        self._size_est_label.config(text=text, foreground=color)
 
     def _redraw(self) -> None:
         if not self._cache:
