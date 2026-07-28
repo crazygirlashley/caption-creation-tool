@@ -371,6 +371,68 @@ def _fit_font_size(text: str, font_family: str, max_size: int,
     return best
 
 
+def _resolve_composite_kwargs(raw: dict) -> tuple:
+    """Turn a CaptionApp._gather_raw_params() dict into build_composite
+    kwargs, running Auto-fit's font-size search if enabled. Pure — touches
+    no Tk state — so it's safe to run on a background thread; that's the
+    whole point of splitting it out from CaptionApp._collect_render_params,
+    since Auto-fit's search is the expensive part that used to block the UI
+    on a large caption. Returns (kwargs, resolved_font_size)."""
+    text = raw["text"]
+    width = raw["width"]
+    pad = raw["pad"]
+    stroke_w = raw["stroke_w"]
+    bold = raw["bold"]
+    layout = raw["layout"]
+
+    if raw["auto_size"] and raw["frame_size"] is not None:
+        fw, fh = raw["frame_size"]
+        if layout == "vertical":
+            # Vertical: panel spans full image width; cap_width is the panel height
+            size = _fit_font_size(text, raw["font_family"], _MAX_AUTO_FONT_SIZE,
+                                  fw, width, pad, stroke_w, bold)
+        else:
+            size = _fit_font_size(text, raw["font_family"], _MAX_AUTO_FONT_SIZE,
+                                  width, fh, pad, stroke_w, bold)
+    else:
+        size = raw["field_size"]
+
+    kwargs: dict = dict(
+        text=text,
+        cap_width=width,
+        page_bg=raw["page_bg"],
+        font_family=raw["font_family"],
+        font_size=size,
+        font_color=raw["font_color"],
+        padding=pad,
+        stroke_width=stroke_w,
+        stroke_color=raw["stroke_color"],
+        bold=bold,
+        shadow=raw["shadow"],
+        align=raw["align"],
+        fmt=raw["fmt"],
+        layout=layout,
+        caption_side=raw["caption_side"],
+        footer_enabled=raw["footer_enabled"],
+        footer_text=raw["footer_text"],
+        footer_font=raw["footer_font"],
+        footer_size=raw["footer_size"],
+        watermark_path=raw["watermark_path"],
+        watermark_height=raw["watermark_height"],
+        output_override=raw["output_override"],
+        output_size_pct=raw["output_size_pct"],
+    )
+
+    if raw["header_enabled"]:
+        kwargs.update(
+            header_text=raw["header_text"],
+            header_font=raw["header_font"],
+            header_size=raw["header_size"],
+        )
+
+    return kwargs, size
+
+
 def _text_x(draw: ImageDraw.ImageDraw, line: str, font: ImageFont.FreeTypeFont,
              x: int, w: int, padding: int, stroke_width: int, align: str) -> int:
     """Compute the left edge for a line of text based on alignment."""
@@ -1986,8 +2048,13 @@ class CaptionApp:
         if self._is_anim:
             self._refresh_job = self.root.after(debounce_ms, self._rebuild_all_async)
 
-    def _collect_render_params(self) -> Optional[dict]:
-        """Return all build_composite kwargs from current UI state, or None if invalid."""
+    def _gather_raw_params(self) -> Optional[dict]:
+        """Read every piece of Tk widget/variable state build_composite needs,
+        as plain Python values, or None if invalid. Must run on the main
+        thread — Tk widgets aren't thread-safe — but does no rendering work
+        itself, so it's fast. The returned dict holds no Tk objects, so it's
+        safe to hand off to a background thread for the expensive part (see
+        _resolve_composite_kwargs)."""
         text = self._text_box.get("1.0", "end-1c")
         try:
             field_size = self._size_var.get()
@@ -1995,7 +2062,8 @@ class CaptionApp:
             pad = self._pad_var.get()
             stroke_w = self._stroke_width_var.get()
             footer_sz = self._footer_size_var.get()
-            if self._footer_enabled.get():
+            footer_enabled = self._footer_enabled.get()
+            if footer_enabled:
                 wm_h = int(footer_sz * 2.0)
             else:
                 wm_h = self._watermark_height_var.get()
@@ -2005,46 +2073,32 @@ class CaptionApp:
         bold = self._bold_var.get()
         fmt = self._format_var.get()
         fmt_data = self._formats.get(fmt, {})
-        shadow = fmt_data.get("shadow", False)
         header_enabled = fmt_data.get("header_enabled", False)
-        layout = fmt_data.get("layout", "horizontal")
 
-        if self._auto_size_var.get() and self._frames:
-            if layout == "vertical":
-                # Vertical: panel spans full image width; cap_width is the panel height
-                fw = self._frames[0].size[0]
-                size = _fit_font_size(text, self._font_var.get(), _MAX_AUTO_FONT_SIZE,
-                                      fw, width, pad, stroke_w, bold)
-            else:
-                fh = self._frames[0].size[1]
-                size = _fit_font_size(text, self._font_var.get(), _MAX_AUTO_FONT_SIZE,
-                                      width, fh, pad, stroke_w, bold)
-            # Reflect the size Auto-fit actually landed on in the Font Size
-            # field. Guarded so this programmatic update doesn't re-trigger
-            # the field's own write-trace and recurse back into a refresh.
-            if size != field_size:
-                self._updating_size_display = True
-                try:
-                    self._size_var.set(size)
-                finally:
-                    self._updating_size_display = False
-        else:
-            size = field_size
-
-        kwargs: dict = dict(
-            stroke_width=stroke_w,
+        raw: dict = dict(
+            text=text,
+            field_size=field_size,
+            width=width,
+            pad=pad,
+            stroke_w=stroke_w,
             stroke_color=self._stroke_color,
             bold=bold,
-            shadow=shadow,
+            shadow=fmt_data.get("shadow", False),
             align=self._align_var.get(),
             fmt=fmt,
-            layout=layout,
+            layout=fmt_data.get("layout", "horizontal"),
             caption_side=self._side_var.get(),
+            auto_size=self._auto_size_var.get(),
+            frame_size=self._frames[0].size if self._frames else None,
+            font_family=self._font_var.get(),
+            page_bg=self._page_bg_color,
+            font_color=self._fc_color,
+            header_enabled=header_enabled,
         )
 
         if header_enabled:
             try:
-                kwargs.update(
+                raw.update(
                     header_text=self._header_text_box.get("1.0", "end-1c"),
                     header_font=self._header_font_var.get(),
                     header_size=self._header_size_var.get(),
@@ -2053,8 +2107,8 @@ class CaptionApp:
                 return None
 
         try:
-            kwargs.update(
-                footer_enabled=self._footer_enabled.get(),
+            raw.update(
+                footer_enabled=footer_enabled,
                 footer_text=self._footer_text_box.get("1.0", "end-1c"),
                 footer_font=self._footer_font_var.get(),
                 footer_size=footer_sz,
@@ -2066,30 +2120,50 @@ class CaptionApp:
         except tk.TclError:
             return None
 
-        return dict(
-            text=text,
-            cap_width=width,
-            page_bg=self._page_bg_color,
-            font_family=self._font_var.get(),
-            font_size=size,
-            font_color=self._fc_color,
-            padding=pad,
-            **kwargs,
-        )
+        return raw
+
+    def _collect_render_params(self) -> Optional[dict]:
+        """Read UI state and resolve it into build_composite kwargs, all on
+        the calling thread — for callers that don't need Auto-fit's search
+        backgrounded (one-off actions like Save/Send-to-DA, where blocking
+        briefly is fine). See _refresh_preview/_rebuild_all_async for the
+        version that splits this across a background thread instead."""
+        raw = self._gather_raw_params()
+        if raw is None:
+            return None
+        kwargs, size = _resolve_composite_kwargs(raw)
+        self._apply_resolved_font_size(size, raw["field_size"])
+        return kwargs
+
+    def _apply_resolved_font_size(self, size: int, field_size: int) -> None:
+        """Reflect the size Auto-fit actually landed on in the Font Size
+        field. Guarded so this programmatic update doesn't re-trigger the
+        field's own write-trace and recurse back into a refresh. Must run
+        on the main thread."""
+        if size == field_size:
+            return
+        self._updating_size_display = True
+        try:
+            self._size_var.set(size)
+        finally:
+            self._updating_size_display = False
 
     def _refresh_preview(self) -> None:
-        """Build the first frame in a background thread and post it back when
-        done, instead of blocking the main thread — Auto-fit's font-size
-        search does many text-measurement passes, which for a large caption
-        (a few hundred words) can take long enough to trip Windows' "Not
-        Responding" state if run inline. A newer call supersedes any build
+        """Resolve params and build the first frame in a background thread,
+        posting the result back when done, instead of blocking the main
+        thread — Auto-fit's font-size search does many text-measurement
+        passes, which for a large caption (a few hundred words) can take
+        long enough to trip Windows' "Not Responding" state if run inline.
+        Only the Tk-reading step (_gather_raw_params) runs on the main
+        thread, since that part isn't thread-safe but is cheap; the actual
+        search and render happen off it. A newer call supersedes any build
         still in flight."""
         if not self._frames:
             return
         self._stop_anim()
 
-        params = self._collect_render_params()
-        if params is None:
+        raw = self._gather_raw_params()
+        if raw is None:
             return
 
         self._build_cancel.set()
@@ -2104,7 +2178,8 @@ class CaptionApp:
         def _build() -> None:
             t0 = time.perf_counter()
             try:
-                first = build_composite(frame, **params)
+                kwargs, size = _resolve_composite_kwargs(raw)
+                first = build_composite(frame, **kwargs)
             except Exception:
                 log.exception("PREVIEW_ERROR")
                 return
@@ -2112,13 +2187,14 @@ class CaptionApp:
             if elapsed > 0.5:
                 log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
             if not cancel.is_set():
-                self.root.after(0, lambda r=first: self._on_preview_built(r))
+                self.root.after(0, lambda r=first, s=size: self._on_preview_built(r, s, raw["field_size"]))
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_preview_built(self, first: Image.Image) -> None:
+    def _on_preview_built(self, first: Image.Image, size: int, field_size: int) -> None:
         """Called on the main thread when the background single-frame
         preview build finishes."""
+        self._apply_resolved_font_size(size, field_size)
         self._cache = [first]
         self._cache_complete = not self._is_anim
         self._anim_idx = 0
@@ -2128,7 +2204,11 @@ class CaptionApp:
         self._redraw()
 
     def _rebuild_all_async(self) -> None:
-        """Build all GIF frames in a background thread; post results back to main thread."""
+        """Build all GIF frames in a background thread; post results back to
+        main thread. Auto-fit's search (via _resolve_composite_kwargs) runs
+        once inside that same thread rather than on the main thread first,
+        for the same reason as _refresh_preview — it can be slow for a large
+        caption."""
         self._refresh_job = None
         if not self._frames or not self._is_anim:
             return
@@ -2139,8 +2219,8 @@ class CaptionApp:
             # full source at save/send time. Full processing happens there instead.
             return
 
-        params = self._collect_render_params()
-        if params is None:
+        raw = self._gather_raw_params()
+        if raw is None:
             return
 
         # Signal any running build to stop and create a fresh cancellation token
@@ -2154,23 +2234,29 @@ class CaptionApp:
             self._status.config(text=txt + " [Rendering…]")
 
         def _build() -> None:
+            try:
+                kwargs, size = _resolve_composite_kwargs(raw)
+            except Exception:
+                log.exception("FRAME_BUILD_ERROR  resolving params")
+                return
             results = []
             for i, f in enumerate(frames):
                 if cancel.is_set():
                     log.debug("GIF_BUILD_CANCELLED  frame=%d", i)
                     return
                 try:
-                    results.append(build_composite(f, **params))
+                    results.append(build_composite(f, **kwargs))
                 except Exception:
                     log.exception("FRAME_BUILD_ERROR  frame=%d", i)
                     return
             if not cancel.is_set():
-                self.root.after(0, lambda r=results: self._on_rebuild_done(r))
+                self.root.after(0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"]))
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_rebuild_done(self, results: list) -> None:
+    def _on_rebuild_done(self, results: list, size: int, field_size: int) -> None:
         """Called on the main thread when the background GIF build finishes."""
+        self._apply_resolved_font_size(size, field_size)
         self._cache = results
         self._cache_complete = True
         txt = self._status.cget("text")
