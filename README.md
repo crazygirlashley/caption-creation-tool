@@ -26,7 +26,8 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM); either way, **Save** and **Send to DA** composite and write one frame at a time straight to the output file instead of building the whole thing in memory first, so exporting doesn't need to hold the full file in RAM regardless of length
 - **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
-- **DeviantArt integration** — save finished output as a private draft on DeviantArt with one click; publish to gallery when ready
+- **Find Online…** — search [Barnorama](https://www.barnorama.com) from inside the app for source images/GIFs. The query defaults to physical-description keywords (gender, hair color, body type, age, clothing) pulled from your current caption text; results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed
+- **DeviantArt integration** — save finished output to Sta.sh (DeviantArt's private storage area) with one click; publish to gallery when ready
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
 ---
@@ -35,7 +36,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 
 - **Windows 10 or later**
 - For the **Quick install** below: nothing else — the download is a standalone build with Python, Tk, and ffmpeg all bundled in.
-- For the **Manual install** (running from source): **Python 3.12+** — [python.org/downloads](https://www.python.org/downloads/), plus **Pillow**, **requests**, **imageio**, and **imageio-ffmpeg** via pip. `imageio-ffmpeg` bundles its own ffmpeg binary, so no separate system-wide ffmpeg install is needed either way.
+- For the **Manual install** (running from source): **Python 3.12+** — [python.org/downloads](https://www.python.org/downloads/), plus **Pillow**, **requests**, **imageio**, **imageio-ffmpeg**, and **beautifulsoup4** via pip. `imageio-ffmpeg` bundles its own ffmpeg binary, so no separate system-wide ffmpeg install is needed either way.
 
 > Tkinter is included with the standard Python installer on Windows. If `import tkinter` fails when running from source, re-run the Python installer and ensure the **tcl/tk and IDLE** optional feature is checked.
 
@@ -129,7 +130,7 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 
 ## DeviantArt Upload (Optional)
 
-Caption Creator can save finished images, GIFs, and videos directly to your DeviantArt account as private drafts, and optionally publish them to your gallery.
+Caption Creator can save finished images, GIFs, and videos directly to Sta.sh — DeviantArt's private storage area — and optionally publish them to your gallery.
 
 ### One-time setup
 
@@ -145,7 +146,7 @@ Caption Creator can save finished images, GIFs, and videos directly to your Devi
 2. Once logged in, **DA Login** is replaced by **Send to DA…** and **Log Out** (both hidden again if you log out)
 3. Open an image, GIF, or video and apply your caption styling
 4. Click **Send to DA…** — a dialog prompts for a **Title** (required, starts empty) and a **Description** (pre-filled with your caption text, sent as DeviantArt's artist comments); if you started from a video, you'll also choose to upload as **MP4** or **GIF** (defaults to MP4); all are editable before sending
-5. The file saves as a private draft on your DeviantArt account
+5. The file uploads to Sta.sh, DeviantArt's private storage area
 6. Click **Publish to Gallery** in the confirmation dialog to make it public
 
 Click **Log Out** to clear the cached token (with a confirmation prompt) if you need to re-authorize or switch accounts. Tokens are saved to `da_tokens.json` and refreshed automatically (valid for 3 months). Your Client ID is saved to `da_settings.json`. Both files are excluded from version control.
@@ -191,6 +192,28 @@ See `formats/Standard.json`, `formats/X-Change.json`, and their `(Vertical)` cou
 
 ---
 
+## Custom Themes
+
+UI color themes work the same way as formats: JSON files in a `themes/` folder, picked up automatically. **Basic** (this app's original look) is always available and isn't a file — it's just the system's native theme with no color overrides. **Dark** and **Bubblegum** are the two built-in themes tracked in version control by default; drop your own `.json` file into `themes/` and it appears in **⚙ Settings → Theme** the next time you open that menu, no restart needed.
+
+Each theme file requires every one of these keys (all hex color strings):
+
+| Field | Description |
+|---|---|
+| `name` | Display name shown in the Theme menu |
+| `bg` | Main window/panel background |
+| `panel` | Buttons, tabs, and other raised surfaces |
+| `input_bg` | Text boxes, entries, and spinboxes |
+| `hover` | Button/control color on mouse-over |
+| `border` | Widget borders and separators |
+| `fg` | Primary text color |
+| `muted_fg` | Secondary/disabled text color |
+| `select_bg` | Selection highlight color |
+
+See `themes/Dark.json` and `themes/Bubblegum.json` for examples. A file missing any of these keys is skipped rather than crashing the app.
+
+---
+
 ## Building a Release (maintainers)
 
 The Quick install downloads a prebuilt release rather than running from source,
@@ -226,7 +249,9 @@ touched.
 caption-creation-tool/
 ├── app_paths.py            # Frozen-aware BASE_DIR/RESOURCE_DIR resolution
 ├── caption_creator.py      # Main application
-├── da_client.py             # DeviantArt API client (OAuth2 PKCE, draft upload)
+├── da_client.py             # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
+├── web_lookup.py            # Barnorama search/scrape client (Find Online…)
+├── themes.py                 # UI theme loader/applier (⚙ Settings → Theme)
 ├── assets/                   # App branding
 │   ├── logo.png                # Window/taskbar icon
 │   └── icon.png                 # .exe / Desktop shortcut icon (built releases only)
@@ -235,6 +260,9 @@ caption-creation-tool/
 │   ├── Standard (Vertical).json
 │   ├── X-Change.json
 │   └── X-Change (Vertical).json
+├── themes/                   # UI theme definitions (JSON) — add your own here
+│   ├── Dark.json
+│   └── Bubblegum.json
 ├── packaging/                # PyInstaller build (see "Building a Release")
 │   ├── build.spec               # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe
 │   └── launcher.py               # Update checker + launcher source

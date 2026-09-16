@@ -13,6 +13,9 @@ caption_creator_crash.log*
 da_tokens.json
 da_settings.json
 
+# UI theme preference (personal, per-install)
+ui_settings.json
+
 # personal watermark images
 watermark/
 
@@ -22,3 +25,10 @@ formats/*.json
 !formats/Standard (Vertical).json
 !formats/X-Change.json
 !formats/X-Change (Vertical).json
+
+# personal UI themes — only the built-in themes are committed by default
+# (Basic.json ships too, but as reference only — see themes.py)
+themes/*.json
+!themes/Dark.json
+!themes/Bubblegum.json
+!themes/Basic.json

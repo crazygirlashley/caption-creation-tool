@@ -25,6 +25,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
 import da_client
+import themes
+import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
 
 # ---------------------------------------------------------------------------
@@ -299,6 +301,13 @@ _DA_MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 # regardless of how huge the real source is.
 _DEFERRED_SIZE_SAMPLE_FRAMES = 30
 
+# Web lookup (Find Online…) — how many of a search page's matching posts to
+# expand into their actual image galleries, and how many images to pull from
+# each, so a single search stays a bounded number of network requests rather
+# than fetching every image in every matching post's gallery (some run 40+).
+_WL_MAX_POSTS_TO_EXPAND = 10
+_WL_MAX_IMAGES_PER_POST = 6
+
 
 def _human_size(num_bytes: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -534,7 +543,8 @@ def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
 def _panel_total_size(fw: int, fh: int, cap_width: int, layout: str) -> tuple:
     """Composite dimensions before the minimum-output-size floor/override
     scaling — shared by build_composite and the Output Size Override
-    slider's default-position calculation (CaptionApp._default_output_pct)."""
+    slider's default-position calculation
+    (CaptionApp._compute_default_output_pct_async)."""
     if layout == "vertical":
         return fw, fh + cap_width
     return fw + cap_width, fh
@@ -841,6 +851,14 @@ class CaptionApp:
         self.root.title("Caption Creator")
         self.root.minsize(800, 500)
 
+        # Theme — applied before _build_ui() so every widget is created with
+        # the right colors from the start; _apply_theme() handles a live
+        # switch later (see its docstring for what option_add can't cover).
+        self._style = ttk.Style(self.root)
+        self._theme_name = themes.load_theme()
+        themes.apply(self.root, self._style, self._theme_name)
+        self._theme_var = tk.StringVar(value=self._theme_name)
+
         log.info("APP_START  python=%s  platform=%s", sys.version.split()[0], sys.platform)
         root.report_callback_exception = _tk_excepthook
         self._watchdog = _Watchdog()
@@ -860,6 +878,14 @@ class CaptionApp:
         self._deferred_kind: Optional[str] = None
         self._deferred_total_frames: Optional[int] = None
         self._source_path: Optional[str] = None
+        # Path of the last Find Online download, if the current source came
+        # from there — unlike a user's own file, nothing else references
+        # this path once it's replaced, so it'd otherwise leak permanently
+        # in the OS temp dir. Cleaned up in _load_source() (when replaced)
+        # and _on_close() (on exit) rather than right after loading, since
+        # animated sources keep reading frames from this path for Save/Send
+        # to DA for as long as it's the active source.
+        self._temp_source_path: Optional[str] = None
         self._single_frame_var = tk.BooleanVar(value=False)
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
@@ -946,6 +972,11 @@ class CaptionApp:
             self.root.after_cancel(self._refresh_job)
         if self._preview_debounce_job:
             self.root.after_cancel(self._preview_debounce_job)
+        if self._temp_source_path:
+            try:
+                os.unlink(self._temp_source_path)
+            except OSError:
+                pass
         self._watchdog.stop()
         self.root.destroy()
 
@@ -957,7 +988,13 @@ class CaptionApp:
         # ---- Toolbar (top) ----
         bar = ttk.Frame(self.root, padding=(6, 5))
         bar.pack(side="top", fill="x")
+        # Anchored to the far right regardless of how many left-packed
+        # buttons precede it — DA Settings and the theme picker live here
+        # now instead of as standalone toolbar buttons.
+        self._settings_btn = ttk.Button(bar, text="⚙ Settings", command=self._open_settings_menu)
+        self._settings_btn.pack(side="right", padx=4)
         ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
+        ttk.Button(bar, text="Find Online…", command=self._web_lookup).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
         # Only shown for animated sources (GIF/MP4) — hidden for static images.
         self._single_frame_check = ttk.Checkbutton(
@@ -971,8 +1008,6 @@ class CaptionApp:
         self._da_login_btn.pack(side="left", padx=2)
         self._da_send_btn = ttk.Button(bar, text="Send to DA…", command=self._da_send)
         self._da_logout_btn = ttk.Button(bar, text="Log Out", command=self._da_logout)
-        self._da_settings_btn = ttk.Button(bar, text="DA Settings", command=self._da_settings)
-        self._da_settings_btn.pack(side="left", padx=2)
 
         # ---- Status bar (bottom) — DA login state and current file info ----
         status_bar = ttk.Frame(self.root, padding=(6, 3))
@@ -986,6 +1021,7 @@ class CaptionApp:
         right = tk.Frame(self.root, width=320, bg=self.root.cget("bg"))
         right.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
         right.pack_propagate(False)
+        self._right_frame = right  # classic tk widget — recolored by hand on theme switch
 
         # ---- Preview canvas fills remaining left space ----
         pf = ttk.LabelFrame(self.root, text="Preview", padding=4)
@@ -1025,6 +1061,7 @@ class CaptionApp:
         # Format selector + Reload + Apply
         fmt_bar = tk.Frame(right, bg=right.cget("bg"))
         fmt_bar.pack(fill="x", padx=8, pady=6)
+        self._fmt_bar = fmt_bar  # classic tk widget — recolored by hand on theme switch
         ttk.Label(fmt_bar, text="Format:").pack(side="left")
         self._fmt_combo = ttk.Combobox(fmt_bar, textvariable=self._format_var,
                                        values=list(self._formats.keys()),
@@ -1339,6 +1376,56 @@ class CaptionApp:
 
 
     # ------------------------------------------------------------------
+    # Settings menu (top-right gear button) — DA Settings and theme choice
+    # ------------------------------------------------------------------
+
+    def _open_settings_menu(self) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="DA Settings…", command=self._da_settings)
+        menu.add_separator()
+        theme_menu = tk.Menu(menu, tearoff=False)
+        # Rescan themes/ on every open (cheap — a handful of small JSON
+        # files) so a theme dropped in while the app is running shows up
+        # without needing a restart, same spirit as the formats ↺ reload.
+        theme_names = ["basic"] + sorted(themes.get_palettes(force_reload=True).keys())
+        for key in theme_names:
+            label = "Basic" if key == "basic" else key
+            theme_menu.add_radiobutton(
+                label=label, value=key, variable=self._theme_var,
+                command=lambda k=key: self._set_theme(k))
+        menu.add_cascade(label="Theme", menu=theme_menu)
+
+        x = self._settings_btn.winfo_rootx()
+        y = self._settings_btn.winfo_rooty() + self._settings_btn.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _set_theme(self, name: str) -> None:
+        if name == self._theme_name:
+            return
+        self._theme_name = name
+        themes.save_theme(name)
+        self._apply_theme(name)
+
+    def _apply_theme(self, name: str) -> None:
+        """Re-theme every ttk widget (instant, since Style is global) and
+        recolor the handful of classic (non-ttk) widgets this app holds
+        direct references to — option_add() set inside themes.apply() only
+        affects widgets created after this call, so anything already built
+        needs to be touched by hand. Any dialog not currently open (DA
+        Settings, Find Online, etc.) simply gets built with the new colors
+        correctly the next time it's opened."""
+        themes.apply(self.root, self._style, name)
+        colors = themes.classic_colors(name)
+        self._right_frame.configure(bg=colors["bg"])
+        self._fmt_bar.configure(bg=colors["bg"])
+        self._pill_frame.configure(bg=colors["bg"])
+        for box in (self._text_box, self._header_text_box, self._footer_text_box):
+            box.configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
+
+    # ------------------------------------------------------------------
     # Aardvark Cafe prompt
     # ------------------------------------------------------------------
 
@@ -1425,14 +1512,18 @@ class CaptionApp:
 
     def _on_output_override_toggle(self) -> None:
         if self._output_override_var.get():
+            self._output_pct_row.pack(side="top", fill="x", pady=(0, 4), before=self._canvas)
             # Start the slider wherever reproduces today's normal output
             # size for the current file — checking the box shouldn't itself
-            # change anything until you actually move the slider.
-            self._output_pct_var.set(self._default_output_pct())
-            self._output_pct_row.pack(side="top", fill="x", pady=(0, 4), before=self._canvas)
+            # change anything until you actually move the slider. Computed
+            # off the main thread (see _compute_default_output_pct_async);
+            # setting _output_pct_var once it's ready triggers a refresh
+            # itself via its write-trace in _build_ui, so no explicit
+            # _safe_refresh() call is needed on this branch.
+            self._compute_default_output_pct_async()
         else:
             self._output_pct_row.pack_forget()
-        self._safe_refresh()
+            self._safe_refresh()
 
     def _on_gif_compress_toggle(self) -> None:
         if self._gif_compress_var.get():
@@ -1444,24 +1535,36 @@ class CaptionApp:
             self._gif_colors_row.pack_forget()
         self._safe_refresh()
 
-    def _default_output_pct(self) -> int:
-        """The Output Size Override slider position that reproduces today's
-        normal (non-overridden) output size for the currently loaded file —
-        varies per image, since it depends on how the source's natural size
-        compares to the 1280x720 floor. See _output_scale_bounds."""
+    def _compute_default_output_pct_async(self) -> None:
+        """Background version of the Output Size Override slider's
+        default-position calculation. Auto-fit's font-size search (via
+        _resolve_composite_kwargs) can take long enough on a large caption
+        to freeze the UI if run synchronously on the main thread — the same
+        problem _refresh_preview/_rebuild_all_async were split up to avoid,
+        just reached from a different caller (the override checkbox) that
+        was missed at the time. See _output_scale_bounds for the scales."""
         if not self._frames:
-            return 0
-        params = self._collect_render_params()
-        if params is None:
-            return 0
+            self._output_pct_var.set(0)
+            return
+        raw = self._gather_raw_params()
+        if raw is None:
+            return
         fw, fh = self._frames[0].size
-        total_w, total_h = _panel_total_size(fw, fh, params["cap_width"], params["layout"])
-        floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
-        span = ceiling_scale - floor_scale
-        if span <= 0:
-            return 0
-        pct = round(100 * (default_scale - floor_scale) / span)
-        return max(0, min(100, pct))
+
+        def _build() -> None:
+            try:
+                kwargs, _size = _resolve_composite_kwargs(raw)
+            except Exception:
+                log.exception("OUTPUT_PCT_ERROR")
+                return
+            total_w, total_h = _panel_total_size(fw, fh, kwargs["cap_width"], kwargs["layout"])
+            floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
+            span = ceiling_scale - floor_scale
+            pct = 0 if span <= 0 else max(0, min(
+                100, round(100 * (default_scale - floor_scale) / span)))
+            self.root.after(0, lambda p=pct: self._output_pct_var.set(p))
+
+        threading.Thread(target=_build, daemon=True).start()
 
     def _apply_dynamic_width(self) -> None:
         """When Dynamic Width/Height is enabled, override the caption panel
@@ -1782,6 +1885,23 @@ class CaptionApp:
         )
         if not path:
             return
+        self._load_source(path)
+
+    def _load_source(self, path: str, *, is_temp_download: bool = False) -> None:
+        """Load path (any file on disk — a local pick from _open(), or a
+        temp file downloaded by _web_lookup()) as the current source image/
+        GIF/video, replacing whatever was previously loaded."""
+        # A previous Find Online download is about to stop being the active
+        # source (or the app never loads it again) — unlike a user's own
+        # file it's not reachable from anywhere else, so clean it up now
+        # instead of leaking it in the OS temp dir. Safe even if loading
+        # this new path fails partway below: either way it's being replaced.
+        if self._temp_source_path and self._temp_source_path != path:
+            try:
+                os.unlink(self._temp_source_path)
+            except OSError:
+                pass
+        self._temp_source_path = path if is_temp_download else None
 
         self._stop_anim()
         self._build_cancel.set()
@@ -1850,6 +1970,273 @@ class CaptionApp:
         self._anim_idx = 0
         self._apply_dynamic_width()
         self._safe_refresh(debounce_ms=0)
+
+    # ------------------------------------------------------------------
+    # Online lookup (Barnorama) — search using keywords pulled from the
+    # caption text, and list the matching posts' actual images/GIFs
+    # directly (no separate "open this post" step) — clicking one
+    # downloads and loads it as the source file. Non-modal (like the DA
+    # log window) since search/download are asynchronous; only one lookup
+    # window at a time.
+    # ------------------------------------------------------------------
+
+    def _web_lookup(self) -> None:
+        if hasattr(self, "_wl_win") and self._wl_win and self._wl_win.winfo_exists():
+            self._wl_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Find Online — Barnorama")
+        win.geometry("860x620")
+        self._wl_win = win
+        self._wl_page = 1
+        self._wl_thumbs: list = []  # keeps PhotoImage refs alive
+        self._wl_image_buttons: list = []
+        self._wl_search_token: object = None
+
+        def _on_close():
+            self._wl_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        search_row = ttk.Frame(win, padding=8)
+        search_row.pack(side="top", fill="x")
+        full_caption = self._text_box.get("1.0", "end-1c")
+        default_query = web_lookup.extract_keywords(full_caption)
+        query_var = tk.StringVar(value=default_query)
+        entry = ttk.Entry(search_row, textvariable=query_var)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        search_btn = ttk.Button(search_row, text="Search")
+        search_btn.pack(side="left")
+        self._wl_query_var = query_var
+
+        status_lbl = ttk.Label(win, text="", foreground="#888", padding=(8, 2), wraplength=820,
+                               justify="left")
+        status_lbl.pack(side="top", anchor="w")
+        self._wl_status_lbl = status_lbl
+
+        nav_row = ttk.Frame(win, padding=8)
+        nav_row.pack(side="bottom", fill="x")
+        prev_btn = ttk.Button(nav_row, text="← Prev", state="disabled")
+        prev_btn.pack(side="left")
+        page_lbl = ttk.Label(nav_row, text="Page 1")
+        page_lbl.pack(side="left", padx=8)
+        next_btn = ttk.Button(nav_row, text="Next →", state="disabled")
+        next_btn.pack(side="left")
+        self._wl_prev_btn = prev_btn
+        self._wl_next_btn = next_btn
+        self._wl_page_lbl = page_lbl
+        self._wl_search_btn = search_btn
+
+        body = ttk.Frame(win)
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=(4, 0))
+        canvas = tk.Canvas(body, highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        results_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=results_frame, anchor="nw")
+        results_frame.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._wl_results_frame = results_frame
+
+        search_btn.config(command=lambda: self._wl_run_search(1))
+        entry.bind("<Return>", lambda _e: self._wl_run_search(1))
+        prev_btn.config(command=lambda: self._wl_run_search(max(1, self._wl_page - 1)))
+        next_btn.config(command=lambda: self._wl_run_search(self._wl_page + 1))
+
+        if default_query:
+            self._wl_run_search(1)
+
+    def _wl_run_search(self, page: int) -> None:
+        query = self._wl_query_var.get().strip()
+        if not query:
+            return
+        self._wl_page = page
+        for w in self._wl_results_frame.winfo_children():
+            w.destroy()
+        self._wl_thumbs = []
+        self._wl_image_buttons = []
+        # A fresh token per search — the Entry is never disabled while a
+        # search is in flight (only the buttons are), so pressing Enter
+        # again before the first request returns can start a second one.
+        # Every callback below checks this before touching the UI, so a
+        # superseded search's results/images are dropped instead of landing
+        # alongside the newer search's.
+        token = object()
+        self._wl_search_token = token
+        self._wl_search_btn.config(state="disabled")
+        self._wl_prev_btn.config(state="disabled")
+        self._wl_next_btn.config(state="disabled")
+        self._wl_status_lbl.config(text=f"Searching '{query}'…", foreground="#888")
+        self._wl_page_lbl.config(text=f"Page {page}")
+
+        def _work() -> None:
+            try:
+                posts = web_lookup.search(query, page)
+            except Exception as exc:
+                log.exception("WEB_LOOKUP_SEARCH_ERROR")
+                self.root.after(0, lambda e=exc: self._wl_on_search_error(e, token))
+                return
+            if not posts:
+                self.root.after(0, lambda: self._wl_on_search_empty(token))
+                return
+            self.root.after(0, lambda n=len(posts): self._wl_on_posts_found(n, token))
+
+            # Expand each matching post into its actual images — capped on
+            # both axes so one search stays a bounded amount of network
+            # work rather than fetching every image in every matching
+            # post's gallery (some run 40+ images; others, e.g. a
+            # single-photo celebrity post, only have one — that's the real
+            # content, not a bug, but see _wl_add_post_block for why each
+            # post's images are grouped under its own title rather than
+            # rendered as one flat list).
+            image_count = 0
+            for post in posts[:_WL_MAX_POSTS_TO_EXPAND]:
+                if token is not self._wl_search_token:
+                    return  # superseded — stop doing pointless network work
+                try:
+                    urls = web_lookup.fetch_gallery_images(post["url"])
+                except Exception:
+                    log.exception("WEB_LOOKUP_GALLERY_ERROR  %s", post["url"])
+                    continue
+                urls = urls[:_WL_MAX_IMAGES_PER_POST]
+                if not urls:
+                    continue
+                if token is not self._wl_search_token:
+                    return
+                self.root.after(
+                    0, lambda t=post["title"], u=urls: self._wl_add_post_block(t, u, token))
+                image_count += len(urls)
+            self.root.after(0, lambda n=image_count: self._wl_on_search_complete(n, token))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _wl_search_alive(self, token: object) -> bool:
+        return (token is self._wl_search_token
+                and bool(self._wl_win) and self._wl_win.winfo_exists())
+
+    def _wl_on_posts_found(self, n: int, token: object) -> None:
+        if not self._wl_search_alive(token):
+            return
+        self._wl_search_btn.config(state="normal")
+        self._wl_prev_btn.config(state="normal" if self._wl_page > 1 else "disabled")
+        self._wl_status_lbl.config(text=f"{n} matching post(s) — loading images…")
+
+    def _wl_on_search_empty(self, token: object) -> None:
+        if not self._wl_search_alive(token):
+            return
+        self._wl_search_btn.config(state="normal")
+        self._wl_prev_btn.config(state="normal" if self._wl_page > 1 else "disabled")
+        self._wl_status_lbl.config(
+            text="No results." if self._wl_page == 1 else "No more results.")
+
+    def _wl_on_search_error(self, exc: Exception, token: object) -> None:
+        if not self._wl_search_alive(token):
+            return
+        self._wl_search_btn.config(state="normal")
+        self._wl_prev_btn.config(state="normal" if self._wl_page > 1 else "disabled")
+        self._wl_status_lbl.config(text=f"Search failed: {exc}", foreground="#c0392b")
+
+    def _wl_on_search_complete(self, image_count: int, token: object) -> None:
+        if not self._wl_search_alive(token):
+            return
+        self._wl_next_btn.config(state="normal")
+        if image_count:
+            self._wl_status_lbl.config(text=f"{image_count} image(s) — click one to use it")
+        else:
+            self._wl_status_lbl.config(text="No images found in the matching posts.")
+
+    def _wl_add_post_block(self, post_title: str, urls: list, token: object) -> None:
+        """Render one matching post as a title header followed by a
+        horizontal strip of its own image thumbnails (up to
+        _WL_MAX_IMAGES_PER_POST, so a strip never wraps past the results
+        panel's width). Grouping this way — rather than one flat list of
+        image rows with the post title as a per-row caption — is what
+        makes it visually obvious that several thumbnails in a row are
+        different photos from the *same* article, instead of reading as
+        one row per article regardless of how many images it actually has."""
+        if not self._wl_search_alive(token):
+            return
+        ttk.Label(self._wl_results_frame, text=post_title, foreground="#555",
+                  wraplength=820, justify="left",
+                  font=("TkDefaultFont", 9, "bold")).pack(
+            side="top", anchor="w", pady=(8, 2))
+        strip = ttk.Frame(self._wl_results_frame)
+        strip.pack(side="top", anchor="w", pady=(0, 4))
+        for url in urls:
+            self._wl_add_image_thumb(strip, url, token)
+
+    def _wl_add_image_thumb(self, parent: ttk.Frame, url: str, token: object) -> None:
+        if not self._wl_search_alive(token):
+            return
+        btn = tk.Button(parent, text="…", width=12, height=6, relief="flat",
+                        command=lambda u=url: self._wl_select_image(u))
+        btn.pack(side="left", padx=(0, 4))
+        self._wl_image_buttons.append(btn)
+
+        def _work() -> None:
+            try:
+                data = web_lookup.download_bytes(url)
+                img = Image.open(io.BytesIO(data)).convert("RGB")
+                img.thumbnail((130, 95), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+            except Exception:
+                return
+            self.root.after(0, lambda p=photo, b=btn: self._wl_apply_thumb(p, b))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _wl_apply_thumb(self, photo: ImageTk.PhotoImage, button: tk.Button) -> None:
+        if not button.winfo_exists():
+            return
+        # width/height were set in character units for the "…" text
+        # placeholder — once an image replaces the text, Tk reinterprets
+        # those same numbers as pixels, clipping the button to ~18x12px
+        # regardless of the image's real size. Resetting both to 0 lets it
+        # auto-size to the actual (now much larger) thumbnail instead.
+        button.config(image=photo, text="", width=0, height=0)
+        self._wl_thumbs.append(photo)  # keep alive — Button only holds a weak ref
+
+    def _wl_select_image(self, url: str) -> None:
+        self._wl_status_lbl.config(text="Downloading selected image…", foreground="#888")
+        for btn in self._wl_image_buttons:
+            if btn.winfo_exists():
+                btn.config(state="disabled")
+        self._wl_prev_btn.config(state="disabled")
+        self._wl_next_btn.config(state="disabled")
+        self._wl_search_btn.config(state="disabled")
+
+        def _work() -> None:
+            try:
+                path = web_lookup.download_to_tempfile(url)
+            except Exception as exc:
+                log.exception("WEB_LOOKUP_DOWNLOAD_ERROR")
+                self.root.after(0, lambda e=exc: self._wl_on_download_done(None, e))
+                return
+            self.root.after(0, lambda p=path: self._wl_on_download_done(p, None))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _wl_on_download_done(self, path: Optional[str], exc: Optional[Exception]) -> None:
+        if not self._wl_win or not self._wl_win.winfo_exists():
+            return
+        if exc is not None:
+            messagebox.showerror("Download Failed", f"Couldn't download image:\n{exc}",
+                                 parent=self._wl_win)
+            self._wl_status_lbl.config(text="Search results", foreground="#888")
+            for btn in self._wl_image_buttons:
+                if btn.winfo_exists():
+                    btn.config(state="normal")
+            self._wl_prev_btn.config(state="normal" if self._wl_page > 1 else "disabled")
+            self._wl_next_btn.config(state="normal")
+            self._wl_search_btn.config(state="normal")
+            return
+        win = self._wl_win
+        self._wl_win = None
+        win.destroy()
+        self._load_source(path, is_temp_download=True)
 
     def _export_fps(self) -> float:
         """FPS to use when encoding an MP4 — the source video's fps if known,
@@ -2559,16 +2946,15 @@ class CaptionApp:
         if da_client.da_has_cached_token():
             self._da_status_label.config(text="DA: logged in", foreground="#4a4")
             if not send_packed:
-                self._da_send_btn.pack(side="left", padx=2, before=self._da_settings_btn)
+                self._da_send_btn.pack(side="left", padx=2)
             if not logout_packed:
-                self._da_logout_btn.pack(side="left", padx=2, before=self._da_settings_btn)
+                self._da_logout_btn.pack(side="left", padx=2)
             if login_packed:
                 self._da_login_btn.pack_forget()
         else:
             self._da_status_label.config(text="DA: not logged in", foreground="#999")
             if not login_packed:
-                self._da_login_btn.pack(side="left", padx=2,
-                                        before=self._da_send_btn if send_packed else self._da_settings_btn)
+                self._da_login_btn.pack(side="left", padx=2)
             if send_packed:
                 self._da_send_btn.pack_forget()
             if logout_packed:
@@ -2745,7 +3131,7 @@ class CaptionApp:
         return False
 
     def _da_send(self) -> None:
-        """Export the current output and save it as a private draft on DeviantArt."""
+        """Export the current output and upload it to Sta.sh as a private submission."""
         if not self._cache:
             messagebox.showwarning("Nothing to send", "Open an image, GIF, or video first.")
             return
@@ -2830,9 +3216,10 @@ class CaptionApp:
             self._start_da_upload(client_id, tmp_path, title, description)
 
     def _start_da_upload(self, client_id: str, tmp_path: str, title: str, description: str) -> None:
-        """Upload the already-rendered tmp_path to DeviantArt as a private draft,
-        in a background thread; token must already be cached (use DA Login first)."""
-        self._status.config(text=self._status.cget("text") + " [Saving draft…]")
+        """Upload the already-rendered tmp_path to Sta.sh as a private
+        submission, in a background thread; token must already be cached
+        (use DA Login first)."""
+        self._status.config(text=self._status.cget("text") + " [Uploading to Sta.sh…]")
 
         def _upload():
             try:
@@ -2841,7 +3228,7 @@ class CaptionApp:
                 def _on_no_token(e=exc):
                     self._da_in_progress = False
                     self._status.config(
-                        text=self._status.cget("text").replace(" [Saving draft…]", ""))
+                        text=self._status.cget("text").replace(" [Uploading to Sta.sh…]", ""))
                     messagebox.showerror(
                         "Not Logged In",
                         f"{e}\n\nClick 'DA Login' to authenticate first."
@@ -2865,7 +3252,7 @@ class CaptionApp:
 
     def _da_upload_done(self, stackid: str, token: str, tmp_path: str) -> None:
         self._da_in_progress = False
-        self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
+        self._status.config(text=self._status.cget("text").replace(" [Uploading to Sta.sh…]", ""))
         log.info("DA_UPLOAD_DONE  stackid=%s", stackid)
         try:
             os.unlink(tmp_path)
@@ -2873,10 +3260,10 @@ class CaptionApp:
             pass
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("Saved as Draft")
+        dlg.title("Saved to Sta.sh")
         dlg.resizable(False, False)
         dlg.grab_set()
-        ttk.Label(dlg, text="Saved as draft on DeviantArt.",
+        ttk.Label(dlg, text="Saved to Sta.sh — your DeviantArt account's private storage area.",
                   padding=(16, 16, 16, 8)).pack()
 
         pub_status = ttk.Label(dlg, text="", foreground="#555", padding=(16, 0, 16, 4))
@@ -2914,7 +3301,7 @@ class CaptionApp:
 
     def _da_upload_failed(self, msg: str, tmp_path: str) -> None:
         self._da_in_progress = False
-        self._status.config(text=self._status.cget("text").replace(" [Saving draft…]", ""))
+        self._status.config(text=self._status.cget("text").replace(" [Uploading to Sta.sh…]", ""))
         try:
             os.unlink(tmp_path)
         except OSError:

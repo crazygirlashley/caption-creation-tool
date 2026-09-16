@@ -22,6 +22,7 @@ from PyInstaller.utils.hooks import copy_metadata
 REPO_ROOT = os.path.dirname(SPECPATH)
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
 FORMATS_DIR = os.path.join(REPO_ROOT, "formats")
+THEMES_DIR = os.path.join(REPO_ROOT, "themes")
 
 # --- Convert assets/icon.png -> a multi-size .ico for the exe icon ---
 ICON_PNG = os.path.join(ASSETS_DIR, "icon.png")
@@ -38,7 +39,8 @@ ffmpeg_binaries = [(_ffmpeg_exe, os.path.join("imageio_ffmpeg", "binaries"))]
 
 # --- Data bundled read-only alongside the app (see app_paths.RESOURCE_DIR):
 # the 4 built-in formats (seeded into a writable formats/ on first run by
-# _ensure_formats_seeded) and the logo/icon images. ---
+# _ensure_formats_seeded), the 2 built-in themes (same seeding pattern via
+# themes._ensure_themes_seeded), and the logo/icon images. ---
 datas = [
     (os.path.join(ASSETS_DIR, "logo.png"), "assets"),
     (os.path.join(ASSETS_DIR, "icon.png"), "assets"),
@@ -48,6 +50,10 @@ for fname in ("Standard.json", "Standard (Vertical).json",
     src = os.path.join(FORMATS_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "formats"))
+for fname in ("Dark.json", "Bubblegum.json", "Basic.json"):
+    src = os.path.join(THEMES_DIR, fname)
+    if os.path.isfile(src):
+        datas.append((src, "themes"))
 
 # imageio (and a couple of its plugins) call importlib.metadata.version() on
 # themselves at import time -- PyInstaller doesn't bundle dist-info metadata

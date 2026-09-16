@@ -1,0 +1,12 @@
+{
+  "name": "Bubblegum",
+  "bg": "#f29ad8",
+  "panel": "#ffffff",
+  "input_bg": "#ffffff",
+  "hover": "#ffd1ea",
+  "border": "#d6559e",
+  "fg": "#7a1f56",
+  "muted_fg": "#a8578b",
+  "select_bg": "#ff6fb8",
+  "font": "Aardvark Cafe"
+}

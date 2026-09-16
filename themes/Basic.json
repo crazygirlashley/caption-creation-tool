@@ -1,0 +1,12 @@
+{
+  "name": "Basic",
+  "_comment": "Reference only — the app's real 'Basic' theme is not loaded from this file. It means 'use the OS's native ttk theme and Windows system colors directly, with no overrides', which can't be expressed as a fixed palette; themes.py skips any theme file named 'Basic' for exactly this reason. These values are typical Windows 10/11 default-theme equivalents, given here as a starting point if you want to build a custom theme from what 'Basic' normally looks like.",
+  "bg": "#f0f0f0",
+  "panel": "#f0f0f0",
+  "input_bg": "#ffffff",
+  "hover": "#e5f1fb",
+  "border": "#adadad",
+  "fg": "#000000",
+  "muted_fg": "#6d6d6d",
+  "select_bg": "#0078d7"
+}

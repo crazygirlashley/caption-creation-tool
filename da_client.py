@@ -1,4 +1,4 @@
-"""DeviantArt API client — OAuth2 PKCE auth, draft upload via Sta.sh, gallery publish."""
+"""DeviantArt API client — OAuth2 PKCE auth, Sta.sh upload, gallery publish."""
 
 import base64
 import hashlib
@@ -297,7 +297,7 @@ def da_has_cached_token() -> bool:
 
 def da_stash_submit(access_token: str, file_path: str, title: str,
                      artist_comments: str = "") -> str:
-    """Upload file as a private draft on DeviantArt (via Sta.sh). Returns stackid string."""
+    """Upload file to Sta.sh as a private submission. Returns stackid string."""
     file_size = os.path.getsize(file_path)
     log.info("Uploading %s (%.1f KB) to Sta.sh as '%s'...",
              os.path.basename(file_path), file_size / 1024, title or "Caption Creator Upload")

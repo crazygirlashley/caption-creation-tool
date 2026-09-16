@@ -1,0 +1,11 @@
+{
+  "name": "Dark",
+  "bg": "#2e2e2e",
+  "panel": "#383838",
+  "input_bg": "#3f3f3f",
+  "hover": "#4a4a4a",
+  "border": "#4f4f4f",
+  "fg": "#e0e0e0",
+  "muted_fg": "#a3a3a3",
+  "select_bg": "#565656"
+}
