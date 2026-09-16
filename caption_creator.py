@@ -2084,14 +2084,17 @@ class CaptionApp:
                 return
             self.root.after(0, lambda n=len(posts): self._wl_on_posts_found(n, token))
 
-            # Expand each matching post into its actual images — capped on
-            # both axes so one search stays a bounded amount of network
-            # work rather than fetching every image in every matching
-            # post's gallery (some run 40+ images; others, e.g. a
-            # single-photo celebrity post, only have one — that's the real
-            # content, not a bug, but see _wl_add_post_block for why each
-            # post's images are grouped under its own title rather than
-            # rendered as one flat list).
+            # Expand each matching post into its actual images — capped to
+            # _WL_MAX_POSTS_TO_EXPAND posts so one search stays a bounded
+            # amount of network work, but the *images* fetched per post are
+            # NOT truncated here (only in how many _wl_add_post_block shows
+            # inline) — some galleries run 40+ images, and the full list is
+            # what lets "+N more" in the results view open all of them
+            # without a second network round-trip. Others, e.g. a
+            # single-photo celebrity post, only have one image — that's the
+            # real content, not a bug, but see _wl_add_post_block for why
+            # each post's images are grouped under its own title rather
+            # than rendered as one flat list.
             image_count = 0
             for post in posts[:_WL_MAX_POSTS_TO_EXPAND]:
                 if token is not self._wl_search_token:
@@ -2101,14 +2104,13 @@ class CaptionApp:
                 except Exception:
                     log.exception("WEB_LOOKUP_GALLERY_ERROR  %s", post["url"])
                     continue
-                urls = urls[:_WL_MAX_IMAGES_PER_POST]
                 if not urls:
                     continue
                 if token is not self._wl_search_token:
                     return
                 self.root.after(
                     0, lambda t=post["title"], u=urls: self._wl_add_post_block(t, u, token))
-                image_count += len(urls)
+                image_count += min(len(urls), _WL_MAX_IMAGES_PER_POST)
             self.root.after(0, lambda n=image_count: self._wl_on_search_complete(n, token))
 
         threading.Thread(target=_work, daemon=True).start()
@@ -2156,7 +2158,10 @@ class CaptionApp:
         image rows with the post title as a per-row caption — is what
         makes it visually obvious that several thumbnails in a row are
         different photos from the *same* article, instead of reading as
-        one row per article regardless of how many images it actually has."""
+        one row per article regardless of how many images it actually has.
+        A post with more images than fit inline gets a "+N more" button
+        that opens the full gallery — reusing this same (already fetched)
+        urls list, no extra network round-trip."""
         if not self._wl_search_alive(token):
             return
         ttk.Label(self._wl_results_frame, text=post_title, foreground="#555",
@@ -2165,8 +2170,68 @@ class CaptionApp:
             side="top", anchor="w", pady=(8, 2))
         strip = ttk.Frame(self._wl_results_frame)
         strip.pack(side="top", anchor="w", pady=(0, 4))
-        for url in urls:
+        shown = urls[:_WL_MAX_IMAGES_PER_POST]
+        for url in shown:
             self._wl_add_image_thumb(strip, url, token)
+        remaining = len(urls) - len(shown)
+        if remaining > 0:
+            ttk.Button(
+                strip, text=f"+{remaining} more…",
+                command=lambda t=post_title, u=urls: self._wl_open_post_gallery(t, u)
+            ).pack(side="left", padx=(4, 0))
+
+    def _wl_open_post_gallery(self, post_title: str, urls: list) -> None:
+        """Popup listing every image in `urls` — the full, already-fetched
+        gallery for one post — in a scrollable grid. Reached via the "+N
+        more…" button in _wl_add_post_block for posts whose gallery is
+        bigger than fits in the inline strip. Picking a thumbnail here
+        closes the popup and hands off to the same _wl_select_image flow
+        an inline thumbnail uses, so there's only one download/select path."""
+        gallery = tk.Toplevel(self._wl_win)
+        gallery.title(post_title)
+        gallery.geometry("700x600")
+        gallery.transient(self._wl_win)
+
+        thumbs: list = []  # keeps PhotoImage refs alive for this popup
+        gallery._wl_gallery_thumbs = thumbs
+
+        canvas = tk.Canvas(gallery, highlightthickness=0)
+        vsb = ttk.Scrollbar(gallery, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        grid_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=grid_frame, anchor="nw")
+        grid_frame.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def _pick(u: str) -> None:
+            gallery.destroy()
+            self._wl_select_image(u)
+
+        def _apply_gallery_thumb(photo: ImageTk.PhotoImage, button: tk.Button) -> None:
+            if not gallery.winfo_exists() or not button.winfo_exists():
+                return
+            button.config(image=photo, text="", width=0, height=0)
+            thumbs.append(photo)
+
+        cols = 5
+        for i, url in enumerate(urls):
+            btn = tk.Button(grid_frame, text="…", width=12, height=6, relief="flat",
+                            command=lambda u=url: _pick(u))
+            btn.grid(row=i // cols, column=i % cols, padx=4, pady=4)
+
+            def _work(u=url, b=btn) -> None:
+                try:
+                    data = web_lookup.download_bytes(u)
+                    img = Image.open(io.BytesIO(data)).convert("RGB")
+                    img.thumbnail((130, 95), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                except Exception:
+                    return
+                self.root.after(0, lambda p=photo, b=b: _apply_gallery_thumb(p, b))
+
+            threading.Thread(target=_work, daemon=True).start()
 
     def _wl_add_image_thumb(self, parent: ttk.Frame, url: str, token: object) -> None:
         if not self._wl_search_alive(token):
