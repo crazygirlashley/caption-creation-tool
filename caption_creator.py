@@ -886,6 +886,11 @@ class CaptionApp:
         # animated sources keep reading frames from this path for Save/Send
         # to DA for as long as it's the active source.
         self._temp_source_path: Optional[str] = None
+        # Post URL the current source image came from, if it was picked via
+        # Find Online — prefilled into the Send to DA description as credit.
+        # None for a locally opened file, and cleared whenever one replaces
+        # an online source (see _load_source).
+        self._image_source_url: Optional[str] = None
         self._single_frame_var = tk.BooleanVar(value=False)
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
@@ -1887,10 +1892,13 @@ class CaptionApp:
             return
         self._load_source(path)
 
-    def _load_source(self, path: str, *, is_temp_download: bool = False) -> None:
+    def _load_source(self, path: str, *, is_temp_download: bool = False,
+                      source_url: Optional[str] = None) -> None:
         """Load path (any file on disk — a local pick from _open(), or a
         temp file downloaded by _web_lookup()) as the current source image/
-        GIF/video, replacing whatever was previously loaded."""
+        GIF/video, replacing whatever was previously loaded. source_url is
+        the Find Online post the image came from, if any — carried through
+        to _da_send() as a credit line in the default description."""
         # A previous Find Online download is about to stop being the active
         # source (or the app never loads it again) — unlike a user's own
         # file it's not reachable from anywhere else, so clean it up now
@@ -1902,6 +1910,7 @@ class CaptionApp:
             except OSError:
                 pass
         self._temp_source_path = path if is_temp_download else None
+        self._image_source_url = source_url if is_temp_download else None
 
         self._stop_anim()
         self._build_cancel.set()
@@ -2109,7 +2118,8 @@ class CaptionApp:
                 if token is not self._wl_search_token:
                     return
                 self.root.after(
-                    0, lambda t=post["title"], u=urls: self._wl_add_post_block(t, u, token))
+                    0, lambda t=post["title"], u=urls, pu=post["url"]:
+                        self._wl_add_post_block(t, u, pu, token))
                 image_count += min(len(urls), _WL_MAX_IMAGES_PER_POST)
             self.root.after(0, lambda n=image_count: self._wl_on_search_complete(n, token))
 
@@ -2150,7 +2160,8 @@ class CaptionApp:
         else:
             self._wl_status_lbl.config(text="No images found in the matching posts.")
 
-    def _wl_add_post_block(self, post_title: str, urls: list, token: object) -> None:
+    def _wl_add_post_block(self, post_title: str, urls: list, post_url: str,
+                            token: object) -> None:
         """Render one matching post as a title header followed by a
         horizontal strip of its own image thumbnails (up to
         _WL_MAX_IMAGES_PER_POST, so a strip never wraps past the results
@@ -2172,15 +2183,16 @@ class CaptionApp:
         strip.pack(side="top", anchor="w", pady=(0, 4))
         shown = urls[:_WL_MAX_IMAGES_PER_POST]
         for url in shown:
-            self._wl_add_image_thumb(strip, url, token)
+            self._wl_add_image_thumb(strip, url, post_url, token)
         remaining = len(urls) - len(shown)
         if remaining > 0:
             ttk.Button(
                 strip, text=f"+{remaining} more…",
-                command=lambda t=post_title, u=urls: self._wl_open_post_gallery(t, u)
+                command=lambda t=post_title, u=urls, pu=post_url:
+                    self._wl_open_post_gallery(t, u, pu)
             ).pack(side="left", padx=(4, 0))
 
-    def _wl_open_post_gallery(self, post_title: str, urls: list) -> None:
+    def _wl_open_post_gallery(self, post_title: str, urls: list, post_url: str) -> None:
         """Popup listing every image in `urls` — the full, already-fetched
         gallery for one post — in a scrollable grid. Reached via the "+N
         more…" button in _wl_add_post_block for posts whose gallery is
@@ -2207,7 +2219,7 @@ class CaptionApp:
 
         def _pick(u: str) -> None:
             gallery.destroy()
-            self._wl_select_image(u)
+            self._wl_select_image(u, post_url)
 
         def _apply_gallery_thumb(photo: ImageTk.PhotoImage, button: tk.Button) -> None:
             if not gallery.winfo_exists() or not button.winfo_exists():
@@ -2233,11 +2245,12 @@ class CaptionApp:
 
             threading.Thread(target=_work, daemon=True).start()
 
-    def _wl_add_image_thumb(self, parent: ttk.Frame, url: str, token: object) -> None:
+    def _wl_add_image_thumb(self, parent: ttk.Frame, url: str, post_url: str,
+                             token: object) -> None:
         if not self._wl_search_alive(token):
             return
         btn = tk.Button(parent, text="…", width=12, height=6, relief="flat",
-                        command=lambda u=url: self._wl_select_image(u))
+                        command=lambda u=url: self._wl_select_image(u, post_url))
         btn.pack(side="left", padx=(0, 4))
         self._wl_image_buttons.append(btn)
 
@@ -2264,7 +2277,7 @@ class CaptionApp:
         button.config(image=photo, text="", width=0, height=0)
         self._wl_thumbs.append(photo)  # keep alive — Button only holds a weak ref
 
-    def _wl_select_image(self, url: str) -> None:
+    def _wl_select_image(self, url: str, post_url: str) -> None:
         self._wl_status_lbl.config(text="Downloading selected image…", foreground="#888")
         for btn in self._wl_image_buttons:
             if btn.winfo_exists():
@@ -2278,13 +2291,14 @@ class CaptionApp:
                 path = web_lookup.download_to_tempfile(url)
             except Exception as exc:
                 log.exception("WEB_LOOKUP_DOWNLOAD_ERROR")
-                self.root.after(0, lambda e=exc: self._wl_on_download_done(None, e))
+                self.root.after(0, lambda e=exc: self._wl_on_download_done(None, e, post_url))
                 return
-            self.root.after(0, lambda p=path: self._wl_on_download_done(p, None))
+            self.root.after(0, lambda p=path: self._wl_on_download_done(p, None, post_url))
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _wl_on_download_done(self, path: Optional[str], exc: Optional[Exception]) -> None:
+    def _wl_on_download_done(self, path: Optional[str], exc: Optional[Exception],
+                              post_url: Optional[str] = None) -> None:
         if not self._wl_win or not self._wl_win.winfo_exists():
             return
         if exc is not None:
@@ -2301,7 +2315,7 @@ class CaptionApp:
         win = self._wl_win
         self._wl_win = None
         win.destroy()
-        self._load_source(path, is_temp_download=True)
+        self._load_source(path, is_temp_download=True, source_url=post_url)
 
     def _export_fps(self) -> float:
         """FPS to use when encoding an MP4 — the source video's fps if known,
@@ -3204,6 +3218,8 @@ class CaptionApp:
             return
 
         raw_text = self._text_box.get("1.0", "end-1c").strip()
+        if self._image_source_url:
+            raw_text = f"Image Source: {self._image_source_url}\n\n{raw_text}"
         prompt = self._da_send_prompt("", raw_text, offer_mp4=self._is_video)
         if prompt is None:
             return
