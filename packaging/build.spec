@@ -49,7 +49,8 @@ datas = [
     (os.path.join(ASSETS_DIR, "given_names.txt"), "assets"),
 ]
 for fname in ("Standard.json", "Standard (Vertical).json",
-              "X-Change.json", "X-Change (Vertical).json"):
+              "X-Change.json", "X-Change (Vertical).json",
+              "Text Message.json", "Text Message (Vertical).json"):
     src = os.path.join(FORMATS_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "formats"))

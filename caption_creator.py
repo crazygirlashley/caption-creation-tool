@@ -143,14 +143,31 @@ _PILL_PRESETS = {
     "Purple": ("#ae63f4", "#810381"),
 }
 
+# "Text Message" chat-bubble format — colors match real iMessage/SMS bubbles;
+# geometry is expressed as fractions of font_size (not fixed px) so bubbles
+# stay proportionate whether Auto-fit lands on a 14px or 90px font. See
+# _draw_chat_panel/_fit_chat_font_size.
+_CHAT_THEM_BG = "#E5E5EA"        # Apple light-gray bubble
+_CHAT_THEM_FG = "#000000"
+_CHAT_ME_BG_BLUE = "#0B93F6"     # "iMessage" blue
+_CHAT_ME_BG_GREEN = "#4CD964"    # "SMS" green
+_CHAT_ME_FG = "#FFFFFF"
+
+_CHAT_BUBBLE_MAX_W_FRAC = 0.78     # bubble max width, fraction of panel inner width
+_CHAT_BUBBLE_PAD_X_FRAC = 0.38     # internal bubble padding, fraction of font_size
+_CHAT_BUBBLE_PAD_Y_FRAC = 0.24
+_CHAT_BUBBLE_SPACING_FRAC = 0.22   # gap between bubbles, fraction of font_size
+_CHAT_BUBBLE_RADIUS_FRAC = 0.42    # corner radius, fraction of font_size
+
 _AARDVARK_NAME = "Aardvark Cafe"
 _AARDVARK_DAFONT = "https://www.dafont.com/aardvark-cafe.font"
 
 _FORMATS_DIR = os.path.join(BASE_DIR, "formats")
 
 # Formats shipped with the app — overwriting one of these locally is fine,
-# but only these four are pushed/committed to the repo by default.
-_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)"}
+# but only these are pushed/committed to the repo by default.
+_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)",
+                      "Text Message", "Text Message (Vertical)"}
 
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
@@ -415,18 +432,21 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
 
     if raw["auto_size"] and raw["frame_size"] is not None:
         fw, fh = raw["frame_size"]
-        if layout == "vertical":
-            # Vertical: panel spans full image width; cap_width is the panel height
-            size = _fit_font_size(text, raw["font_family"], _MAX_AUTO_FONT_SIZE,
-                                  fw, width, pad, stroke_w, bold)
+        # Vertical: panel spans full image width; cap_width is the panel height.
+        area_w, area_h = (fw, width) if layout == "vertical" else (width, fh)
+        if raw.get("chat_messages") is not None:
+            size = _fit_chat_font_size(raw["chat_messages"], raw["font_family"],
+                                       _MAX_AUTO_FONT_SIZE, area_w, area_h, pad, bold)
         else:
             size = _fit_font_size(text, raw["font_family"], _MAX_AUTO_FONT_SIZE,
-                                  width, fh, pad, stroke_w, bold)
+                                  area_w, area_h, pad, stroke_w, bold)
     else:
         size = raw["field_size"]
 
     kwargs: dict = dict(
         text=text,
+        chat_messages=raw.get("chat_messages"),
+        bubble_color=raw.get("bubble_color", "blue"),
         cap_width=width,
         page_bg=raw["page_bg"],
         font_family=raw["font_family"],
@@ -540,6 +560,115 @@ def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
         ty += line_h
 
 
+def _chat_measure_message(text: str, font: ImageFont.FreeTypeFont,
+                          draw: ImageDraw.ImageDraw, max_bubble_w: int,
+                          pad_x: int, pad_y: int, line_h: int) -> tuple:
+    """Wrap `text` and return (lines, bubble_w, bubble_h) for one chat
+    bubble. Shared by _chat_layout_height (Auto-fit's search) and
+    _draw_chat_panel (the actual draw) so the two can never disagree on how
+    tall a message's bubble is."""
+    lines = _wrap_lines(text, font, max_bubble_w - pad_x * 2, draw)
+    text_w = max((draw.textbbox((0, 0), ln, font=font)[2] for ln in lines), default=0)
+    bubble_w = text_w + pad_x * 2
+    bubble_h = len(lines) * line_h + pad_y * 2
+    return lines, bubble_w, bubble_h
+
+
+def _chat_layout_height(messages: list, font_family: str, font_size: int, bold: bool,
+                        panel_w: int, padding: int, draw: ImageDraw.ImageDraw) -> int:
+    """Total stacked-bubble height for `messages` at `font_size`, inset by
+    `padding` on both sides (mirrors how _fit_font_size/_draw_text_block
+    treat `padding`). Used by _fit_chat_font_size's binary search."""
+    font = _pil_font(font_family, font_size, bold)
+    line_h = int(font_size * 1.3)
+    pad_x = max(8, int(font_size * _CHAT_BUBBLE_PAD_X_FRAC))
+    pad_y = max(5, int(font_size * _CHAT_BUBBLE_PAD_Y_FRAC))
+    spacing = max(4, int(font_size * _CHAT_BUBBLE_SPACING_FRAC))
+    max_bubble_w = int((panel_w - padding * 2) * _CHAT_BUBBLE_MAX_W_FRAC)
+    total_h = 0
+    drawn = 0
+    for msg in messages:
+        txt = (msg.get("text") or "").strip()
+        if not txt:
+            continue
+        _, _, bubble_h = _chat_measure_message(txt, font, draw, max_bubble_w, pad_x, pad_y, line_h)
+        if drawn:
+            total_h += spacing
+        total_h += bubble_h
+        drawn += 1
+    return total_h
+
+
+def _fit_chat_font_size(messages: list, font_family: str, max_size: int,
+                        panel_w: int, panel_h: int, padding: int,
+                        bold: bool = False) -> int:
+    """Binary-search for the largest font size where the stacked bubbles fit
+    in panel_h — mirrors _fit_font_size's search exactly, but measuring
+    bubble-stack height instead of wrapped-paragraph height."""
+    if not any((m.get("text") or "").strip() for m in messages):
+        return max_size
+    tmp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    lo, hi, best = 6, max_size, 6
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        total_h = _chat_layout_height(messages, font_family, mid, bold, panel_w, padding, tmp_draw)
+        if total_h + padding * 2 <= panel_h:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _draw_chat_panel(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
+                     messages: list, font_family: str, font_size: int, padding: int,
+                     bold: bool, bubble_color: str,
+                     shadow_draw: Optional[ImageDraw.ImageDraw] = None) -> None:
+    """Draw a stack of chat bubbles into the panel rect (x, y, w, h) — left-
+    aligned gray for 'them', right-aligned blue/green for 'me'. Bubbles that
+    would overflow past y+h are skipped entirely (graceful truncation
+    rather than bleeding into the image)."""
+    font = _pil_font(font_family, font_size, bold)
+    line_h = int(font_size * 1.3)
+    pad_x = max(8, int(font_size * _CHAT_BUBBLE_PAD_X_FRAC))
+    pad_y = max(5, int(font_size * _CHAT_BUBBLE_PAD_Y_FRAC))
+    spacing = max(4, int(font_size * _CHAT_BUBBLE_SPACING_FRAC))
+    radius = max(6, int(font_size * _CHAT_BUBBLE_RADIUS_FRAC))
+    inner_x = x + padding
+    inner_w = w - padding * 2
+    max_bubble_w = int(inner_w * _CHAT_BUBBLE_MAX_W_FRAC)
+    me_fill = _hex_to_rgb(_CHAT_ME_BG_GREEN if bubble_color == "green" else _CHAT_ME_BG_BLUE)
+    them_fill = _hex_to_rgb(_CHAT_THEM_BG)
+    me_fg = _hex_to_rgb(_CHAT_ME_FG)
+    them_fg = _hex_to_rgb(_CHAT_THEM_FG)
+
+    ty = y + padding
+    bottom_limit = y + h - padding
+    for msg in messages:
+        txt = (msg.get("text") or "").strip()
+        if not txt:
+            continue
+        is_me = msg.get("sender") == "me"
+        lines, bubble_w, bubble_h = _chat_measure_message(
+            txt, font, draw, max_bubble_w, pad_x, pad_y, line_h)
+        if ty + bubble_h > bottom_limit:
+            break
+        bx0 = inner_x + inner_w - bubble_w if is_me else inner_x
+        bx1 = bx0 + bubble_w
+        by0, by1 = ty, ty + bubble_h
+        fill = me_fill if is_me else them_fill
+        fg = me_fg if is_me else them_fg
+        if shadow_draw is not None:
+            shadow_draw.rounded_rectangle(
+                (bx0 + 2, by0 + 3, bx1 + 2, by1 + 3), radius=radius, fill=(0, 0, 0, 120))
+        draw.rounded_rectangle((bx0, by0, bx1, by1), radius=radius, fill=fill + (255,))
+        ly = by0 + pad_y
+        for line in lines:
+            draw.text((bx0 + pad_x, ly), line, font=font, fill=fg)
+            ly += line_h
+        ty += bubble_h + spacing
+
+
 def _panel_total_size(fw: int, fh: int, cap_width: int, layout: str) -> tuple:
     """Composite dimensions before the minimum-output-size floor/override
     scaling — shared by build_composite and the Output Size Override
@@ -595,6 +724,8 @@ def build_composite(
     watermark_height: int = 60,
     output_override: bool = False,
     output_size_pct: float = 0.0,
+    chat_messages: Optional[list] = None,
+    bubble_color: str = "blue",
 ) -> Image.Image:
     frame = frame.convert("RGBA")
     fw, fh = frame.size
@@ -633,10 +764,15 @@ def build_composite(
         txt_draw = draw
         shd_draw_ctx = None
 
-    _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
-                     text, font_family, font_size, font_color, padding,
-                     stroke_width, stroke_color, bold, shd_draw_ctx,
-                     align=align)
+    if chat_messages is not None:
+        _draw_chat_panel(txt_draw, panel_x, panel_y, panel_w, panel_h,
+                         chat_messages, font_family, font_size, padding,
+                         bold, bubble_color, shd_draw_ctx)
+    else:
+        _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
+                         text, font_family, font_size, font_color, padding,
+                         stroke_width, stroke_color, bold, shd_draw_ctx,
+                         align=align)
 
     # Watermark — bottom-left of image; track right edge for footer placement
     wm_right = image_x + 8
@@ -927,6 +1063,15 @@ class CaptionApp:
         self._align_var = tk.StringVar(value="center")
         self._side_var = tk.StringVar(value="right")
 
+        # Text Message chat-mode state (see _build_caption_tab /
+        # _update_chat_mode_visibility / _rebuild_chat_rows)
+        self._chat_messages: list = [
+            {"sender": "them", "text": "did you see this??"},
+            {"sender": "me", "text": "omg yes, no way"},
+        ]
+        self._chat_bubble_var = tk.StringVar(value="blue")  # "blue" or "green"
+        self._chat_row_widgets: list = []
+
         # Formats (loaded from formats/ dir)
         _ensure_formats_seeded()
         self._formats: dict = _load_formats()
@@ -1201,6 +1346,10 @@ class CaptionApp:
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         self._text_box.insert("1.0", "Your caption here")
         self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
+        self._chat_frame = ttk.Frame(f)
+        self._chat_frame.grid(row=r, column=0, columnspan=2, sticky="nsew", pady=(2, 8))
+        self._build_chat_frame(self._chat_frame)
+        self._chat_frame.grid_remove()
         r += 1
 
         ttk.Label(f, text="Page BG Color:").grid(row=r, column=0, sticky="w", pady=4)
@@ -1227,11 +1376,12 @@ class CaptionApp:
                         command=self._safe_refresh).pack(side="left", padx=(12, 0))
         r += 1
 
-        ttk.Label(f, text="Alignment:").grid(row=r, column=0, sticky="w", pady=4)
-        align_row = ttk.Frame(f)
-        align_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._align_label = ttk.Label(f, text="Alignment:")
+        self._align_label.grid(row=r, column=0, sticky="w", pady=4)
+        self._align_row = ttk.Frame(f)
+        self._align_row.grid(row=r, column=1, sticky="w", padx=6)
         for label, value in (("←", "left"), ("↔", "center"), ("→", "right")):
-            ttk.Radiobutton(align_row, text=label, variable=self._align_var,
+            ttk.Radiobutton(self._align_row, text=label, variable=self._align_var,
                             value=value).pack(side="left", padx=2)
         r += 1
 
@@ -1252,13 +1402,14 @@ class CaptionApp:
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
-        ttk.Label(f, text="Text Color:").grid(row=r, column=0, sticky="w", pady=4)
-        fc_row = ttk.Frame(f)
-        fc_row.grid(row=r, column=1, sticky="w", padx=6)
-        self._fc_btn = tk.Button(fc_row, bg=self._fc_color, width=5, relief="groove",
+        self._fc_label = ttk.Label(f, text="Text Color:")
+        self._fc_label.grid(row=r, column=0, sticky="w", pady=4)
+        self._fc_row = ttk.Frame(f)
+        self._fc_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._fc_btn = tk.Button(self._fc_row, bg=self._fc_color, width=5, relief="groove",
                                  command=self._pick_fc)
         self._fc_btn.pack(side="left")
-        ttk.Button(fc_row, text="Pick", width=5,
+        ttk.Button(self._fc_row, text="Pick", width=5,
                    command=lambda: self._start_color_pick("fc")).pack(side="left", padx=(4, 0))
         r += 1
 
@@ -1282,19 +1433,137 @@ class CaptionApp:
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
-        ttk.Label(f, text="Stroke Width:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=0, to=20, textvariable=self._stroke_width_var,
-                    width=7).grid(row=r, column=1, sticky="w", padx=6)
+        self._stroke_width_label = ttk.Label(f, text="Stroke Width:")
+        self._stroke_width_label.grid(row=r, column=0, sticky="w", pady=4)
+        self._stroke_width_spin = ttk.Spinbox(f, from_=0, to=20, textvariable=self._stroke_width_var,
+                                              width=7)
+        self._stroke_width_spin.grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
-        ttk.Label(f, text="Stroke Color:").grid(row=r, column=0, sticky="w", pady=4)
-        stroke_row = ttk.Frame(f)
-        stroke_row.grid(row=r, column=1, sticky="w", padx=6)
-        self._stroke_btn = tk.Button(stroke_row, bg=self._stroke_color, width=5, relief="groove",
-                                     command=self._pick_stroke)
+        self._stroke_color_label = ttk.Label(f, text="Stroke Color:")
+        self._stroke_color_label.grid(row=r, column=0, sticky="w", pady=4)
+        self._stroke_color_row = ttk.Frame(f)
+        self._stroke_color_row.grid(row=r, column=1, sticky="w", padx=6)
+        self._stroke_btn = tk.Button(self._stroke_color_row, bg=self._stroke_color, width=5,
+                                     relief="groove", command=self._pick_stroke)
         self._stroke_btn.pack(side="left")
-        ttk.Button(stroke_row, text="Pick", width=5,
+        ttk.Button(self._stroke_color_row, text="Pick", width=5,
                    command=lambda: self._start_color_pick("stroke")).pack(side="left", padx=(4, 0))
+
+    def _build_chat_frame(self, frame: ttk.Frame) -> None:
+        """Builder UI for chat_mode formats ("Text Message") — occupies the
+        same grid cell as self._text_box (see _build_caption_tab /
+        _update_chat_mode_visibility), swapped in/out based on the selected
+        format. A scrollable list of message rows, using the same
+        canvas+scrollbar+inner-frame pattern as Find Online's results list
+        (see _wl_run_search)."""
+        color_row = ttk.Frame(frame)
+        color_row.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Label(color_row, text="My Bubble Color:").pack(side="left")
+        self._chat_color_btn = ttk.Button(
+            color_row, text="iMessage Blue", command=self._toggle_chat_bubble_color)
+        self._chat_color_btn.pack(side="left", padx=(6, 0))
+
+        body = ttk.Frame(frame)
+        body.pack(side="top", fill="both", expand=True)
+        canvas = tk.Canvas(body, highlightthickness=0, height=180)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self._chat_canvas = canvas
+        self._chat_rows_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=self._chat_rows_frame, anchor="nw")
+        self._chat_rows_frame.bind(
+            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        ttk.Button(frame, text="+ Add Message",
+                  command=self._chat_add_message).pack(side="top", anchor="w", pady=(4, 0))
+
+        self._rebuild_chat_rows()
+
+    def _rebuild_chat_rows(self) -> None:
+        """Destroy and recreate every message row from self._chat_messages —
+        same destroy-all-children-then-rebuild approach _wl_run_search uses
+        for Find Online's results list."""
+        for w in self._chat_rows_frame.winfo_children():
+            w.destroy()
+        self._chat_row_widgets = []
+        for i, msg in enumerate(self._chat_messages):
+            row = ttk.Frame(self._chat_rows_frame, relief="groove", borderwidth=1, padding=4)
+            row.pack(side="top", fill="x", pady=2, padx=2)
+
+            top = ttk.Frame(row)
+            top.pack(side="top", fill="x")
+            sender_var = tk.StringVar(value=msg["sender"])
+            ttk.Radiobutton(top, text="Them", variable=sender_var, value="them",
+                            command=lambda i=i, v=sender_var: self._chat_set_sender(i, v.get())
+                            ).pack(side="left")
+            ttk.Radiobutton(top, text="Me", variable=sender_var, value="me",
+                            command=lambda i=i, v=sender_var: self._chat_set_sender(i, v.get())
+                            ).pack(side="left", padx=(8, 0))
+
+            btns = ttk.Frame(top)
+            btns.pack(side="right")
+            ttk.Button(btns, text="▲", width=2,
+                      command=lambda i=i: self._chat_move_message(i, -1)).pack(side="left")
+            ttk.Button(btns, text="▼", width=2,
+                      command=lambda i=i: self._chat_move_message(i, 1)).pack(side="left")
+            ttk.Button(btns, text="✕", width=2,
+                      command=lambda i=i: self._chat_remove_message(i)).pack(side="left")
+
+            text_widget = tk.Text(row, width=20, height=2, wrap="word",
+                                  relief="solid", bd=1, padx=3, pady=3)
+            text_widget.pack(side="top", fill="x", pady=(3, 0))
+            text_widget.insert("1.0", msg["text"])
+            text_widget.bind(
+                "<KeyRelease>",
+                lambda _e, i=i, w=text_widget: self._chat_on_text_change(i, w))
+
+            self._chat_row_widgets.append(
+                {"frame": row, "text": text_widget, "sender_var": sender_var})
+
+        self._chat_rows_frame.update_idletasks()
+        self._chat_canvas.configure(scrollregion=self._chat_canvas.bbox("all"))
+
+    def _chat_add_message(self) -> None:
+        prev = self._chat_messages[-1]["sender"] if self._chat_messages else "them"
+        self._chat_messages.append({"sender": "me" if prev == "them" else "them", "text": ""})
+        self._rebuild_chat_rows()
+        self._safe_refresh()
+        if self._chat_row_widgets:
+            self._chat_row_widgets[-1]["text"].focus_set()
+            self._chat_canvas.yview_moveto(1.0)
+
+    def _chat_remove_message(self, idx: int) -> None:
+        if 0 <= idx < len(self._chat_messages):
+            del self._chat_messages[idx]
+            self._rebuild_chat_rows()
+            self._safe_refresh()
+
+    def _chat_move_message(self, idx: int, delta: int) -> None:
+        new_idx = idx + delta
+        if 0 <= new_idx < len(self._chat_messages):
+            self._chat_messages[idx], self._chat_messages[new_idx] = (
+                self._chat_messages[new_idx], self._chat_messages[idx])
+            self._rebuild_chat_rows()
+            self._safe_refresh()
+
+    def _chat_set_sender(self, idx: int, sender: str) -> None:
+        if 0 <= idx < len(self._chat_messages):
+            self._chat_messages[idx]["sender"] = sender
+            self._safe_refresh()
+
+    def _chat_on_text_change(self, idx: int, widget: tk.Text) -> None:
+        if 0 <= idx < len(self._chat_messages):
+            self._chat_messages[idx]["text"] = widget.get("1.0", "end-1c")
+        self._on_text_keyrelease()
+
+    def _toggle_chat_bubble_color(self) -> None:
+        new = "green" if self._chat_bubble_var.get() == "blue" else "blue"
+        self._chat_bubble_var.set(new)
+        self._chat_color_btn.config(text="SMS Green" if new == "green" else "iMessage Blue")
+        self._safe_refresh()
 
     def _build_xchange_tab(self, f: ttk.Frame) -> None:
         f.columnconfigure(1, weight=1)
@@ -1429,6 +1698,8 @@ class CaptionApp:
         self._pill_frame.configure(bg=colors["bg"])
         for box in (self._text_box, self._header_text_box, self._footer_text_box):
             box.configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
+        for rw in getattr(self, "_chat_row_widgets", []):
+            rw["text"].configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
 
     # ------------------------------------------------------------------
     # Aardvark Cafe prompt
@@ -1606,6 +1877,30 @@ class CaptionApp:
         else:
             self._side_label.grid()
             self._side_row.grid()
+
+    def _update_chat_mode_visibility(self) -> None:
+        """Swap the plain caption text box for the chat-bubble row editor
+        when a chat_mode format (e.g. "Text Message") is selected, and hide
+        the fields that don't apply to fixed-color bubbles — Text Color,
+        Alignment, Stroke Width/Color — same grid-remove pattern as
+        _update_side_visibility."""
+        chat_mode = self._formats.get(self._format_var.get(), {}).get("chat_mode", False)
+        rows = ((self._fc_label, self._fc_row),
+                (self._align_label, self._align_row),
+                (self._stroke_width_label, self._stroke_width_spin),
+                (self._stroke_color_label, self._stroke_color_row))
+        if chat_mode:
+            self._text_box.grid_remove()
+            self._chat_frame.grid()
+            for a, b in rows:
+                a.grid_remove()
+                b.grid_remove()
+        else:
+            self._chat_frame.grid_remove()
+            self._text_box.grid()
+            for a, b in rows:
+                a.grid()
+                b.grid()
 
     def _apply_preset(self, bg: str, stroke: str) -> None:
         self._page_bg_color = bg
@@ -2010,7 +2305,7 @@ class CaptionApp:
 
         search_row = ttk.Frame(win, padding=8)
         search_row.pack(side="top", fill="x")
-        full_caption = self._text_box.get("1.0", "end-1c")
+        full_caption = self._get_caption_text()
         default_query = web_lookup.extract_keywords(full_caption)
         query_var = tk.StringVar(value=default_query)
         entry = ttk.Entry(search_row, textvariable=query_var)
@@ -2585,6 +2880,7 @@ class CaptionApp:
         self._align_var.set(data.get("align", "center"))
         self._side_var.set(data.get("caption_side", "right"))
         self._update_side_visibility()
+        self._update_chat_mode_visibility()
 
         # Panel size and label
         self._dynamic_width_var.set(data.get("dynamic_width", False))
@@ -2664,6 +2960,16 @@ class CaptionApp:
         if self._is_anim:
             self._refresh_job = self.root.after(debounce_ms, self._rebuild_all_async)
 
+    def _get_caption_text(self) -> str:
+        """Plain-text equivalent of the caption for consumers that don't
+        need chat-bubble structure (Find Online's default search query, the
+        Send-to-DA description prefill)."""
+        fmt_data = self._formats.get(self._format_var.get(), {})
+        if fmt_data.get("chat_mode", False):
+            return "\n".join(
+                m["text"] for m in self._chat_messages if m.get("text", "").strip())
+        return self._text_box.get("1.0", "end-1c")
+
     def _gather_raw_params(self) -> Optional[dict]:
         """Read every piece of Tk widget/variable state build_composite needs,
         as plain Python values, or None if invalid. Must run on the main
@@ -2671,7 +2977,20 @@ class CaptionApp:
         itself, so it's fast. The returned dict holds no Tk objects, so it's
         safe to hand off to a background thread for the expensive part (see
         _resolve_composite_kwargs)."""
-        text = self._text_box.get("1.0", "end-1c")
+        fmt = self._format_var.get()
+        fmt_data = self._formats.get(fmt, {})
+        header_enabled = fmt_data.get("header_enabled", False)
+        chat_mode = fmt_data.get("chat_mode", False)
+
+        if chat_mode:
+            text = self._get_caption_text()
+            chat_messages = [dict(m) for m in self._chat_messages if m.get("text", "").strip()]
+            bubble_color = self._chat_bubble_var.get()
+        else:
+            text = self._text_box.get("1.0", "end-1c")
+            chat_messages = None
+            bubble_color = "blue"
+
         try:
             field_size = self._size_var.get()
             width = self._width_var.get()
@@ -2687,12 +3006,11 @@ class CaptionApp:
             return None
 
         bold = self._bold_var.get()
-        fmt = self._format_var.get()
-        fmt_data = self._formats.get(fmt, {})
-        header_enabled = fmt_data.get("header_enabled", False)
 
         raw: dict = dict(
             text=text,
+            chat_messages=chat_messages,
+            bubble_color=bubble_color,
             field_size=field_size,
             width=width,
             pad=pad,
@@ -3217,7 +3535,7 @@ class CaptionApp:
         if getattr(self, "_da_in_progress", False):
             return
 
-        raw_text = self._text_box.get("1.0", "end-1c").strip()
+        raw_text = self._get_caption_text().strip()
         if self._image_source_url:
             raw_text = f"Image Source: {self._image_source_url}\n\n{raw_text}"
         prompt = self._da_send_prompt("", raw_text, offer_mp4=self._is_video)
