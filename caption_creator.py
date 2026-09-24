@@ -1981,10 +1981,10 @@ class CaptionApp:
         self._safe_refresh(debounce_ms=0)
 
     # ------------------------------------------------------------------
-    # Online lookup (Barnorama) — search using keywords pulled from the
-    # caption text, and list the matching posts' actual images/GIFs
-    # directly (no separate "open this post" step) — clicking one
-    # downloads and loads it as the source file. Non-modal (like the DA
+    # Online lookup (Barnorama + AcidCow) — search using keywords pulled
+    # from the caption text, and list the matching posts' actual
+    # images/GIFs directly (no separate "open this post" step) — clicking
+    # one downloads and loads it as the source file. Non-modal (like the DA
     # log window) since search/download are asynchronous; only one lookup
     # window at a time.
     # ------------------------------------------------------------------
@@ -1995,7 +1995,7 @@ class CaptionApp:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Find Online — Barnorama")
+        win.title("Find Online — Barnorama + AcidCow")
         win.geometry("860x620")
         self._wl_win = win
         self._wl_page = 1

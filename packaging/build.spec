@@ -40,10 +40,13 @@ ffmpeg_binaries = [(_ffmpeg_exe, os.path.join("imageio_ffmpeg", "binaries"))]
 # --- Data bundled read-only alongside the app (see app_paths.RESOURCE_DIR):
 # the 4 built-in formats (seeded into a writable formats/ on first run by
 # _ensure_formats_seeded), the 2 built-in themes (same seeding pattern via
-# themes._ensure_themes_seeded), and the logo/icon images. ---
+# themes._ensure_themes_seeded), the logo/icon images, and the wordlists
+# web_lookup._is_celebrity_title() uses to filter "Find Online" results. ---
 datas = [
     (os.path.join(ASSETS_DIR, "logo.png"), "assets"),
     (os.path.join(ASSETS_DIR, "icon.png"), "assets"),
+    (os.path.join(ASSETS_DIR, "english_words.txt"), "assets"),
+    (os.path.join(ASSETS_DIR, "given_names.txt"), "assets"),
 ]
 for fname in ("Standard.json", "Standard (Vertical).json",
               "X-Change.json", "X-Change (Vertical).json"):
