@@ -77,7 +77,7 @@ _CLOTHING_WORDS = {
     "nightgown", "robe", "jacket", "sweater", "pants", "suit",
 }
 _ATTRIBUTE_CATEGORIES = (
-    _GENDER_WORDS, _HAIR_COLOR_WORDS, _BODY_TYPE_WORDS, _AGE_WORDS,
+    _HAIR_COLOR_WORDS, _GENDER_WORDS, _BODY_TYPE_WORDS, _AGE_WORDS,
     _CLOTHING_WORDS,
 )
 
@@ -287,16 +287,40 @@ def _search_acidcow(query: str, page: int) -> list:
     return results
 
 
+def _rank_results(results: list, query: str) -> list:
+    """Sort results the way a web search does: the query's first word is
+    the primary term and decides who's in the top tier, exactly like
+    extract_keywords() always puts the hair color first when there is one
+    — that's the trait most worth matching on a photo search. The rest of
+    the query is secondary — those words only break ties among results
+    that already match the primary term (so a title matching the primary
+    plus several secondary words sorts above one matching the primary
+    alone), they never lift a result that's missing the primary term past
+    one that has it. Ties keep each source's own order (stable sort)."""
+    terms = query.lower().split()
+    if not terms:
+        return results
+    primary, secondary = terms[0], terms[1:]
+
+    def rank_key(result):
+        title = result["title"].lower()
+        secondary_hits = sum(1 for t in secondary if t in title)
+        return (primary not in title, -secondary_hits)
+
+    return sorted(results, key=rank_key)
+
+
 def search(query: str, page: int = 1) -> list:
     """Return [{"title", "url", "thumb_url"}, ...] merging one search
     results page each from Barnorama and AcidCow (page N of each,
     concatenated — the two sites paginate independently, so "page 2" isn't
-    a single ranked list across both, just each site's own next page).
-    Empty for a source on no results (or a request/parse failure — callers
-    can't tell the difference, which is fine here: both just mean "nothing
-    to show" for that source), and a failing source never blocks the other
-    one's results. Results whose title names or references a real person
-    (see _is_celebrity_title) are dropped rather than returned."""
+    a single ranked list across both, just each site's own next page), then
+    ranked by relevance to query — see _rank_results(). Empty for a source
+    on no results (or a request/parse failure — callers can't tell the
+    difference, which is fine here: both just mean "nothing to show" for
+    that source), and a failing source never blocks the other one's
+    results. Results whose title names or references a real person (see
+    _is_celebrity_title) are dropped rather than returned."""
     query = query.strip()
     if not query:
         return []
@@ -306,7 +330,7 @@ def search(query: str, page: int = 1) -> list:
             results.extend(source(query, page))
         except requests.RequestException:
             pass
-    return results
+    return _rank_results(results, query)
 
 
 def _fetch_gallery_barnorama(post_url: str) -> list:
