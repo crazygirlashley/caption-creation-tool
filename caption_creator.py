@@ -1101,6 +1101,9 @@ class CaptionApp:
         self._refresh_job: Optional[str] = None
         self._preview_debounce_job: Optional[str] = None
         self._build_cancel = threading.Event()
+        self._preview_lock = threading.Lock()
+        self._preview_running = False
+        self._preview_pending: Optional[tuple] = None
         self._cache_complete: bool = True
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -3093,7 +3096,14 @@ class CaptionApp:
         Only the Tk-reading step (_gather_raw_params) runs on the main
         thread, since that part isn't thread-safe but is cheap; the actual
         search and render happen off it. A newer call supersedes any build
-        still in flight."""
+        still in flight.
+
+        At most one preview worker runs at a time: requests that arrive
+        while it's busy (e.g. every tick of a slider drag) collapse into a
+        single pending slot that the worker picks up next, keeping only the
+        latest. Spawning a thread per request instead let a dozen renders
+        run at once, all fighting over the GIL, so each took several
+        seconds and the preview lagged far behind the controls."""
         if not self._frames:
             return
         self._stop_anim()
@@ -3104,35 +3114,52 @@ class CaptionApp:
 
         self._build_cancel.set()
         self._build_cancel = threading.Event()
-        cancel = self._build_cancel
-        frame = self._frames[0]
+        job = (raw, self._frames[0], self._build_cancel, self._is_anim)
 
         txt = self._status.cget("text")
         if "[Rendering" not in txt:
             self._status.config(text=txt + " [Rendering…]")
 
-        def _build() -> None:
-            t0 = time.perf_counter()
-            try:
-                kwargs, size = _resolve_composite_kwargs(raw)
-                first = build_composite(frame, **kwargs)
-            except Exception:
-                log.exception("PREVIEW_ERROR")
+        with self._preview_lock:
+            if self._preview_running:
+                self._preview_pending = job
                 return
-            elapsed = time.perf_counter() - t0
-            if elapsed > 0.5:
-                log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
-            # Only worth estimating here for static images — for GIF/MP4
-            # sources this is just the first frame, not the real output;
-            # _rebuild_all_async supplies the real estimate for those once
-            # every frame has been built.
-            size_bytes = None if self._is_anim else _estimate_static_bytes(first)
-            if not cancel.is_set():
-                self.root.after(
-                    0, lambda r=first, s=size, sb=size_bytes:
-                        self._on_preview_built(r, s, raw["field_size"], sb))
+            self._preview_running = True
+        threading.Thread(target=self._preview_worker, args=(job,), daemon=True).start()
 
-        threading.Thread(target=_build, daemon=True).start()
+    def _preview_worker(self, job: tuple) -> None:
+        """Background loop for _refresh_preview — renders job, then whatever
+        request queued up meanwhile, until none is pending."""
+        while job is not None:
+            raw, frame, cancel, is_anim = job
+            if not cancel.is_set():
+                self._build_preview(raw, frame, cancel, is_anim)
+            with self._preview_lock:
+                job, self._preview_pending = self._preview_pending, None
+                if job is None:
+                    self._preview_running = False
+
+    def _build_preview(self, raw: dict, frame: Image.Image,
+                       cancel: threading.Event, is_anim: bool) -> None:
+        t0 = time.perf_counter()
+        try:
+            kwargs, size = _resolve_composite_kwargs(raw)
+            first = build_composite(frame, **kwargs)
+        except Exception:
+            log.exception("PREVIEW_ERROR")
+            return
+        elapsed = time.perf_counter() - t0
+        if elapsed > 0.5:
+            log.warning("SLOW_PREVIEW  elapsed=%.3fs", elapsed)
+        # Only worth estimating here for static images — for GIF/MP4
+        # sources this is just the first frame, not the real output;
+        # _rebuild_all_async supplies the real estimate for those once
+        # every frame has been built.
+        size_bytes = None if is_anim else _estimate_static_bytes(first)
+        if not cancel.is_set():
+            self.root.after(
+                0, lambda r=first, s=size, sb=size_bytes:
+                    self._on_preview_built(r, s, raw["field_size"], sb))
 
     def _on_preview_built(self, first: Image.Image, size: int, field_size: int,
                            size_bytes: Optional[int]) -> None:

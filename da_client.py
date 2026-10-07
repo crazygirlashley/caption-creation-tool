@@ -80,6 +80,25 @@ def da_logout() -> None:
         log.info("No cached tokens found — already logged out.")
 
 
+def _refresh_tokens(client_id: str, refresh_token: str) -> str:
+    """Exchange refresh_token for a new access token, save it, and return it.
+    Raises on any network/HTTP failure."""
+    resp = requests.post(_DA_TOKEN_URL, data={
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }, headers={"User-Agent": _UA}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    tokens = {
+        "access_token": data["access_token"],
+        "refresh_token": data.get("refresh_token", refresh_token),
+        "expires_at": time.time() + int(data.get("expires_in", 3600)) - 30,
+    }
+    _save_tokens(tokens)
+    return tokens["access_token"]
+
+
 def da_ensure_silent_token(client_id: str) -> str:
     """Return a valid access token using only the cache or a silent refresh.
     Never opens a browser. Raises RuntimeError if interactive login is required."""
@@ -92,21 +111,9 @@ def da_ensure_silent_token(client_id: str) -> str:
     if tokens and tokens.get("refresh_token"):
         log.info("Token expired — attempting silent refresh...")
         try:
-            resp = requests.post(_DA_TOKEN_URL, data={
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": tokens["refresh_token"],
-            }, headers={"User-Agent": _UA}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            tokens = {
-                "access_token": data["access_token"],
-                "refresh_token": data.get("refresh_token", tokens["refresh_token"]),
-                "expires_at": time.time() + int(data.get("expires_in", 3600)) - 30,
-            }
-            _save_tokens(tokens)
+            access_token = _refresh_tokens(client_id, tokens["refresh_token"])
             log.info("Token refreshed silently.")
-            return tokens["access_token"]
+            return access_token
         except Exception as exc:
             log.warning("Silent refresh failed: %s", exc)
 
@@ -131,10 +138,18 @@ def _pkce_pair() -> tuple:
 class _CallbackHandler(BaseHTTPRequestHandler):
     code: Optional[str] = None
     error: Optional[str] = None
+    expected_state: Optional[str] = None
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        if ("code" in params or "error" in params) and                 params.get("state", [None])[0] != _CallbackHandler.expected_state:
+            # Not a response to the request we sent (stale tab, or a forged
+            # request from another page) — ignore it and keep waiting.
+            log.warning("Ignoring OAuth callback with a mismatched state parameter.")
+            self.send_response(400)
+            self.end_headers()
+            return
         if "code" in params:
             _CallbackHandler.code = params["code"][0]
             log.info("Authorization code received from DeviantArt.")
@@ -175,6 +190,7 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
 
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
+    _CallbackHandler.expected_state = state
 
     try:
         server = HTTPServer(("127.0.0.1", REDIRECT_PORT), _CallbackHandler)
@@ -267,20 +283,7 @@ def da_ensure_token(client_id: str, open_browser=None) -> str:
     # Try silent refresh
     if tokens and tokens.get("refresh_token"):
         try:
-            resp = requests.post(_DA_TOKEN_URL, data={
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": tokens["refresh_token"],
-            }, headers={"User-Agent": _UA}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            tokens = {
-                "access_token": data["access_token"],
-                "refresh_token": data.get("refresh_token", tokens["refresh_token"]),
-                "expires_at": time.time() + int(data.get("expires_in", 3600)) - 30,
-            }
-            _save_tokens(tokens)
-            return tokens["access_token"]
+            return _refresh_tokens(client_id, tokens["refresh_token"])
         except Exception:
             pass  # fall through to full re-auth
 

@@ -43,6 +43,12 @@ def get_local_version() -> str:
         return "0"
 
 
+def _version_tuple(version: str) -> tuple:
+    """"0.1.10" -> (0, 1, 10), so versions compare numerically rather than
+    as strings. Non-numeric parts count as 0."""
+    return tuple(int(p) if p.isdigit() else 0 for p in version.split("."))
+
+
 def fetch_latest_release_info() -> dict:
     """Returns the GitHub API's release JSON, or {} on any failure (offline,
     no release published yet, rate-limited, etc.) — callers should treat an
@@ -100,7 +106,9 @@ def check_and_update() -> None:
         return
 
     latest_version = str(release_info.get("tag_name", "")).lstrip("v")
-    if not latest_version or latest_version == get_local_version():
+    # Only move forward — a plain != check would "update" a newer local
+    # build back down to an older published release.
+    if not latest_version or _version_tuple(latest_version) <= _version_tuple(get_local_version()):
         return
 
     asset_url = find_asset_url(release_info)

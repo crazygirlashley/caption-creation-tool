@@ -10,6 +10,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 
 - **Standard format** — image on the left, styled text panel on the right
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
+- **Text Message format** — renders the caption as a phone-style chat: build a list of messages, mark each as sent by you or the other person, reorder them, and toggle your bubbles between iMessage Blue and SMS Green
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
 - **Caption panel** — auto-fit text sizing, left/center/right alignment, bold, stroke; choose from every font installed on your system
 - **Caption side** — for horizontal-layout formats, place the caption panel to the left or right of the image (defaults to right); hidden for vertical-layout formats, which always caption below the image
@@ -26,8 +27,9 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Large-file safety** — opening a GIF/video whose frames would use a lot of memory prompts you to load it in full, or use a single-frame preview instead (editing stays fast and light on RAM); either way, **Save** and **Send to DA** composite and write one frame at a time straight to the output file instead of building the whole thing in memory first, so exporting doesn't need to hold the full file in RAM regardless of length
 - **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
-- **Find Online…** — search [Barnorama](https://www.barnorama.com) from inside the app for source images/GIFs. The query defaults to physical-description keywords (gender, hair color, body type, age, clothing) pulled from your current caption text; results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed
+- **Find Online…** — search [Barnorama](https://www.barnorama.com) and [AcidCow](https://acidcow.com) from inside the app for source images/GIFs. The query defaults to physical-description keywords (hair color, gender, body type, age, clothing) pulled from your current caption text, and results are ranked by how well their titles match it (hair color first). Posts about real celebrities are filtered out. Results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed
 - **DeviantArt integration** — save finished output to Sta.sh (DeviantArt's private storage area) with one click; publish to gallery when ready
+- **UI themes** — Dark (default), Bubblegum, or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
 ---
@@ -155,7 +157,7 @@ Click **Log Out** to clear the cached token (with a confirmation prompt) if you 
 
 ## Custom Formats
 
-Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the four built-in formats (`Standard`, `X-Change`, and their `(Vertical)` counterparts) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
+Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the six built-in formats (`Standard`, `X-Change`, `Text Message`, and their `(Vertical)` counterparts) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
 
 You can also hand-edit or drop in a `.json` file directly — it'll appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
 
@@ -179,6 +181,7 @@ Each format file supports the following fields:
 | `align` | `"left"` / `"center"` / `"right"` | Caption text alignment |
 | `caption_side` | `"left"` / `"right"` | Which side of the image the caption panel sits on (horizontal layout only; ignored for `"vertical"`) |
 | `show_pill_presets` | bool | Show pill color preset buttons |
+| `chat_mode` | bool | Replace the caption text box with the Text Message chat builder and render the caption as chat bubbles |
 | `header_enabled` | bool | Show title overlay on image |
 | `header_text` | string | Default title text |
 | `header_font` | string | Title font (use `"Aardvark Cafe"` for the X-Change font) |
@@ -188,13 +191,13 @@ Each format file supports the following fields:
 | `footer_font` | string | Tagline font |
 | `footer_size` | int | Tagline font size |
 
-See `formats/Standard.json`, `formats/X-Change.json`, and their `(Vertical)` counterparts for examples.
+See `formats/Standard.json`, `formats/X-Change.json`, `formats/Text Message.json`, and their `(Vertical)` counterparts for examples.
 
 ---
 
 ## Custom Themes
 
-UI color themes work the same way as formats: JSON files in a `themes/` folder, picked up automatically. **Basic** (this app's original look) is always available and isn't a file — it's just the system's native theme with no color overrides. **Dark** and **Bubblegum** are the two built-in themes tracked in version control by default; drop your own `.json` file into `themes/` and it appears in **⚙ Settings → Theme** the next time you open that menu, no restart needed.
+UI color themes work the same way as formats: JSON files in a `themes/` folder, picked up automatically. **Basic** (this app's original look) is always available — it's just the system's native theme with no color overrides. `themes/Basic.json` ships for reference only (typical Windows default colors, handy as a starting point for your own theme); the app never loads it. **Dark** and **Bubblegum** are the two built-in themes tracked in version control by default; drop your own `.json` file into `themes/` and it appears in **⚙ Settings → Theme** the next time you open that menu, no restart needed.
 
 Each theme file requires every one of these keys (all hex color strings):
 
@@ -209,6 +212,10 @@ Each theme file requires every one of these keys (all hex color strings):
 | `fg` | Primary text color |
 | `muted_fg` | Secondary/disabled text color |
 | `select_bg` | Selection highlight color |
+
+A theme can also set an optional `font` key to a font family name (Bubblegum uses `"Aardvark Cafe"`) to re-font the whole UI while it's active; if that font isn't installed, the normal UI font is used.
+
+Your theme choice is saved to `ui_settings.json` (gitignored).
 
 See `themes/Dark.json` and `themes/Bubblegum.json` for examples. A file missing any of these keys is skipped rather than crashing the app.
 
@@ -236,8 +243,8 @@ so publishing one requires a local build first:
 writable `BASE_DIR` (next to the exe when frozen, next to `caption_creator.py`
 when run from source) for `formats/`, `watermark/`, DA credentials, and the
 crash log, separately from a read-only `RESOURCE_DIR` (PyInstaller's bundled
-`_internal/` when frozen) for `assets/` and the seed copies of the 4 built-in
-formats. The launcher only ever replaces `CaptionCreator.exe` and `_internal/`
+`_internal/` when frozen) for `assets/` and the seed copies of the built-in
+formats and themes. The launcher only ever replaces `CaptionCreator.exe` and `_internal/`
 on update — nothing in `BASE_DIR` is part of the release zip, so it's never
 touched.
 
@@ -247,30 +254,35 @@ touched.
 
 ```
 caption-creation-tool/
-├── app_paths.py            # Frozen-aware BASE_DIR/RESOURCE_DIR resolution
-├── caption_creator.py      # Main application
-├── da_client.py             # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
-├── web_lookup.py            # Barnorama search/scrape client (Find Online…)
+├── app_paths.py              # Frozen-aware BASE_DIR/RESOURCE_DIR resolution
+├── caption_creator.py        # Main application
+├── da_client.py              # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
+├── web_lookup.py             # Barnorama/AcidCow search client (Find Online…)
 ├── themes.py                 # UI theme loader/applier (⚙ Settings → Theme)
-├── assets/                   # App branding
-│   ├── logo.png                # Window/taskbar icon
-│   └── icon.png                 # .exe / Desktop shortcut icon (built releases only)
-├── formats/                 # Format definitions (JSON) — add your own here
+├── assets/
+│   ├── logo.png              # Window/taskbar icon
+│   ├── icon.png              # .exe / Desktop shortcut icon (built releases only)
+│   ├── english_words.txt     # Wordlists used by Find Online's celebrity filter
+│   └── given_names.txt
+├── formats/                  # Format definitions (JSON) — add your own here
 │   ├── Standard.json
 │   ├── Standard (Vertical).json
+│   ├── Text Message.json
+│   ├── Text Message (Vertical).json
 │   ├── X-Change.json
 │   └── X-Change (Vertical).json
 ├── themes/                   # UI theme definitions (JSON) — add your own here
-│   ├── Dark.json
-│   └── Bubblegum.json
+│   ├── Basic.json            # Reference only, never loaded
+│   ├── Bubblegum.json
+│   └── Dark.json
 ├── packaging/                # PyInstaller build (see "Building a Release")
-│   ├── build.spec               # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe
-│   └── launcher.py               # Update checker + launcher source
+│   ├── build.spec            # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe
+│   └── launcher.py           # Update checker + launcher source
 ├── VERSION                   # Plain-text version string, source of truth for releases
 ├── install.bat               # Windows installer — downloads the latest built release
 ├── requirements.txt          # Python dependencies (source/dev use)
-├── run.bat                    # Windows launcher (source/dev use)
-├── watermark/                 # Drop a single watermark image here (gitignored)
+├── run.bat                   # Windows launcher (source/dev use)
+├── watermark/                # Drop a single watermark image here (gitignored)
 └── .gitignore
 ```
 

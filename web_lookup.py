@@ -296,16 +296,21 @@ def _rank_results(results: list, query: str) -> list:
     that already match the primary term (so a title matching the primary
     plus several secondary words sorts above one matching the primary
     alone), they never lift a result that's missing the primary term past
-    one that has it. Ties keep each source's own order (stable sort)."""
+    one that has it. Ties keep each source's own order (stable sort).
+
+    Terms match at the start of a title word (so "blonde" still matches
+    "Blondes"), not anywhere in the title — a plain substring check let
+    "red" match "Featured"/"Covered" and float unrelated posts to the top."""
     terms = query.lower().split()
     if not terms:
         return results
-    primary, secondary = terms[0], terms[1:]
+    patterns = [re.compile(r"\b" + re.escape(t)) for t in terms]
+    primary, secondary = patterns[0], patterns[1:]
 
     def rank_key(result):
         title = result["title"].lower()
-        secondary_hits = sum(1 for t in secondary if t in title)
-        return (primary not in title, -secondary_hits)
+        secondary_hits = sum(1 for p in secondary if p.search(title))
+        return (not primary.search(title), -secondary_hits)
 
     return sorted(results, key=rank_key)
 
