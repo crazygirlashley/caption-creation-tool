@@ -3585,9 +3585,18 @@ class CaptionApp:
             # finished.
             self.root.after(
                 0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"]))
+            # MP4 bytes scale close to linearly with frame count, and a full
+            # x264 encode of a 1080p clip takes ~1 minute — so MP4 estimates
+            # come from a sample, like _estimate_deferred_bytes. GIFs keep the
+            # exact full encode (cheaper, and their size depends on how
+            # consecutive frames differ).
+            sampled = as_mp4 and len(results) > _DEFERRED_SIZE_SAMPLE_FRAMES
+            to_encode = results[:_DEFERRED_SIZE_SAMPLE_FRAMES] if sampled else results
             try:
-                size_bytes = _estimate_anim_bytes(results, as_mp4, fps, durations,
+                size_bytes = _estimate_anim_bytes(to_encode, as_mp4, fps, durations,
                                                   gif_colors, cancel=cancel)
+                if sampled:
+                    size_bytes = round(size_bytes / len(to_encode) * len(results))
             except _EstimateCancelled:
                 return
             except Exception:
@@ -3595,6 +3604,8 @@ class CaptionApp:
                 size_bytes = None
             if not cancel.is_set():
                 label = "MP4" if as_mp4 else "GIF"
+                if sampled:
+                    label += ", approx"
                 if gif_colors is not None:
                     label += ", compressed"
                 self.root.after(
