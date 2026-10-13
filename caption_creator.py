@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
+import collections
 import ctypes
 import functools
 import io
@@ -22,7 +23,7 @@ import webbrowser
 
 import imageio.v2 as imageio
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
 import da_client
 import themes
@@ -362,6 +363,28 @@ def _hex_to_rgb(color: str) -> tuple:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+def _split_long_words(words: list, font: ImageFont.FreeTypeFont, max_px: int,
+                      draw: ImageDraw.ImageDraw) -> list:
+    """Break any word wider than max_px (a URL, "Aaaaaaah", ...) into
+    pieces that fit. Word-level wrapping alone left such a word on one
+    overlong line that ran off the side of the panel, and Auto-fit — which
+    only counts lines against the panel height — never noticed."""
+    out = []
+    for word in words:
+        if len(word) <= 1 or draw.textbbox((0, 0), word, font=font)[2] <= max_px:
+            out.append(word)
+            continue
+        piece = ""
+        for ch in word:
+            if piece and draw.textbbox((0, 0), piece + ch, font=font)[2] > max_px:
+                out.append(piece)
+                piece = ch
+            else:
+                piece += ch
+        out.append(piece)
+    return out
+
+
 def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
                 draw: ImageDraw.ImageDraw) -> list:
     # Measures each word once and sums cached widths, rather than
@@ -381,7 +404,7 @@ def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
             continue
         current_words: list = []
         current_w = 0
-        for word in words:
+        for word in _split_long_words(words, font, max_px, draw):
             word_w = draw.textbbox((0, 0), word, font=font)[2]
             added_w = word_w if not current_words else space_w + word_w
             if current_words and current_w + added_w > max_px:
@@ -432,14 +455,31 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
 
     if raw["auto_size"] and raw["frame_size"] is not None:
         fw, fh = raw["frame_size"]
+        # Fit against the panel exactly as build_composite will draw it —
+        # at output resolution, with padding/stroke scaled the same way —
+        # rather than at the source's natural size. Text measured small and
+        # then drawn ~3x larger doesn't wrap identically, so a caption that
+        # "fit" could still spill past the panel.
+        total_w, total_h = _panel_total_size(fw, fh, width, layout)
+        scale, new_w, new_h = _output_scale(total_w, total_h, raw["output_override"],
+                                            raw["output_size_pct"])
+        if (new_w, new_h) == (total_w, total_h):
+            scale, new_w, new_h = 1.0, total_w, total_h
+        s_cap = max(1, round(width * scale))
         # Vertical: panel spans full image width; cap_width is the panel height.
-        area_w, area_h = (fw, width) if layout == "vertical" else (width, fh)
+        area_w, area_h = (new_w, s_cap) if layout == "vertical" else (s_cap, new_h)
+        s_pad = round(pad * scale)
+        s_stroke = round(stroke_w * scale)
+        max_size = int(_MAX_AUTO_FONT_SIZE * scale)
         if raw.get("chat_messages") is not None:
-            size = _fit_chat_font_size(raw["chat_messages"], raw["font_family"],
-                                       _MAX_AUTO_FONT_SIZE, area_w, area_h, pad, bold)
+            fitted = _fit_chat_font_size(raw["chat_messages"], raw["font_family"],
+                                         max_size, area_w, area_h, s_pad, bold)
         else:
-            size = _fit_font_size(text, raw["font_family"], _MAX_AUTO_FONT_SIZE,
-                                  area_w, area_h, pad, stroke_w, bold)
+            fitted = _fit_font_size(text, raw["font_family"], max_size,
+                                    area_w, area_h, s_pad, s_stroke, bold)
+        # Back to the Font Size field's units, rounded down to a quarter
+        # point so the drawn size (this x scale) never exceeds what fit.
+        size = max(0.25, int(fitted / scale * 4) / 4)
     else:
         size = raw["field_size"]
 
@@ -469,6 +509,10 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         watermark_height=raw["watermark_height"],
         output_override=raw["output_override"],
         output_size_pct=raw["output_size_pct"],
+        # GIF sources are already low-res and dithered: LANCZOS only blurs
+        # the dither into fresh colors, roughly tripling the exported GIF's
+        # size for no visible gain. Nearest keeps the source's own pixels.
+        upscale_filter="nearest" if raw.get("source_is_gif") else "lanczos",
     )
 
     if raw["header_enabled"]:
@@ -503,7 +547,7 @@ def _draw_text_block(draw: ImageDraw.ImageDraw,
                       shadow_offset: tuple = (2, 3),
                       align: str = "center") -> None:
     font = _pil_font(font_family, font_size, bold)
-    lines = _wrap_lines(text, font, w - padding * 2, draw)
+    lines = _wrap_lines(text, font, w - padding * 2 - stroke_width * 2, draw)
     line_h = int(font_size * 1.3)
     block_h = len(lines) * line_h
     ty_start = y + max(padding, (h - block_h) // 2)
@@ -623,7 +667,8 @@ def _fit_chat_font_size(messages: list, font_family: str, max_size: int,
 def _draw_chat_panel(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
                      messages: list, font_family: str, font_size: int, padding: int,
                      bold: bool, bubble_color: str,
-                     shadow_draw: Optional[ImageDraw.ImageDraw] = None) -> None:
+                     shadow_draw: Optional[ImageDraw.ImageDraw] = None,
+                     shadow_offset: tuple = (2, 3)) -> None:
     """Draw a stack of chat bubbles into the panel rect (x, y, w, h) — left-
     aligned gray for 'them', right-aligned blue/green for 'me'. Bubbles that
     would overflow past y+h are skipped entirely (graceful truncation
@@ -660,7 +705,8 @@ def _draw_chat_panel(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
         fg = me_fg if is_me else them_fg
         if shadow_draw is not None:
             shadow_draw.rounded_rectangle(
-                (bx0 + 2, by0 + 3, bx1 + 2, by1 + 3), radius=radius, fill=(0, 0, 0, 120))
+                (bx0 + shadow_offset[0], by0 + shadow_offset[1],
+                 bx1 + shadow_offset[0], by1 + shadow_offset[1]), radius=radius, fill=(0, 0, 0, 120))
         draw.rounded_rectangle((bx0, by0, bx1, by1), radius=radius, fill=fill + (255,))
         ly = by0 + pad_y
         for line in lines:
@@ -696,6 +742,32 @@ def _output_scale_bounds(total_w: int, total_h: int) -> tuple:
     return floor_scale, default_scale, ceiling_scale
 
 
+# Per-caption overlay cache for build_composite — a few entries is plenty,
+# since only the current caption/frame size is ever hot. Each entry is one
+# full-size RGBA canvas.
+_OVERLAY_CACHE: "collections.OrderedDict" = collections.OrderedDict()
+_OVERLAY_CACHE_LOCK = threading.Lock()
+_OVERLAY_CACHE_SIZE = 4
+
+
+def _output_scale(total_w: int, total_h: int, output_override: bool,
+                  output_size_pct: float) -> tuple:
+    """(scale, new_w, new_h) build_composite renders a total_w x total_h
+    composite at. Without an override, that's default_scale; with the
+    Output Size Override active, output_size_pct (0-100) slides between the
+    1280x720-touching floor (0%) and double the default (100%). See
+    _output_scale_bounds for the three reference scales."""
+    floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
+    if output_override:
+        pct = max(0.0, min(100.0, output_size_pct)) / 100.0
+        scale = floor_scale + (ceiling_scale - floor_scale) * pct
+    else:
+        scale = default_scale
+    new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
+    new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
+    return scale, new_w, new_h
+
+
 def build_composite(
     frame: Image.Image,
     text: str,
@@ -726,9 +798,54 @@ def build_composite(
     output_size_pct: float = 0.0,
     chat_messages: Optional[list] = None,
     bubble_color: str = "blue",
+    upscale_filter: str = "lanczos",
+    _px_scale: float = 1.0,
 ) -> Image.Image:
     frame = frame.convert("RGBA")
     fw, fh = frame.size
+    total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
+
+    # Enforce a minimum final output size — upscale (never downscale by
+    # default) preserving aspect ratio, so small sources don't distort when
+    # stretched to fit both axes. See _output_scale.
+    scale, new_w, new_h = _output_scale(total_w, total_h, output_override, output_size_pct)
+    if (new_w, new_h) != (total_w, total_h):
+        # Resize only the source frame, then lay the panel out again at the
+        # target size with every pixel measurement scaled to match — text is
+        # rasterized at full output resolution instead of being drawn small
+        # and blown up (which left captions on small GIFs soft and blurry).
+        # The scaled canvas already meets the floor, so the recursive call
+        # lands at default_scale == 1 and doesn't resize again.
+        def _s(v: float) -> int:
+            return max(1, round(v * scale))
+        s_cap = _s(cap_width)
+        if layout == "vertical":
+            s_frame = (new_w, max(1, new_h - s_cap))
+        else:
+            s_frame = (max(1, new_w - s_cap), new_h)
+        resample = (Image.NEAREST if upscale_filter == "nearest" and scale > 1
+                    else Image.LANCZOS)
+        return build_composite(
+            frame.resize(s_frame, resample),
+            text, s_cap, page_bg, font_family, font_size * scale,
+            font_color, round(padding * scale),
+            stroke_width=round(stroke_width * scale), stroke_color=stroke_color,
+            bold=bold, shadow=shadow, align=align, fmt=fmt, layout=layout,
+            caption_side=caption_side, header_text=header_text,
+            header_font=header_font, header_size=_s(header_size),
+            footer_enabled=footer_enabled, footer_text=footer_text,
+            footer_font=footer_font, footer_size=_s(footer_size),
+            watermark_path=watermark_path, watermark_height=_s(watermark_height),
+            chat_messages=chat_messages, bubble_color=bubble_color,
+            _px_scale=_px_scale * scale,
+        )
+
+    # Fixed pixel margins/offsets below were tuned at natural size; scale
+    # them along with everything else when rendering at output resolution.
+    def _px(v: float) -> int:
+        return max(1, round(v * _px_scale))
+    margin = _px(8)
+    shadow_offset = (_px(2), _px(3))
 
     # Panel geometry — cap_width acts as height in vertical layout.
     # Horizontal layouts can put the caption panel on either side of the
@@ -736,7 +853,6 @@ def build_composite(
     # watermark/footer/header overlays below (all anchored to the image,
     # not the canvas) shift along with it.
     image_x = 0
-    total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
     if layout == "vertical":
         panel_x, panel_y, panel_w, panel_h = 0, fh, fw, cap_width
     elif caption_side == "left":
@@ -745,96 +861,112 @@ def build_composite(
     else:
         panel_x, panel_y, panel_w, panel_h = fw, 0, cap_width, fh
 
+    def _render_overlay() -> Image.Image:
+        out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(out)
+
+        out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
+                  (panel_x, panel_y))
+
+        # When shadow is on, accumulate all text into two layers then composite once.
+        # This cuts GaussianBlur calls from N-per-text-element down to one per frame.
+        if shadow:
+            txt_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+            txt_draw = ImageDraw.Draw(txt_img)
+            shd_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+            shd_draw_ctx: Optional[ImageDraw.ImageDraw] = ImageDraw.Draw(shd_img)
+        else:
+            txt_img = None
+            txt_draw = draw
+            shd_draw_ctx = None
+
+        if chat_messages is not None:
+            _draw_chat_panel(txt_draw, panel_x, panel_y, panel_w, panel_h,
+                             chat_messages, font_family, font_size, padding,
+                             bold, bubble_color, shd_draw_ctx,
+                             shadow_offset=shadow_offset)
+        else:
+            _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
+                             text, font_family, font_size, font_color, padding,
+                             stroke_width, stroke_color, bold, shd_draw_ctx,
+                             shadow_offset=shadow_offset, align=align)
+
+        # Watermark — bottom-left of image; track right edge for footer placement
+        wm_right = image_x + margin
+        if watermark_path and os.path.exists(watermark_path):
+            try:
+                wm = Image.open(watermark_path).convert("RGBA")
+                wm_scale = watermark_height / wm.height
+                wm = wm.resize((max(1, int(wm.width * wm_scale)), watermark_height), Image.LANCZOS)
+                wy = fh - watermark_height - margin
+                if wy >= 0:
+                    out.alpha_composite(wm, (image_x + margin, wy))
+                    wm_right = image_x + margin + wm.width + _px(6)
+            except Exception:
+                pass
+
+        # Footer text — overlaid on bottom-left of image, to the right of watermark
+        if footer_enabled and footer_text.strip():
+            fnt = _pil_font(footer_font, footer_size)
+            avail_w = fw - (wm_right - image_x) - margin
+            if avail_w > _px(20):
+                lines = _wrap_lines(footer_text.strip(), fnt, avail_w, txt_draw)
+                line_h = txt_draw.textbbox((0, 0), "Ag", font=fnt)[3] + _px(2)
+                block_h = len(lines) * line_h
+                fx = wm_right
+                fy = fh - block_h - margin
+                if fy >= 0:
+                    ty = fy
+                    for line in lines:
+                        _draw_text_overlay(txt_draw, (fx, ty), line, fnt, font_color,
+                                           stroke_width, stroke_color, shd_draw_ctx,
+                                           shadow_offset)
+                        ty += line_h
+
+        # Title text overlaid at top-left corner of image
+        if header_text.strip():
+            fnt = _pil_font(header_font, header_size)
+            _draw_text_overlay(txt_draw, (image_x + margin, margin), header_text.strip(), fnt,
+                               font_color, stroke_width, stroke_color, shd_draw_ctx,
+                               shadow_offset)
+
+        # Composite shadow (single blur) then actual text on top
+        if shadow and txt_img is not None and shd_img is not None:
+            out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3 * _px_scale)))
+            out.alpha_composite(txt_img)
+
+        return out
+
+    # Everything except the frame itself — panel, caption, shadow,
+    # watermark, header/footer — is identical for every frame of an
+    # animation, so it's rendered once onto a transparent overlay and
+    # reused. Redrawing and re-blurring it per frame made a full GIF
+    # rebuild/export take ~0.25s a frame, and that background rebuild
+    # starved the live preview of CPU.
+    try:
+        wm_mtime = os.path.getmtime(watermark_path) if watermark_path else None
+    except OSError:
+        wm_mtime = None
+    key = (fw, fh, text, cap_width, page_bg, font_family, font_size, font_color,
+           padding, stroke_width, stroke_color, bold, shadow, align, layout,
+           caption_side, header_text, header_font, header_size, footer_enabled,
+           footer_text, footer_font, footer_size, watermark_path, wm_mtime,
+           watermark_height, json.dumps(chat_messages), bubble_color, _px_scale)
+    with _OVERLAY_CACHE_LOCK:
+        overlay = _OVERLAY_CACHE.get(key)
+        if overlay is not None:
+            _OVERLAY_CACHE.move_to_end(key)
+
+    if overlay is None:
+        overlay = _render_overlay()
+        with _OVERLAY_CACHE_LOCK:
+            _OVERLAY_CACHE[key] = overlay
+            while len(_OVERLAY_CACHE) > _OVERLAY_CACHE_SIZE:
+                _OVERLAY_CACHE.popitem(last=False)
+
     out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 255))
-    draw = ImageDraw.Draw(out)
-
     out.paste(frame, (image_x, 0), frame)
-    out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
-              (panel_x, panel_y))
-
-    # When shadow is on, accumulate all text into two layers then composite once.
-    # This cuts GaussianBlur calls from N-per-text-element down to one per frame.
-    if shadow:
-        txt_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-        txt_draw = ImageDraw.Draw(txt_img)
-        shd_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-        shd_draw_ctx: Optional[ImageDraw.ImageDraw] = ImageDraw.Draw(shd_img)
-    else:
-        txt_img = None
-        txt_draw = draw
-        shd_draw_ctx = None
-
-    if chat_messages is not None:
-        _draw_chat_panel(txt_draw, panel_x, panel_y, panel_w, panel_h,
-                         chat_messages, font_family, font_size, padding,
-                         bold, bubble_color, shd_draw_ctx)
-    else:
-        _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
-                         text, font_family, font_size, font_color, padding,
-                         stroke_width, stroke_color, bold, shd_draw_ctx,
-                         align=align)
-
-    # Watermark — bottom-left of image; track right edge for footer placement
-    wm_right = image_x + 8
-    if watermark_path and os.path.exists(watermark_path):
-        try:
-            wm = Image.open(watermark_path).convert("RGBA")
-            scale = watermark_height / wm.height
-            wm = wm.resize((max(1, int(wm.width * scale)), watermark_height), Image.LANCZOS)
-            wy = fh - watermark_height - 8
-            if wy >= 0:
-                out.alpha_composite(wm, (image_x + 8, wy))
-                wm_right = image_x + 8 + wm.width + 6
-        except Exception:
-            pass
-
-    # Footer text — overlaid on bottom-left of image, to the right of watermark
-    if footer_enabled and footer_text.strip():
-        fnt = _pil_font(footer_font, footer_size)
-        avail_w = fw - (wm_right - image_x) - 8
-        if avail_w > 20:
-            lines = _wrap_lines(footer_text.strip(), fnt, avail_w, txt_draw)
-            line_h = txt_draw.textbbox((0, 0), "Ag", font=fnt)[3] + 2
-            block_h = len(lines) * line_h
-            fx = wm_right
-            fy = fh - block_h - 8
-            if fy >= 0:
-                ty = fy
-                for line in lines:
-                    _draw_text_overlay(txt_draw, (fx, ty), line, fnt, font_color,
-                                       stroke_width, stroke_color, shd_draw_ctx)
-                    ty += line_h
-
-    # Title text overlaid at top-left corner of image
-    if header_text.strip():
-        fnt = _pil_font(header_font, header_size)
-        _draw_text_overlay(txt_draw, (image_x + 8, 8), header_text.strip(), fnt,
-                           font_color, stroke_width, stroke_color, shd_draw_ctx)
-
-    # Composite shadow (single blur) then actual text on top
-    if shadow and txt_img is not None and shd_img is not None:
-        out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3)))
-        out.alpha_composite(txt_img)
-
-    # Enforce a minimum final output size — upscale (never downscale by
-    # default) preserving aspect ratio, so small sources don't distort when
-    # stretched to fit both axes. Without an override, that's just
-    # default_scale. With the Output Size Override active, output_size_pct
-    # (0-100) slides between the 1280x720-touching floor (0%) and double
-    # today's default (100%) — giving room to shrink toward the floor or
-    # upscale beyond the normal default, on top of the plain non-overridden
-    # behavior. See _output_scale_bounds for the three reference scales.
-    floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
-    if output_override:
-        pct = max(0.0, min(100.0, output_size_pct)) / 100.0
-        scale = floor_scale + (ceiling_scale - floor_scale) * pct
-    else:
-        scale = default_scale
-    new_w = max(_MIN_OUTPUT_W, round(total_w * scale))
-    new_h = max(_MIN_OUTPUT_H, round(total_h * scale))
-    if (new_w, new_h) != (total_w, total_h):
-        out = out.resize((new_w, new_h), Image.LANCZOS)
-
+    out.alpha_composite(overlay)
     return out
 
 
@@ -879,6 +1011,91 @@ def _iter_frames_from_path(path: str, kind: str):
             yield frm.copy().convert("RGBA")
 
 
+# Frames sampled across the animation to pick the shared GIF palette and to
+# find which pixels never change (the caption panel, mostly).
+_GIF_PALETTE_SAMPLES = 12
+
+
+def _gif_sample_indices(total: int) -> list:
+    n = max(1, min(_GIF_PALETTE_SAMPLES, total))
+    return sorted({round(i * (total - 1) / max(1, n - 1)) for i in range(n)})
+
+
+def _write_gif(path: str, frames, samples: list, durations,
+               gif_colors: Optional[int] = None, dither: bool = True) -> None:
+    """Encode composited RGB(A) `frames` (any iterable) as a looping GIF.
+
+    Composites are upscaled to the output floor, and the old encode gave
+    every frame its own palette, so even the static caption panel was
+    re-encoded every frame. Exports came out 10x+ the size of the source,
+    too heavy for viewers to decode at the source's frame rate, so
+    playback crawled. Instead:
+    - one palette, built from `samples`, is shared by every frame;
+    - pixels identical across all samples (the caption panel) are quantized
+      without dithering, so they map to the same index every frame, while
+      the moving image area keeps Floyd-Steinberg dithering — unless
+      `dither` is False (GIF sources, which carry their own dither already;
+      re-dithering them just adds noise and bloats the file);
+    - pixels unchanged since the previous frame are set to a reserved
+      transparent index, and Pillow crops each frame to its changed area.
+    The transparency fill is done here in numpy rather than via Pillow's
+    optimize=True, whose palette-image path round-trips every frame through
+    a Python list (~0.1s a frame at 1280x720).
+    """
+    colors = min(255, gif_colors or 255)
+    rgb_samples = [f.convert("RGB") for f in samples]
+    w, h = rgb_samples[0].size
+    mosaic = Image.new("RGB", (w, h * len(rgb_samples)))
+    for i, f in enumerate(rgb_samples):
+        mosaic.paste(f, (0, h * i))
+    palette = mosaic.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+    # Reserve the first index past the palette for transparency, padding the
+    # palette to the power-of-two size GIF stores it at anyway.
+    transparent = colors
+    slots = 2
+    while slots < colors + 1:
+        slots *= 2
+    pal_bytes = (palette.getpalette() or [])[:colors * 3]
+    pal_bytes += [0] * (slots * 3 - len(pal_bytes))
+
+    # Without dithering, quantization is per-pixel, so static pixels already
+    # map to the same index every frame and no mask is needed.
+    static_mask = None
+    if dither:
+        static_mask = Image.new("L", (w, h), 255)
+        for f in rgb_samples[1:]:
+            diff = ImageChops.difference(rgb_samples[0], f).convert("L")
+            static_mask = ImageChops.multiply(static_mask, diff.point(lambda v: 255 if v == 0 else 0))
+        if static_mask.getbbox() is None:
+            static_mask = None
+    method = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+
+    def _quantized():
+        prev = None
+        for f in frames:
+            rgb = f.convert("RGB")
+            q = rgb.quantize(palette=palette, dither=method)
+            if static_mask is not None:
+                q.paste(rgb.quantize(palette=palette, dither=Image.Dither.NONE),
+                        (0, 0), static_mask)
+            idx = np.asarray(q)
+            if prev is None:
+                out_idx = idx
+            else:
+                out_idx = idx.copy()
+                out_idx[idx == prev] = transparent
+            prev = idx
+            out = Image.fromarray(out_idx, "P")
+            out.putpalette(pal_bytes)
+            yield out
+
+    it = _quantized()
+    first = next(it)
+    first.save(path, format="GIF", save_all=True, append_images=it,
+               duration=durations, loop=0, optimize=False, disposal=1,
+               transparency=transparent)
+
+
 def _export_worker_main(job_path: str) -> None:
     with open(job_path, "r", encoding="utf-8") as f:
         job = json.load(f)
@@ -901,26 +1118,36 @@ def _export_worker_main(job_path: str) -> None:
     print(f"Exporting {os.path.basename(output_path)}  ({total} frames, {fps:.2f} fps)")
     print("This window closes automatically when the export finishes.\n")
 
+    def _progress(i: int) -> None:
+        if i % 20 == 0 or i == total - 1:
+            print(f"\rExporting frame {i + 1}/{total}…", end="", flush=True)
+
     if as_mp4:
         writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        try:
+            for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
+                composited = build_composite(frame, **params)
+                writer.append_data(_pad_to_macro_block(np.array(composited.convert("RGB"))))
+                _progress(i)
+        finally:
+            writer.close()
     else:
-        duration = durations if durations else max(1, round(1000 / fps))
-        writer = imageio.get_writer(output_path, mode="I", duration=duration, loop=0)
+        # Two passes over the source: a sample of frames picks the shared
+        # palette (see _write_gif), then every frame is encoded.
+        print("Choosing colors…", flush=True)
+        wanted = set(_gif_sample_indices(total))
+        samples = [build_composite(frame, **params)
+                   for i, frame in enumerate(_iter_frames_from_path(source_path, kind))
+                   if i in wanted]
 
-    try:
-        for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
-            composited = build_composite(frame, **params)
-            rgb = composited.convert("RGB")
-            if not as_mp4 and gif_colors is not None:
-                rgb = rgb.quantize(colors=gif_colors).convert("RGB")
-            arr = np.array(rgb)
-            if as_mp4:
-                arr = _pad_to_macro_block(arr)
-            writer.append_data(arr)
-            if i % 20 == 0 or i == total - 1:
-                print(f"\rExporting frame {i + 1}/{total}…", end="", flush=True)
-    finally:
-        writer.close()
+        def _composited():
+            for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
+                yield build_composite(frame, **params)
+                _progress(i)
+
+        duration = durations if durations else max(1, round(1000 / fps))
+        _write_gif(output_path, _composited(), samples, duration, gif_colors,
+                   dither=kind != "gif")
     print("\nDone.")
 
 
@@ -953,22 +1180,19 @@ def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
     try:
         if as_mp4:
             writer = imageio.get_writer(tmp_path, fps=fps, codec="libx264", quality=8)
+            try:
+                for frame in frames:
+                    writer.append_data(_pad_to_macro_block(np.array(frame.convert("RGB"))))
+            finally:
+                writer.close()
         else:
+            # Only affects the estimate number, not the in-memory frames or
+            # the on-screen preview — see _redraw()/self._cache.
             duration = durations if durations else max(1, round(1000 / fps))
-            writer = imageio.get_writer(tmp_path, mode="I", duration=duration, loop=0)
-        try:
-            for frame in frames:
-                rgb = frame.convert("RGB")
-                # Only affects the estimate number, not this in-memory frame
-                # or the on-screen preview — see _redraw()/self._cache.
-                if not as_mp4 and gif_colors is not None:
-                    rgb = rgb.quantize(colors=gif_colors).convert("RGB")
-                arr = np.array(rgb)
-                if as_mp4:
-                    arr = _pad_to_macro_block(arr)
-                writer.append_data(arr)
-        finally:
-            writer.close()
+            # Only GIF sources get a GIF estimate (as_mp4 follows the source
+            # type), so match the worker's no-dither setting for them.
+            samples = [frames[i] for i in _gif_sample_indices(len(frames))]
+            _write_gif(tmp_path, frames, samples, duration, gif_colors, dither=False)
         return os.path.getsize(tmp_path)
     finally:
         try:
@@ -1040,7 +1264,7 @@ class CaptionApp:
         self._stroke_color = "#000000"
         available_fonts = _font_list()
         self._font_var = tk.StringVar(value=available_fonts[0] if available_fonts else "Arial")
-        self._size_var = tk.IntVar(value=72)
+        self._size_var = tk.DoubleVar(value=72)
         # Set while _collect_render_params programmatically updates _size_var
         # to reflect Auto-fit's computed size, so that write doesn't loop
         # back into another refresh via the trace below.
@@ -1401,7 +1625,9 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Font Size:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=8, to=_MAX_AUTO_FONT_SIZE, textvariable=self._size_var,
+        # Quarter-point steps; any value can be typed (e.g. 5.6).
+        ttk.Spinbox(f, from_=1, to=_MAX_AUTO_FONT_SIZE, increment=0.25,
+                    textvariable=self._size_var,
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
         r += 1
 
@@ -3027,6 +3253,7 @@ class CaptionApp:
             caption_side=self._side_var.get(),
             auto_size=self._auto_size_var.get(),
             frame_size=self._frames[0].size if self._frames else None,
+            source_is_gif=self._is_anim and not self._is_video,
             font_family=self._font_var.get(),
             page_bg=self._page_bg_color,
             font_color=self._fc_color,
