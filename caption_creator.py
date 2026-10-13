@@ -1177,12 +1177,25 @@ def _estimate_static_bytes(img: Image.Image) -> int:
     return buf.tell()
 
 
+class _EstimateCancelled(Exception):
+    """Raised inside _estimate_anim_bytes when its cancel event is set."""
+
+
 def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
-                          gif_colors: Optional[int] = None) -> int:
+                          gif_colors: Optional[int] = None,
+                          cancel: Optional[threading.Event] = None) -> int:
     """Encode already-composited frames with the same writer settings
     _export_worker_main uses, to a throwaway temp file, and return its size.
     Slow enough (a real GIF/MP4 encode) that callers must run this off the
     Tk thread."""
+    def _checked():
+        # A newer edit makes this estimate stale — stop encoding instead of
+        # burning seconds of CPU the next rebuild/preview needs.
+        for f in frames:
+            if cancel is not None and cancel.is_set():
+                raise _EstimateCancelled
+            yield f
+
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4" if as_mp4 else ".gif", delete=False)
     tmp_path = tmp.name
     tmp.close()  # release our handle before imageio opens the same path
@@ -1190,7 +1203,7 @@ def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
         if as_mp4:
             writer = imageio.get_writer(tmp_path, fps=fps, codec="libx264", quality=8)
             try:
-                for frame in frames:
+                for frame in _checked():
                     writer.append_data(_pad_to_macro_block(np.array(frame.convert("RGB"))))
             finally:
                 writer.close()
@@ -1201,7 +1214,7 @@ def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
             # Only GIF sources get a GIF estimate (as_mp4 follows the source
             # type), so match the worker's no-dither setting for them.
             samples = [frames[i] for i in _gif_sample_indices(len(frames))]
-            _write_gif(tmp_path, frames, samples, duration, gif_colors, dither=False)
+            _write_gif(tmp_path, _checked(), samples, duration, gif_colors, dither=False)
         return os.path.getsize(tmp_path)
     finally:
         try:
@@ -1237,6 +1250,11 @@ class CaptionApp:
         self._frames: list = []
         self._durations: list = []
         self._cache: list = []
+        # Display-size copies of self._cache frames for the preview canvas,
+        # keyed by index; cleared whenever self._cache or the canvas size
+        # changes (see _redraw).
+        self._disp_cache: dict = {}
+        self._disp_size: tuple = (0, 0)
         self._is_anim: bool = False
         self._is_video: bool = False
         self._video_fps: Optional[float] = None
@@ -2476,6 +2494,7 @@ class CaptionApp:
         self._frames.clear()
         self._durations.clear()
         self._cache.clear()
+        self._disp_cache = {}
         self._update_preview_label()
         self._video_fps = None
         self._deferred_path = None
@@ -3434,6 +3453,7 @@ class CaptionApp:
         preview build finishes."""
         self._apply_resolved_font_size(size, field_size)
         self._cache = [first]
+        self._disp_cache = {}
         self._cache_complete = not self._is_anim
         self._anim_idx = 0
         txt = self._status.cget("text")
@@ -3541,34 +3561,66 @@ class CaptionApp:
                     return
             if cancel.is_set():
                 return
+            # Start the animation now; the size estimate is a full encode
+            # (several seconds) and used to hold the preview back until it
+            # finished.
+            self.root.after(
+                0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"]))
             try:
-                size_bytes = _estimate_anim_bytes(results, as_mp4, fps, durations, gif_colors)
+                size_bytes = _estimate_anim_bytes(results, as_mp4, fps, durations,
+                                                  gif_colors, cancel=cancel)
+            except _EstimateCancelled:
+                return
             except Exception:
                 log.exception("SIZE_ESTIMATE_ERROR")
                 size_bytes = None
             if not cancel.is_set():
+                label = "MP4" if as_mp4 else "GIF"
+                if gif_colors is not None:
+                    label += ", compressed"
                 self.root.after(
-                    0, lambda r=results, s=size, sb=size_bytes, gc=gif_colors:
-                        self._on_rebuild_done(r, s, raw["field_size"], sb, gc))
+                    0, lambda sb=size_bytes, lb=label: self._set_size_estimate(sb, lb))
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_rebuild_done(self, results: list, size: int, field_size: int,
-                          size_bytes: Optional[int], gif_colors: Optional[int]) -> None:
-        """Called on the main thread when the background GIF build finishes."""
+    def _on_rebuild_done(self, results: list, size: int, field_size: int) -> None:
+        """Called on the main thread when the background GIF build finishes
+        (the size estimate follows separately via _set_size_estimate)."""
         self._apply_resolved_font_size(size, field_size)
         self._cache = results
+        self._disp_cache = {}
         self._cache_complete = True
         txt = self._status.cget("text")
         self._status.config(text=txt.replace(" [Rendering…]", ""))
         log.info("GIF_REBUILD_DONE  frames=%d", len(results))
         self._anim_idx = 0
         self._update_preview_label()
-        label = "MP4" if self._is_video else "GIF"
-        if gif_colors is not None:
-            label += ", compressed"
-        self._set_size_estimate(size_bytes, label)
+        self._size_est_label.config(text="Est. size: calculating…", foreground="#888")
+        self._prewarm_display_cache()
         self._start_anim()
+
+    def _prewarm_display_cache(self) -> None:
+        """Downscale every cached frame to the preview canvas size in the
+        background, so the animation's first loop plays at full speed too
+        instead of resizing as it goes (see _redraw)."""
+        frames = self._cache
+        cw = max(self._canvas.winfo_width(), 10)
+        ch = max(self._canvas.winfo_height(), 10)
+        self._disp_size = (cw, ch)
+        disp_cache = self._disp_cache
+
+        def _work() -> None:
+            for i, img in enumerate(frames):
+                # Stop if the frames or canvas size changed underneath us.
+                if self._disp_cache is not disp_cache or self._cache is not frames:
+                    return
+                if i in disp_cache:
+                    continue
+                scale = min(cw / img.width, ch / img.height, 1.0)
+                disp_cache[i] = img.resize((max(1, int(img.width * scale)),
+                                            max(1, int(img.height * scale))), Image.LANCZOS)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     # ------------------------------------------------------------------
     # DeviantArt integration
@@ -4039,9 +4091,18 @@ class CaptionApp:
         img = self._cache[self._anim_idx]
         cw = max(self._canvas.winfo_width(), 10)
         ch = max(self._canvas.winfo_height(), 10)
-        scale = min(cw / img.width, ch / img.height, 1.0)
-        disp = img.resize((max(1, int(img.width * scale)),
-                           max(1, int(img.height * scale))), Image.LANCZOS)
+        if (cw, ch) != self._disp_size:
+            self._disp_cache = {}
+            self._disp_size = (cw, ch)
+        # Downscaling a full-size frame takes ~30ms — most of a GIF frame's
+        # duration — so each frame is resized once per canvas size and
+        # reused on every later loop of the animation.
+        disp = self._disp_cache.get(self._anim_idx)
+        if disp is None:
+            scale = min(cw / img.width, ch / img.height, 1.0)
+            disp = img.resize((max(1, int(img.width * scale)),
+                               max(1, int(img.height * scale))), Image.LANCZOS)
+            self._disp_cache[self._anim_idx] = disp
         self._preview_pil_img = disp  # kept for the color-eyedropper to sample from
         self._tk_img = ImageTk.PhotoImage(disp)
         self._canvas.delete("all")
@@ -4053,8 +4114,13 @@ class CaptionApp:
     def _anim_step(self) -> None:
         if not self._cache or not self._is_anim:
             return
+        t0 = time.perf_counter()
         self._redraw()
-        delay = max(20, self._durations[self._anim_idx])
+        # Wait out the rest of the frame's duration, not all of it on top of
+        # the time spent drawing — otherwise the preview plays slower than
+        # the real GIF.
+        spent_ms = int((time.perf_counter() - t0) * 1000)
+        delay = max(1, max(20, self._durations[self._anim_idx]) - spent_ms)
         self._anim_idx = (self._anim_idx + 1) % len(self._cache)
         self._anim_id = self.root.after(delay, self._anim_step)
 
