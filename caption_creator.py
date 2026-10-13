@@ -264,7 +264,7 @@ def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeF
                 return ImageFont.truetype(path, size)
             except Exception:
                 pass
-        return ImageFont.load_default()
+        return ImageFont.load_default(size)
 
     all_fonts = _scan_all_fonts()
     path = all_fonts.get(f"{family} Bold") if bold else None
@@ -278,7 +278,9 @@ def _pil_font(family: str, size: int, bold: bool = False) -> ImageFont.FreeTypeF
             return ImageFont.truetype(path, size)
         except Exception:
             pass
-    return ImageFont.load_default()
+    # Scalable fallback (Pillow >= 10.1) — the size-less bitmap default is
+    # a fixed ~10px, which also defeats Auto-fit.
+    return ImageFont.load_default(size)
 
 
 def _font_list() -> list:

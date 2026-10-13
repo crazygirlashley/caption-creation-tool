@@ -1,4 +1,4 @@
-pillow>=10.0.0
+pillow>=10.1.0
 requests>=2.28
 imageio>=2.34.0
 imageio-ffmpeg>=0.5.0
