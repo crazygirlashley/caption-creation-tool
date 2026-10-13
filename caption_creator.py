@@ -303,6 +303,15 @@ _MIN_OUTPUT_H = 720
 # CaptionApp._collect_render_params).
 _MAX_AUTO_FONT_SIZE = 200
 
+# Auto watermark height (footer off, Auto checked): this fraction of the
+# image's shorter side, so the watermark keeps the same proportions on a
+# 242px GIF as on a 2000px photo instead of a fixed pixel height.
+_WM_AUTO_FRAC = 0.15
+
+
+def _auto_watermark_height(frame_size: tuple) -> int:
+    return max(1, round(min(frame_size) * _WM_AUTO_FRAC))
+
 # Raw RGBA frame-data threshold above which we warn before loading a GIF/video.
 # The app holds source frames AND a separately-rendered cache simultaneously
 # (plus temporary RGB copies during save/upload), so actual peak usage runs
@@ -1315,8 +1324,13 @@ class CaptionApp:
         # Watermark
         self._watermark_path = ""
         # Only used when the footer is disabled — with the footer on,
-        # watermark height stays tied to 2x footer size as before.
+        # watermark height stays tied to 2x footer size as before. While
+        # _wm_auto_var is set the height follows the image (see
+        # _auto_watermark_height) and the field just displays it; typing a
+        # value turns Auto off and keeps the manual height.
         self._watermark_height_var = tk.IntVar(value=120)
+        self._wm_auto_var = tk.BooleanVar(value=True)
+        self._updating_wm_display = False
 
         # Warn if Aardvark Cafe not installed (deferred to after window shows)
         self._warn_aardvark = not bool(_check_aardvark())
@@ -1495,9 +1509,10 @@ class CaptionApp:
         for v in (self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._side_var, self._header_size_var,
-                  self._footer_size_var,
-                  self._watermark_height_var, self._output_pct_var, self._gif_colors_var):
+                  self._footer_size_var, self._wm_auto_var,
+                  self._output_pct_var, self._gif_colors_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
+        self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
         # _size_var also gets programmatically overwritten by Auto-fit itself
         # (see _collect_render_params) — skip those writes so they don't
         # recurse back into another refresh.
@@ -1872,8 +1887,11 @@ class CaptionApp:
         # and _on_format_change).
         self._wm_height_label = ttk.Label(f, text="Watermark Height (px):")
         self._wm_height_label.grid(row=r, column=0, sticky="w", pady=(6, 4))
-        self._wm_height_spin = ttk.Spinbox(f, from_=10, to=2000,
-                                           textvariable=self._watermark_height_var, width=7)
+        self._wm_height_spin = ttk.Frame(f)
+        ttk.Spinbox(self._wm_height_spin, from_=1, to=2000,
+                    textvariable=self._watermark_height_var, width=7).pack(side="left")
+        ttk.Checkbutton(self._wm_height_spin, text="Auto",
+                        variable=self._wm_auto_var).pack(side="left", padx=(6, 0))
         self._wm_height_spin.grid(row=r, column=1, sticky="w", padx=6, pady=(6, 4))
         r += 1
 
@@ -2085,6 +2103,16 @@ class CaptionApp:
     def _on_footer_toggle(self) -> None:
         self._update_watermark_height_visibility()
         self._safe_refresh()
+
+    def _on_wm_height_write(self) -> None:
+        """A user edit of Watermark Height switches Auto off (its trace
+        refreshes); Auto's own display updates are skipped."""
+        if self._updating_wm_display:
+            return
+        if self._wm_auto_var.get():
+            self._wm_auto_var.set(False)
+        else:
+            self._safe_refresh()
 
     def _update_watermark_height_visibility(self) -> None:
         """The manual watermark height control only matters when the footer
@@ -3229,6 +3257,14 @@ class CaptionApp:
             footer_enabled = self._footer_enabled.get()
             if footer_enabled:
                 wm_h = int(footer_sz * 2.0)
+            elif self._wm_auto_var.get() and self._frames:
+                wm_h = _auto_watermark_height(self._frames[0].size)
+                if self._watermark_height_var.get() != wm_h:
+                    self._updating_wm_display = True
+                    try:
+                        self._watermark_height_var.set(wm_h)
+                    finally:
+                        self._updating_wm_display = False
             else:
                 wm_h = self._watermark_height_var.get()
         except tk.TclError:
