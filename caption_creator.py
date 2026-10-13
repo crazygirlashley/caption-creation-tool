@@ -1248,6 +1248,51 @@ def _estimate_static_bytes(img: Image.Image) -> int:
     return buf.tell()
 
 
+# Consecutive frames encoded for a sampled GIF size estimate — ~0.5% off a
+# full encode on a real 120-frame caption GIF, at a fraction of the cost.
+_GIF_SIZE_SAMPLE_FRAMES = 24
+
+
+def _sampled_gif_bytes(source_frames: list, kwargs: dict, durations, fps: float,
+                       gif_colors: Optional[int], total: int) -> int:
+    """Approximate exported GIF size from the first few source frames.
+
+    A GIF is one full frame followed by deltas, so bytes don't scale
+    linearly from frame 0: estimate the first frame on its own, then
+    extrapolate the average delta cost across the remaining frames."""
+    sample = source_frames[:_GIF_SIZE_SAMPLE_FRAMES]
+    comps = [build_composite(f, **kwargs) for f in sample]
+    sample_durations = durations[:len(comps)] if durations else None
+    all_bytes = _estimate_anim_bytes(comps, False, fps, sample_durations, gif_colors)
+    if total <= len(comps) or len(comps) < 2:
+        return round(all_bytes / max(1, len(comps)) * total)
+    first_bytes = _estimate_anim_bytes(comps[:1], False, fps,
+                                       sample_durations[:1] if sample_durations else None,
+                                       gif_colors)
+    per_frame = (all_bytes - first_bytes) / (len(comps) - 1)
+    return round(first_bytes + per_frame * (total - 1))
+
+
+def _mp4_as_gif_bytes(source_frames: list, kwargs: dict, fps: float, total: int) -> int:
+    """Approximate size if an fps-timed (MP4) source were saved as GIF,
+    including the frame-dropping the GIF export applies above 50fps."""
+    step = max(1, math.ceil(fps / _GIF_MAX_FPS))
+    kept = source_frames[::step]
+    return _sampled_gif_bytes(kept, kwargs, None, fps / step, None,
+                              math.ceil(total / step))
+
+
+def _default_output_pct(fw: int, fh: int, cap_width: int, layout: str) -> int:
+    """Output Size Override slider position that reproduces the normal
+    (non-overridden) output size. See _output_scale_bounds."""
+    total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
+    floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
+    span = ceiling_scale - floor_scale
+    if span <= 0:
+        return 0
+    return max(0, min(100, round(100 * (default_scale - floor_scale) / span)))
+
+
 class _EstimateCancelled(Exception):
     """Raised inside _estimate_anim_bytes when its cancel event is set."""
 
@@ -1532,8 +1577,14 @@ class CaptionApp:
         self._gif_colors_row.pack_forget()  # hidden until the toggle above is checked
         self._gif_compress_frame.pack_forget()  # hidden until an eligible GIF source loads
 
-        self._size_est_label = ttk.Label(pf, text="", foreground="#888")
-        self._size_est_label.pack(side="top", anchor="w", pady=(0, 4))
+        self._size_est_row = ttk.Frame(pf)
+        self._size_est_row.pack(side="top", fill="x", pady=(0, 4))
+        self._size_est_label = ttk.Label(self._size_est_row, text="", foreground="#888")
+        self._size_est_label.pack(side="left", anchor="w")
+        # Shown only while a GIF estimate is over DeviantArt's upload cap.
+        self._fit_btn = ttk.Button(self._size_est_row, text="Fit under 80 MB",
+                                   command=self._fit_to_da_limit)
+        self._fit_running = False
 
         self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
@@ -2182,11 +2233,7 @@ class CaptionApp:
             except Exception:
                 log.exception("OUTPUT_PCT_ERROR")
                 return
-            total_w, total_h = _panel_total_size(fw, fh, kwargs["cap_width"], kwargs["layout"])
-            floor_scale, default_scale, ceiling_scale = _output_scale_bounds(total_w, total_h)
-            span = ceiling_scale - floor_scale
-            pct = 0 if span <= 0 else max(0, min(
-                100, round(100 * (default_scale - floor_scale) / span)))
+            pct = _default_output_pct(fw, fh, kwargs["cap_width"], kwargs["layout"])
             self.root.after(0, lambda p=pct: self._output_pct_var.set(p))
 
         threading.Thread(target=_build, daemon=True).start()
@@ -2494,7 +2541,7 @@ class CaptionApp:
         packed = self._gif_compress_frame.winfo_manager() == "pack"
         if relevant:
             if not packed:
-                self._gif_compress_frame.pack(side="top", fill="x", before=self._size_est_label)
+                self._gif_compress_frame.pack(side="top", fill="x", before=self._size_est_row)
         else:
             if packed:
                 self._gif_compress_frame.pack_forget()
@@ -3567,22 +3614,25 @@ class CaptionApp:
         def _build() -> None:
             try:
                 kwargs, _size = _resolve_composite_kwargs(raw)
-                sample = []
+                src = []
                 for i, frame in enumerate(_iter_frames_from_path(path, kind)):
                     if i >= sample_n:
                         break
-                    sample.append(build_composite(frame, **kwargs))
-                if not sample:
+                    src.append(frame)
+                if not src:
                     return
+                sample = [build_composite(frame, **kwargs) for frame in src]
                 sample_bytes = _estimate_anim_bytes(sample, as_mp4, fps, None, gif_colors)
                 size_bytes = round(sample_bytes / len(sample) * total)
+                gif_alt = _mp4_as_gif_bytes(src, kwargs, fps, total) if as_mp4 else None
             except Exception:
                 log.exception("SIZE_ESTIMATE_ERROR  (deferred sample)")
-                size_bytes = None
+                size_bytes = gif_alt = None
             label = ("MP4" if as_mp4 else "GIF") + ", approx"
             if gif_colors is not None:
                 label += ", compressed"
-            self.root.after(0, lambda sb=size_bytes: self._set_size_estimate(sb, label))
+            self.root.after(0, lambda sb=size_bytes, ga=gif_alt:
+                            self._set_size_estimate(sb, label, ga))
 
         threading.Thread(target=_build, daemon=True).start()
 
@@ -3666,6 +3716,12 @@ class CaptionApp:
             except Exception:
                 log.exception("SIZE_ESTIMATE_ERROR")
                 size_bytes = None
+            gif_alt = None
+            if as_mp4 and not cancel.is_set():
+                try:
+                    gif_alt = _mp4_as_gif_bytes(frames, kwargs, fps, len(frames))
+                except Exception:
+                    log.exception("SIZE_ESTIMATE_ERROR  (MP4 as GIF)")
             if not cancel.is_set():
                 label = "MP4" if as_mp4 else "GIF"
                 if sampled:
@@ -3673,7 +3729,8 @@ class CaptionApp:
                 if gif_colors is not None:
                     label += ", compressed"
                 self.root.after(
-                    0, lambda sb=size_bytes, lb=label: self._set_size_estimate(sb, lb))
+                    0, lambda sb=size_bytes, lb=label, ga=gif_alt:
+                        self._set_size_estimate(sb, lb, ga))
 
         threading.Thread(target=_build, daemon=True).start()
 
@@ -4161,11 +4218,13 @@ class CaptionApp:
         else:
             self._preview_frame.config(text="Preview")
 
-    def _set_size_estimate(self, num_bytes: Optional[int], label: str) -> None:
+    def _set_size_estimate(self, num_bytes: Optional[int], label: str,
+                           gif_alt_bytes: Optional[int] = None) -> None:
         """Update the estimated-output-size label next to the Preview panel,
         flagging anything that would exceed DeviantArt's 80MB upload cap.
         num_bytes is None either because nothing has been built yet or
         because the encode itself failed (see _rebuild_all_async)."""
+        self._fit_btn.pack_forget()
         if not self._cache:
             self._size_est_label.config(text="", foreground="#888")
             return
@@ -4181,7 +4240,119 @@ class CaptionApp:
             color = "#b8860b"
         else:
             color = "#888"
+        # MP4 sources can also be saved as GIF, which is usually far bigger
+        # — show that too so the DA limit doesn't come as a surprise.
+        if gif_alt_bytes is not None:
+            text += f"  ·  as GIF ≈ {_human_size(gif_alt_bytes)}"
+            if _over_da_limit_msg(gif_alt_bytes):
+                text += " ⚠"
         self._size_est_label.config(text=text, foreground=color)
+        if over_msg and label.startswith("GIF") and not self._is_video:
+            self._fit_btn.config(state="disabled" if self._fit_running else "normal")
+            self._fit_btn.pack(side="left", padx=(8, 0))
+
+    def _fit_to_da_limit(self) -> None:
+        """Find the highest-quality output settings whose GIF fits under
+        DeviantArt's upload cap, then apply them. Quality is given up in
+        order of how little it shows: first output size (down to the
+        1280x720 floor), then palette colors. Each candidate is sized from a
+        short sample (see _sampled_gif_bytes); the normal full estimate
+        confirms the result once the settings are applied."""
+        if self._fit_running or not self._frames:
+            return
+        raw = self._gather_raw_params()
+        if raw is None:
+            return
+        self._fit_running = True
+        self._fit_btn.config(state="disabled")
+        base_text = self._size_est_label.cget("text")
+        self._size_est_label.config(text="Finding settings that fit under 80 MB…")
+
+        deferred_path, deferred_kind = self._deferred_path, self._deferred_kind
+        total = self._deferred_total_frames if deferred_path else len(self._frames)
+        frames = None if deferred_path else self._frames[:_GIF_SIZE_SAMPLE_FRAMES]
+        durations = None if deferred_path else list(self._durations)
+        fps = self._export_fps()
+        fw, fh = self._frames[0].size
+        current_pct = raw["output_size_pct"] if raw["output_override"] else None
+        target = _DA_MAX_UPLOAD_BYTES * 0.95  # headroom for sampling error
+
+        def _search() -> Optional[tuple]:
+            src = frames
+            src_durations = durations
+            if src is None:
+                src = []
+                for i, f in enumerate(_iter_frames_from_path(deferred_path, deferred_kind)):
+                    if i >= _GIF_SIZE_SAMPLE_FRAMES:
+                        break
+                    src.append(f)
+                with Image.open(deferred_path) as img:
+                    src_durations = [frm.info.get("duration", 100)
+                                     for frm in ImageSequence.Iterator(img)]
+
+            def size_at(pct: int, colors: int) -> int:
+                kwargs, _ = _resolve_composite_kwargs(
+                    dict(raw, output_override=True, output_size_pct=pct))
+                return _sampled_gif_bytes(src, kwargs, src_durations, fps,
+                                          colors if colors < 256 else None, total)
+
+            hi = current_pct
+            if hi is None:
+                kwargs, _ = _resolve_composite_kwargs(raw)
+                hi = _default_output_pct(fw, fh, kwargs["cap_width"], kwargs["layout"])
+            if size_at(0, 256) <= target:
+                lo, best = 0, 0  # binary search the largest size that fits
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if size_at(mid, 256) <= target:
+                        best, lo = mid, mid + 1
+                    else:
+                        hi = mid - 1
+                return best, 256
+            for colors in (128, 96, 64, 48, 32):
+                if size_at(0, colors) <= target:
+                    return 0, colors
+            return None
+
+        def _run() -> None:
+            try:
+                result = _search()
+            except Exception:
+                log.exception("FIT_DA_LIMIT_ERROR")
+                result = "error"
+            self.root.after(0, lambda r=result: _done(r))
+
+        def _done(result) -> None:
+            self._fit_running = False
+            self._fit_btn.config(state="normal")
+            if result == "error":
+                self._size_est_label.config(text=base_text)
+                messagebox.showerror("Fit under 80 MB", "Couldn't work out smaller settings — "
+                                     "see caption_creator_crash.log.")
+                return
+            if result is None:
+                self._size_est_label.config(text=base_text)
+                messagebox.showinfo(
+                    "Fit under 80 MB",
+                    "Even at the smallest output size (1280×720) with 32 colors this "
+                    "GIF is still over 80 MB.\n\nTrimming it to fewer frames (or a "
+                    "shorter clip) is the remaining way to bring it under the limit.")
+                return
+            pct, colors = result
+            log.info("FIT_DA_LIMIT  pct=%d colors=%d", pct, colors)
+            self._output_override_var.set(True)
+            self._output_pct_row.pack(side="top", fill="x", pady=(0, 4),
+                                      before=self._gif_compress_frame
+                                      if self._gif_compress_frame.winfo_manager()
+                                      else self._size_est_row)
+            self._output_pct_var.set(pct)
+            if colors < 256:
+                self._gif_compress_var.set(True)
+                self._gif_colors_row.pack(side="top", fill="x", pady=(0, 4))
+                self._gif_colors_var.set(colors)
+            self._size_est_label.config(text="Est. size: recalculating…", foreground="#888")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _redraw(self) -> None:
         if not self._cache:

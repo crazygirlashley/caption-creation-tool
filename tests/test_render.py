@@ -206,6 +206,31 @@ class GifExportTests(unittest.TestCase):
         self.assertEqual(est, os.path.getsize(out))
 
 
+class SizeEstimateHelperTests(unittest.TestCase):
+    def test_default_output_pct_round_trips_to_default_size(self):
+        frame = Image.new("RGBA", (350, 242))
+        kw = dict(text="x", cap_width=300, page_bg="#ffffff", font_family="Arial",
+                  font_size=18, font_color="#000000", padding=12)
+        pct = cc._default_output_pct(350, 242, 300, "horizontal")
+        normal = cc.build_composite(frame, **kw).size
+        overridden = cc.build_composite(frame, output_override=True,
+                                        output_size_pct=pct, **kw).size
+        self.assertLessEqual(abs(normal[0] - overridden[0]), normal[0] * 0.02)
+
+    def test_sampled_gif_bytes_close_to_full_encode(self):
+        frames = []
+        for i in range(60):
+            im = Image.new("RGBA", (200, 140), (40, 90, 160, 255))
+            ImageDraw.Draw(im).ellipse((i * 2, 30, i * 2 + 50, 80), fill=(250, 200, 30))
+            frames.append(im)
+        kwargs, _ = cc._resolve_composite_kwargs(_raw((200, 140), text="caption"))
+        durations = [40] * len(frames)
+        full = cc._estimate_anim_bytes([cc.build_composite(f, **kwargs) for f in frames],
+                                       False, 25.0, durations, None)
+        sampled = cc._sampled_gif_bytes(frames, kwargs, durations, 25.0, None, len(frames))
+        self.assertLess(abs(sampled - full) / full, 0.10)
+
+
 class Mp4ToGifTimingTests(unittest.TestCase):
     """fps-timed sources: GIF stores centisecond delays and can't go below
     20ms, so total length has to be preserved by spreading the rounding and
