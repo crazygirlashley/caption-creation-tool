@@ -196,5 +196,45 @@ class GifExportTests(unittest.TestCase):
         self.assertEqual(est, os.path.getsize(out))
 
 
+class Mp4ToGifTimingTests(unittest.TestCase):
+    """fps-timed sources: GIF stores centisecond delays and can't go below
+    20ms, so total length has to be preserved by spreading the rounding and
+    dropping frames above 50fps."""
+
+    def _export(self, fps: float, n: int) -> tuple:
+        import imageio.v2 as imageio
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.mp4")
+            writer = imageio.get_writer(src, fps=fps, codec="libx264", quality=8)
+            for i in range(n):
+                im = Image.new("RGB", (192, 128), (40, 90, 160))
+                ImageDraw.Draw(im).rectangle((i * 2, 30, i * 2 + 30, 70), fill=(250, 200, 30))
+                writer.append_data(np.asarray(im))
+            writer.close()
+            out = os.path.join(tmp, "out.gif")
+            job = os.path.join(tmp, "job.json")
+            params, _ = cc._resolve_composite_kwargs(_raw((192, 128), text="caption",
+                                                          source_is_gif=False))
+            with open(job, "w", encoding="utf-8") as f:
+                json.dump(dict(source_path=src, kind="mp4", output_path=out, as_mp4=False,
+                               params=params, fps=fps, total_frames=n, durations=None,
+                               gif_colors=None), f)
+            cc._export_worker_main(job)
+            with Image.open(out) as im:
+                delays = [f.info["duration"] for f in ImageSequence.Iterator(im)]
+        return delays
+
+    def test_30fps_keeps_total_length(self):
+        delays = self._export(30.0, 30)
+        self.assertEqual(sum(delays), 1000)
+        self.assertEqual(len(delays), 30)
+
+    def test_60fps_drops_frames_but_keeps_length(self):
+        delays = self._export(60.0, 60)
+        self.assertEqual(sum(delays), 1000)
+        self.assertEqual(len(delays), 30)
+        self.assertGreaterEqual(min(delays), 20)
+
+
 if __name__ == "__main__":
     unittest.main()

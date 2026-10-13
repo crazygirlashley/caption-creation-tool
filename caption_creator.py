@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import shutil
 import subprocess
@@ -1026,10 +1027,31 @@ def _iter_frames_from_path(path: str, kind: str):
 # find which pixels never change (the caption panel, mostly).
 _GIF_PALETTE_SAMPLES = 12
 
+# Fastest frame rate a GIF plays at reliably (20ms delays).
+_GIF_MAX_FPS = 50
+
 
 def _gif_sample_indices(total: int) -> list:
     n = max(1, min(_GIF_PALETTE_SAMPLES, total))
     return sorted({round(i * (total - 1) / max(1, n - 1)) for i in range(n)})
+
+
+def _gif_frame_delays(frame_ms: float):
+    """Yield per-frame GIF delays (ms) for a constant frame interval.
+
+    GIF stores delays in whole centiseconds, so a 30fps frame (33.3ms)
+    written as-is truncates to 30ms and the whole animation runs ~10% fast.
+    Rounding the running total instead (30, 30, 40, 30, ...) keeps the
+    overall duration exact. Delays never go below 20ms: browsers treat
+    0-10ms delays as 100ms, which would make a fast clip crawl instead.
+    """
+    elapsed_target = 0.0
+    written = 0
+    while True:
+        elapsed_target += frame_ms
+        delay = max(20, int(round((elapsed_target - written) / 10.0)) * 10)
+        written += delay
+        yield delay
 
 
 def _write_gif(path: str, frames, samples: list, durations,
@@ -1052,6 +1074,10 @@ def _write_gif(path: str, frames, samples: list, durations,
     The transparency fill is done here in numpy rather than via Pillow's
     optimize=True, whose palette-image path round-trips every frame through
     a Python list (~0.1s a frame at 1280x720).
+
+    `durations` is either the source's per-frame delays (a list, ms) or a
+    single frame interval in ms (float) for fps-timed sources, which is
+    spread across frames by _gif_frame_delays.
     """
     colors = min(255, gif_colors or 255)
     rgb_samples = [f.convert("RGB") for f in samples]
@@ -1080,6 +1106,12 @@ def _write_gif(path: str, frames, samples: list, durations,
         if static_mask.getbbox() is None:
             static_mask = None
     method = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+
+    if isinstance(durations, (list, tuple)):
+        delays = iter(durations)
+    else:
+        delays = _gif_frame_delays(float(durations))
+    last_delay = [100]
 
     def _quantized():
         prev = prev_out = None
@@ -1115,12 +1147,18 @@ def _write_gif(path: str, frames, samples: list, durations,
             prev_out = out_idx
             out = Image.fromarray(out_idx, "P")
             out.putpalette(pal_bytes)
+            # Per-frame delay rides on the frame itself (save() below gets
+            # duration=None), so the frame count never has to be known up
+            # front — a streamed MP4 can yield more frames than its metadata
+            # promised.
+            last_delay[0] = next(delays, last_delay[0])
+            out.info["duration"] = last_delay[0]
             yield out
 
     it = _quantized()
     first = next(it)
     first.save(path, format="GIF", save_all=True, append_images=it,
-               duration=durations, loop=0, optimize=False, disposal=1,
+               loop=0, optimize=False, disposal=1,
                transparency=transparent)
 
 
@@ -1163,6 +1201,10 @@ def _export_worker_main(job_path: str) -> None:
         # Two passes over the source: a sample of frames picks the shared
         # palette (see _write_gif), then every frame is encoded.
         print("Choosing colors…", flush=True)
+        # GIF can't show frames faster than 20ms (50fps) — browsers slow
+        # shorter delays to 100ms — so an fps-timed source above that keeps
+        # every Nth frame, with each one held N frames' worth of time.
+        step = 1 if durations else max(1, math.ceil(fps / _GIF_MAX_FPS))
         wanted = set(_gif_sample_indices(total))
         samples = [build_composite(frame, **params)
                    for i, frame in enumerate(_iter_frames_from_path(source_path, kind))
@@ -1170,10 +1212,11 @@ def _export_worker_main(job_path: str) -> None:
 
         def _composited():
             for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
-                yield build_composite(frame, **params)
+                if i % step == 0:
+                    yield build_composite(frame, **params)
                 _progress(i)
 
-        duration = durations if durations else max(1, round(1000 / fps))
+        duration = durations if durations else 1000.0 * step / fps
         _write_gif(output_path, _composited(), samples, duration, gif_colors,
                    dither=kind != "gif")
     print("\nDone.")
@@ -1229,7 +1272,7 @@ def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
         else:
             # Only affects the estimate number, not the in-memory frames or
             # the on-screen preview — see _redraw()/self._cache.
-            duration = durations if durations else max(1, round(1000 / fps))
+            duration = durations if durations else 1000.0 / fps
             # Only GIF sources get a GIF estimate (as_mp4 follows the source
             # type), so match the worker's no-dither setting for them.
             samples = [frames[i] for i in _gif_sample_indices(len(frames))]
