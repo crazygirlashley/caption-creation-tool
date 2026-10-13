@@ -3969,7 +3969,11 @@ class CaptionApp:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-                messagebox.showerror("Export Error", "Failed to render/export the file for upload.")
+                messagebox.showerror(
+                    "Export Error",
+                    "The export didn't finish, so nothing was uploaded — either it "
+                    "failed or its console window was closed before it was done.\n\n"
+                    "If it failed, the details are in caption_creator_crash.log.")
 
             self._run_export_in_console(tmp_path, upload_format == "mp4",
                                          params, gif_colors, _on_export_success, _on_export_error)
