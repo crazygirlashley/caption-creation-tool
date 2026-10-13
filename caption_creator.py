@@ -1201,6 +1201,15 @@ def _export_worker_main(job_path: str) -> None:
         # Two passes over the source: a sample of frames picks the shared
         # palette (see _write_gif), then every frame is encoded.
         print("Choosing colors…", flush=True)
+        if durations is None and kind == "gif":
+            # Deferred (single-frame preview) GIF sources reach here without
+            # per-frame timing — the GUI only ever decoded frame 1. Read it
+            # from the file instead of stretching frame 1's delay across the
+            # whole animation, which played variable-timing GIFs at the
+            # wrong speed.
+            with Image.open(source_path) as img:
+                durations = [frm.info.get("duration", 100)
+                             for frm in ImageSequence.Iterator(img)]
         # GIF can't show frames faster than 20ms (50fps) — browsers slow
         # shorter delays to 100ms — so an fps-timed source above that keeps
         # every Nth frame, with each one held N frames' worth of time.
@@ -2971,10 +2980,9 @@ class CaptionApp:
         args) are invoked on the main thread once the subprocess exits."""
         total = self._deferred_total_frames if self._deferred_path else len(self._frames)
         fps = self._export_fps()
-        # Getting exact per-frame GIF durations requires the durations already
-        # loaded in memory — the worker process re-reads frames from disk and
-        # has no access to those, so deferred (never-fully-loaded) sources and
-        # MP4 output fall back to one uniform duration derived from fps.
+        # Per-frame GIF durations are passed when already loaded in memory.
+        # Deferred (never-fully-loaded) GIF sources send None and the worker
+        # reads the timing from the file itself; MP4 sources are timed by fps.
         durations = (list(self._durations)
                      if (not self._deferred_path and not as_mp4) else None)
 

@@ -161,19 +161,29 @@ class GifExportTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _export(self) -> str:
+    def _export(self, deferred: bool = False) -> str:
         out = os.path.join(self.tmp.name, "out.gif")
         job = os.path.join(self.tmp.name, "job.json")
+        # A deferred (single-frame preview) source only knows frame 1's
+        # timing, so the GUI sends durations=None and fps from that frame.
+        durations = None if deferred else self.durations
+        fps = 1000.0 / self.durations[0] if deferred else 25.0
         with open(job, "w", encoding="utf-8") as f:
             json.dump(dict(source_path=self.src, kind="gif", output_path=out,
-                           as_mp4=False, params=self.params, fps=25.0,
-                           total_frames=len(self.durations), durations=self.durations,
+                           as_mp4=False, params=self.params, fps=fps,
+                           total_frames=len(self.durations), durations=durations,
                            gif_colors=None), f)
         cc._export_worker_main(job)
         return out
 
     def test_frame_timing_matches_source(self):
         out = self._export()
+        with Image.open(out) as im:
+            got = [f.info["duration"] for f in ImageSequence.Iterator(im)]
+        self.assertEqual(got, self.durations)
+
+    def test_deferred_source_keeps_per_frame_timing(self):
+        out = self._export(deferred=True)
         with Image.open(out) as im:
             got = [f.info["duration"] for f in ImageSequence.Iterator(im)]
         self.assertEqual(got, self.durations)
