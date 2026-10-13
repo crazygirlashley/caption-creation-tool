@@ -1082,7 +1082,7 @@ def _write_gif(path: str, frames, samples: list, durations,
     method = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
 
     def _quantized():
-        prev = None
+        prev = prev_out = None
         for f in frames:
             rgb = f.convert("RGB")
             q = rgb.quantize(palette=palette, dither=method)
@@ -1093,9 +1093,26 @@ def _write_gif(path: str, frames, samples: list, durations,
             if prev is None:
                 out_idx = idx
             else:
-                out_idx = idx.copy()
-                out_idx[idx == prev] = transparent
+                # Pillow crops each frame to where it differs from the
+                # previously *written* frame, so unchanged pixels are only
+                # made transparent inside this frame's changed bounding box.
+                # Outside it they keep their real (unchanged) value; marking
+                # them transparent everywhere made Pillow see the whole
+                # canvas as changed on the second frame, panel included.
+                changed = idx != prev
+                ys = np.flatnonzero(changed.any(axis=1))
+                if ys.size == 0:
+                    # Identical frame: repeat the last written one exactly so
+                    # Pillow merges it into the previous frame's duration.
+                    out_idx = prev_out
+                else:
+                    xs = np.flatnonzero(changed.any(axis=0))
+                    box = (slice(ys[0], ys[-1] + 1), slice(xs[0], xs[-1] + 1))
+                    out_idx = idx.copy()
+                    region = out_idx[box]
+                    region[~changed[box]] = transparent
             prev = idx
+            prev_out = out_idx
             out = Image.fromarray(out_idx, "P")
             out.putpalette(pal_bytes)
             yield out

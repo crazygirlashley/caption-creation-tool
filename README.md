@@ -227,14 +227,16 @@ See `themes/Dark.json` and `themes/Bubblegum.json` for examples. A file missing 
 The Quick install downloads a prebuilt release rather than running from source,
 so publishing one requires a local build first:
 
-1. Bump the `VERSION` file (e.g. `0.2.0`) and commit it.
-2. `pip install pyinstaller`
-3. `pyinstaller packaging/build.spec` — produces `dist/CaptionCreator/`
+1. Run the tests: `python -m unittest discover tests` (standard library only,
+   no extra installs; uses synthetic images, so no source files needed).
+2. Bump the `VERSION` file (e.g. `0.2.0`) and commit it.
+3. `pip install pyinstaller`
+4. `pyinstaller packaging/build.spec` — produces `dist/CaptionCreator/`
    containing `CaptionCreator.exe`, `CaptionCreatorLauncher.exe`, a shared
    `_internal/` dependency folder, and `version.txt`.
-4. Zip the *contents* of `dist/CaptionCreator/` (not the folder itself) as
+5. Zip the *contents* of `dist/CaptionCreator/` (not the folder itself) as
    `CaptionCreator-win64.zip`.
-5. Create a GitHub Release tagged `v<VERSION>` (e.g. `v0.2.0` — the launcher
+6. Create a GitHub Release tagged `v<VERSION>` (e.g. `v0.2.0` — the launcher
    strips a leading `v` when comparing) and attach that zip as a release
    asset. `install.bat` and `CaptionCreatorLauncher.exe` both fetch it from
    `.../releases/latest/download/CaptionCreator-win64.zip`, a stable URL
@@ -283,6 +285,7 @@ caption-creation-tool/
 ├── install.bat               # Windows installer — downloads the latest built release
 ├── requirements.txt          # Python dependencies (source/dev use)
 ├── run.bat                   # Windows launcher (source/dev use)
+├── tests/                    # Rendering/export regression tests (unittest)
 ├── watermark/                # Drop a single watermark image here (gitignored)
 └── .gitignore
 ```
