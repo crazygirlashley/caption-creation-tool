@@ -1476,6 +1476,7 @@ class CaptionApp:
         ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Find Online…", command=self._web_lookup).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
+        self._bind_shortcuts()
         # Only shown for animated sources (GIF/MP4) — hidden for static images.
         self._single_frame_check = ttk.Checkbutton(
             bar, text="Single-Frame Preview", variable=self._single_frame_var,
@@ -2117,6 +2118,18 @@ class CaptionApp:
         else:
             return
         self._safe_refresh()
+
+    def _bind_shortcuts(self) -> None:
+        """Ctrl+O opens a file and Ctrl+S saves the output, from anywhere in
+        the window. Tk's Text widget has its own Ctrl+O (insert a newline),
+        so the shortcut is also bound on the Text class and stops there —
+        otherwise pressing it in the caption box would add a stray line
+        break before opening the file dialog."""
+        for keys, action in ((("<Control-o>", "<Control-O>"), self._open),
+                             (("<Control-s>", "<Control-S>"), self._save)):
+            for key in keys:
+                self.root.bind_all(key, lambda _e, a=action: a())
+                self.root.bind_class("Text", key, lambda _e, a=action: (a(), "break")[1])
 
     def _on_dynamic_width_toggle(self) -> None:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
