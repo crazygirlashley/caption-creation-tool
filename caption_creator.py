@@ -2992,7 +2992,11 @@ class CaptionApp:
                     os.unlink(path)
                 except OSError:
                     pass
-                messagebox.showerror("Render Error", "Failed to render/export all frames for saving.")
+                messagebox.showerror(
+                    "Render Error",
+                    "The export didn't finish — either it failed or its console "
+                    "window was closed before it was done.\n\nIf it failed, the "
+                    "details are in caption_creator_crash.log.")
 
             self._run_export_in_console(path, path.lower().endswith(".mp4"),
                                          params, gif_colors, _on_success, _on_error)
@@ -4087,8 +4091,31 @@ def main() -> None:
     root.mainloop()
 
 
+def _run_export_worker(job_path: str) -> None:
+    """Run _export_worker_main, recording the outcome in the crash log. The
+    worker's console closes as soon as the process exits, so on failure the
+    traceback is logged and the window held open until Enter is pressed —
+    otherwise the GUI could only report that *something* went wrong."""
+    t0 = time.perf_counter()
+    try:
+        _export_worker_main(job_path)
+    except KeyboardInterrupt:
+        log.info("EXPORT_CANCELLED  (console interrupted)")
+        sys.exit(1)
+    except Exception:
+        log.exception("EXPORT_WORKER_ERROR")
+        traceback.print_exc()
+        try:
+            input("\nExport failed — details were saved to caption_creator_crash.log."
+                  "\nPress Enter to close this window.")
+        except (EOFError, OSError):
+            pass
+        sys.exit(1)
+    log.info("EXPORT_DONE  elapsed=%.1fs", time.perf_counter() - t0)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--export-worker":
-        _export_worker_main(sys.argv[2])
+        _run_export_worker(sys.argv[2])
     else:
         main()
