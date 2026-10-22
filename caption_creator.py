@@ -308,13 +308,17 @@ _MIN_OUTPUT_H = 720
 _MAX_AUTO_FONT_SIZE = 200
 
 # Auto watermark height (footer off, Auto checked): this fraction of the
-# image's shorter side, so the watermark keeps the same proportions on a
+# total canvas height, so the watermark keeps the same proportions on a
 # 242px GIF as on a 2000px photo instead of a fixed pixel height.
-_WM_AUTO_FRAC = 0.15
+_WM_AUTO_FRAC = 1 / 6
 
 
-def _auto_watermark_height(frame_size: tuple) -> int:
-    return max(1, round(min(frame_size) * _WM_AUTO_FRAC))
+def _auto_watermark_height(frame_size: tuple, cap_width: int = 0,
+                           layout: str = "horizontal") -> int:
+    """1/6 of the composite's height: the image's height for side-by-side
+    layouts, image plus the caption panel below it for vertical ones."""
+    _total_w, total_h = _panel_total_size(frame_size[0], frame_size[1], cap_width, layout)
+    return max(1, round(total_h * _WM_AUTO_FRAC))
 
 # Raw RGBA frame-data threshold above which we warn before loading a GIF/video.
 # The app holds source frames AND a separately-rendered cache simultaneously
@@ -3982,7 +3986,8 @@ class CaptionApp:
             if footer_enabled:
                 wm_h = int(footer_sz * 2.0)
             elif self._wm_auto_var.get() and self._frames:
-                wm_h = _auto_watermark_height(self._frames[0].size)
+                wm_h = _auto_watermark_height(self._frames[0].size, width,
+                                              fmt_data.get("layout", "horizontal"))
                 if self._watermark_height_var.get() != wm_h:
                     self._updating_wm_display = True
                     try:
