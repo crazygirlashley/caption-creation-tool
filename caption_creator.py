@@ -2175,12 +2175,220 @@ class CaptionApp:
             result[0] = new
             dlg.destroy()
 
+        def _auto_setup() -> None:
+            dlg.grab_release()
+            new = self._ai_setup_dialog()
+            if not dlg.winfo_exists():
+                return
+            if new:
+                result[0] = new
+                dlg.destroy()
+            else:
+                dlg.grab_set()
+
         btns = ttk.Frame(body)
-        btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        btns.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Button(btns, text="Install a model for me…", command=_auto_setup).pack(side="left")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
         ttk.Button(btns, text="Save", command=_save).pack(side="right", padx=(0, 6))
 
         _refresh_models()
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result[0]
+
+    def _ai_setup_dialog(self) -> Optional[dict]:
+        """Offer to install Ollama and download a model. Nothing is
+        downloaded until the user picks a model and presses Install.
+        Returns the new settings on success, else None."""
+        ram = ai_writer.total_ram_gb()
+        home = os.path.expanduser("~")
+        free = ai_writer.free_gb(home)
+        needs_install = ai_writer.find_ollama_exe() is None and not ai_writer.ollama_running()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Set up the AI writer")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+
+        intro = ("No local AI model was found. Caption Creator can set one up for you:\n\n"
+                 + ("  1. Download and install Ollama (free, open-source; ~1.7 GB download)\n"
+                    "  2. Download the writing model you pick below\n\n"
+                    if needs_install else
+                    "  • Ollama is already installed — just download the model you pick below\n\n")
+                 + "Everything runs on this PC; your prompts and stories never leave it. "
+                   "These models are uncensored, so they will write explicit content.")
+        ttk.Label(body, text=intro, wraplength=440, justify="left").pack(anchor="w")
+
+        ttk.Label(body, text="Model:").pack(anchor="w", pady=(12, 2))
+        labels = {f"{label}  ({gb:g} GB)": tag for tag, label, gb, _need in ai_writer.SETUP_MODELS}
+        rec = ai_writer.recommended_model(ram)
+        choice = tk.StringVar(value=next(k for k, v in labels.items() if v == rec))
+        ttk.Combobox(body, textvariable=choice, state="readonly", width=62,
+                     values=list(labels)).pack(anchor="w")
+        fit_label = ttk.Label(body, text="", wraplength=440, justify="left")
+        fit_label.pack(anchor="w", pady=(6, 0))
+
+        def _check_fit(*_a) -> bool:
+            tag = labels[choice.get()]
+            _t, _l, gb, need = next(m for m in ai_writer.SETUP_MODELS if m[0] == tag)
+            want = gb + (ai_writer.OLLAMA_INSTALL_GB if needs_install else 0) + 1
+            notes, ok = [], True
+            if free < want:
+                ok = False
+                notes.append(f"⚠ Needs about {want:.0f} GB free disk space; this PC has "
+                             f"{free:.1f} GB. Free up space or pick a smaller model.")
+            if ram and ram < need:
+                notes.append(f"⚠ This PC has {ram:.0f} GB of RAM; this model wants {need} GB "
+                             "and will be very slow or may not load.")
+            if not notes:
+                notes.append(f"✓ Fits this PC ({ram:.0f} GB RAM, {free:.0f} GB free disk). "
+                             "Without a graphics card, a story takes about a minute to write.")
+            fit_label.config(text="\n".join(notes), foreground="#888" if ok else "#c0392b")
+            return ok
+        choice.trace_add("write", _check_fit)
+        _check_fit()
+
+        bar = ttk.Progressbar(body, mode="determinate", maximum=1.0, length=440)
+        status = ttk.Label(body, text="", foreground="#888", wraplength=440)
+        btns = ttk.Frame(body)
+        btns.pack(anchor="e", pady=(14, 0), side="bottom")
+        cancel_btn = ttk.Button(btns, text="Cancel")
+        install_btn = ttk.Button(btns, text="Install for me")
+        cancel_btn.pack(side="right")
+        install_btn.pack(side="right", padx=(0, 6))
+
+        result: list = [None]
+        state = {"cancel": None}
+
+        def _progress(text: str, frac: Optional[float]) -> None:
+            def _ui() -> None:
+                if not dlg.winfo_exists():
+                    return
+                status.config(text=text)
+                if frac is None:
+                    if str(bar.cget("mode")) != "indeterminate":
+                        bar.config(mode="indeterminate")
+                        bar.start(15)
+                else:
+                    if str(bar.cget("mode")) != "determinate":
+                        bar.stop()
+                        bar.config(mode="determinate")
+                    bar["value"] = frac
+            self.root.after(0, _ui)
+
+        def _install() -> None:
+            if not _check_fit() and not messagebox.askyesno(
+                    "Set up the AI writer", "There may not be enough disk space. Try anyway?",
+                    parent=dlg):
+                return
+            tag = labels[choice.get()]
+            install_btn.config(state="disabled")
+            bar.pack(anchor="w", pady=(12, 0))
+            status.pack(anchor="w", pady=(4, 0))
+            cancel = threading.Event()
+            state["cancel"] = cancel
+            log.info("AI_SETUP_START  model=%s install_ollama=%s", tag, needs_install)
+
+            def _work() -> None:
+                err, settings = None, None
+                try:
+                    settings = ai_writer.setup_ollama(tag, _progress, cancel)
+                except ai_writer.SetupCancelled:
+                    err = "cancelled"
+                except ai_writer.AIWriterError as e:
+                    err = str(e)
+                except Exception as e:
+                    log.exception("AI_SETUP_ERROR")
+                    err = f"Setup failed: {e}"
+                self.root.after(0, lambda: _done(settings, err))
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _done(settings: Optional[dict], err: Optional[str]) -> None:
+            state["cancel"] = None
+            log.info("AI_SETUP_DONE  ok=%s error=%s", bool(settings), err)
+            if not dlg.winfo_exists():
+                return
+            bar.stop()
+            if settings:
+                result[0] = settings
+                dlg.destroy()
+                return
+            install_btn.config(state="normal")
+            if err == "cancelled":
+                status.config(text="Cancelled. Press Install to resume — finished parts "
+                                   "aren't downloaded again.")
+            else:
+                status.config(text="")
+                messagebox.showerror("Set up the AI writer", err, parent=dlg)
+
+        def _cancel() -> None:
+            if state["cancel"] is not None:
+                state["cancel"].set()
+                status.config(text="Cancelling…")
+            else:
+                dlg.destroy()
+
+        install_btn.config(command=_install)
+        cancel_btn.config(command=_cancel)
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result[0]
+
+    def _ensure_ai_ready(self) -> Optional[dict]:
+        """Settings for a reachable model, offering the automatic setup
+        (or the manual settings dialog) when there isn't one yet."""
+        settings = ai_writer.load_settings()
+        if settings["model"]:
+            try:
+                ai_writer.list_models(settings["base_url"], settings["api_key"], timeout=3)
+                return settings
+            except ai_writer.AIWriterError:
+                # Ollama installed by us but not running (e.g. after a
+                # reboot) — start it quietly instead of asking again.
+                exe = ai_writer.find_ollama_exe()
+                if exe and settings["base_url"] == ai_writer.PRESETS["Ollama"]:
+                    try:
+                        ai_writer.start_ollama(exe, wait=20)
+                        return settings
+                    except ai_writer.AIWriterError:
+                        pass
+        choice = self._ask_ai_setup_choice()
+        if choice == "auto":
+            return self._ai_setup_dialog()
+        if choice == "manual":
+            new = self._ai_settings_dialog()
+            return new if new and new["model"] else None
+        return None
+
+    def _ask_ai_setup_choice(self) -> str:
+        """'auto' | 'manual' | 'cancel'."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Write with AI")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, wraplength=400, justify="left",
+                  text="The AI writer needs a local AI model, and none is running yet.\n\n"
+                       "Install one for you now? (Already have Ollama, LM Studio or "
+                       "KoboldCpp? Choose \"Use my own\" to connect to it.)").pack(anchor="w")
+        result = ["cancel"]
+
+        def _pick(v: str) -> None:
+            result[0] = v
+            dlg.destroy()
+        btns = ttk.Frame(body)
+        btns.pack(anchor="e", pady=(14, 0))
+        ttk.Button(btns, text="Cancel", command=lambda: _pick("cancel")).pack(side="right")
+        ttk.Button(btns, text="Use my own…", command=lambda: _pick("manual")).pack(
+            side="right", padx=(0, 6))
+        ttk.Button(btns, text="Install for me", command=lambda: _pick("auto")).pack(
+            side="right", padx=(0, 6))
         dlg.grab_set()
         self.root.wait_window(dlg)
         return result[0]
@@ -2192,11 +2400,9 @@ class CaptionApp:
         if getattr(self, "_ai_win", None) is not None and self._ai_win.winfo_exists():
             self._ai_win.lift()
             return
-        settings = ai_writer.load_settings()
-        if not settings["model"]:
-            settings = self._ai_settings_dialog()
-            if not settings or not settings["model"]:
-                return
+        settings = self._ensure_ai_ready()
+        if not settings:
+            return
 
         win = tk.Toplevel(self.root)
         self._ai_win = win

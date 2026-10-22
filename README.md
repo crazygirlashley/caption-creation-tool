@@ -141,18 +141,30 @@ ending on her line: …"*. Pick a length (~60 to ~350 words), and whether it
 replaces the caption or is added to the end; edit the result freely, or
 **Write** again for another take (Ctrl+Enter in the prompt box also writes).
 
-It runs on **your own computer** with whatever open-source model you choose,
-so you control what it will write (adult content included) and nothing is
-sent to a hosted AI service:
+It runs on **your own computer** with an open-source model, so it will write
+explicit adult content and nothing is sent to a hosted AI service.
 
-1. Install a local LLM app with an OpenAI-compatible server —
-   [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai),
-   KoboldCpp, llama.cpp's `llama-server`, or text-generation-webui.
-2. Download a creative-writing model in it and start its server
-   (Ollama runs one automatically; in LM Studio, start the Local Server).
-3. In Caption Creator: **⚙ Settings → AI Writer Settings…**, choose your app
-   from the **Server** list (or type a custom address), press **Refresh**,
-   pick the model, and **Save**.
+**Automatic setup:** the first time you press **Write with AI…** with no local
+model running, it offers to **Install for me**: it downloads the official
+[Ollama](https://ollama.com) installer from Ollama's GitHub release, verifies
+it against the SHA-256 checksum published there (and rejects an invalid
+signature) before running it, installs it per-user (no admin), starts it,
+and downloads the uncensored writing model you pick — sized to your PC:
+
+| Model | Download | RAM | Notes |
+|---|---|---|---|
+| Hermes 3 3B (`hermes3:3b`) | ~2 GB | 6 GB+ | Fast; plainer prose. Default on 8 GB PCs |
+| Hermes 3 8B (`hermes3:8b`) | ~4.7 GB | 10 GB+ | Best writing for most PCs |
+| Dolphin Mistral 7B (`dolphin-mistral`) | ~4.1 GB | 10 GB+ | Uncensored, different voice |
+| Mistral Small 24B abliterated | ~14 GB | 24 GB+ | Richest prose; needs a strong PC |
+
+The dialog checks free disk space and RAM first and warns if a model won't
+fit. Without a dedicated graphics card, expect about a minute per story.
+
+**Use your own instead:** already running Ollama, LM Studio, KoboldCpp,
+llama.cpp's `llama-server`, or text-generation-webui? Choose **Use my own…**
+(or **⚙ Settings → AI Writer Settings…**), pick your app from the **Server**
+list (or type a custom address), press **Refresh**, pick the model, **Save**.
 
 Settings live in `ai_settings.json` (gitignored, never part of an update).
 Reasoning models' `<think>` sections are stripped automatically.

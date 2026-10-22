@@ -9,8 +9,12 @@ CaptionApp dialog and the tests share it.
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 import threading
-from typing import Iterator, Optional
+import time
+from typing import Callable, Iterator, Optional
 
 import requests
 
@@ -211,3 +215,279 @@ def stream_story(prompt: str, words: int, settings: dict,
             tail = tail.lstrip()
         if tail:
             yield tail
+
+
+# ---------------------------------------------------------------------------
+# One-click local setup (Ollama)
+#
+# For users with no local LLM yet: download the official Ollama installer,
+# verify its Authenticode signature, install it per-user, start its server,
+# and pull a model — all after the user agrees in the setup dialog in
+# caption_creator.py.
+# ---------------------------------------------------------------------------
+
+OLLAMA_URL = "http://localhost:11434"
+# The installer comes from Ollama's official GitHub release, whose API
+# publishes a SHA-256 for every asset — the download must match it exactly.
+OLLAMA_RELEASE_API = "https://api.github.com/repos/ollama/ollama/releases/latest"
+OLLAMA_INSTALLER_ASSET = "OllamaSetup.exe"
+OLLAMA_INSTALL_GB = 5.0  # installer download plus the installed runtime, roughly
+
+# Models offered by the setup dialog — uncensored / lightly aligned models
+# that will write explicit fiction. (tag, label, download GB, RAM GB needed)
+SETUP_MODELS = [
+    ("hermes3:3b", "Hermes 3 3B — light & fast, plainer prose", 2.0, 6),
+    ("hermes3:8b", "Hermes 3 8B — best writing for most PCs", 4.7, 10),
+    ("dolphin-mistral", "Dolphin Mistral 7B — uncensored, alternative voice", 4.1, 10),
+    ("huihui_ai/mistral-small-abliterated:24b",
+     "Mistral Small 24B abliterated — richest prose, needs a strong PC", 14.0, 24),
+]
+
+ProgressFn = Callable[[str, Optional[float]], None]  # (status text, fraction 0-1 or None)
+
+
+class SetupCancelled(Exception):
+    pass
+
+
+def total_ram_gb() -> float:
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        stat = _MemStatus()
+        stat.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullTotalPhys / 1e9
+    return 0.0
+
+
+def recommended_model(ram_gb: float) -> str:
+    """Largest offered model this much RAM runs comfortably."""
+    fitting = [tag for tag, _label, _gb, need in SETUP_MODELS if ram_gb >= need]
+    return fitting[-1] if fitting else SETUP_MODELS[0][0]
+
+
+def find_ollama_exe() -> Optional[str]:
+    """Path to ollama.exe if installed (default per-user location or PATH)."""
+    candidates = [os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama",
+                               "ollama.exe")]
+    on_path = shutil.which("ollama")
+    if on_path:
+        candidates.insert(0, on_path)
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
+def ollama_running(base: str = OLLAMA_URL, timeout: float = 2.0) -> bool:
+    try:
+        return requests.get(base + "/api/version", timeout=timeout).status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def ollama_models(base: str = OLLAMA_URL) -> list:
+    try:
+        resp = requests.get(base + "/api/tags", timeout=5)
+        resp.raise_for_status()
+        return [m["name"] for m in resp.json().get("models", [])]
+    except (requests.RequestException, ValueError, KeyError):
+        return []
+
+
+def free_gb(path: str) -> float:
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except OSError:
+        return float("inf")
+
+
+def download_file(url: str, dest: str, progress: ProgressFn,
+                  cancel: Optional[threading.Event] = None,
+                  label: str = "Downloading") -> None:
+    with requests.get(url, stream=True, timeout=(15, 120)) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if cancel is not None and cancel.is_set():
+                    raise SetupCancelled
+                f.write(chunk)
+                done += len(chunk)
+                text = f"{label}… {done / 1e6:.0f} MB"
+                if total:
+                    text += f" of {total / 1e6:.0f} MB"
+                progress(text, done / total if total else None)
+
+
+def latest_ollama_installer() -> tuple:
+    """(download url, sha256 hex, version tag) of the newest official
+    Windows installer."""
+    try:
+        resp = requests.get(OLLAMA_RELEASE_API, timeout=20,
+                            headers={"Accept": "application/vnd.github+json"})
+        resp.raise_for_status()
+        release = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        raise AIWriterError(f"Couldn't look up the latest Ollama release: {e}") from None
+    for asset in release.get("assets", []):
+        if asset.get("name") == OLLAMA_INSTALLER_ASSET:
+            digest = asset.get("digest") or ""
+            if not digest.startswith("sha256:"):
+                raise AIWriterError("Ollama's release doesn't publish a checksum for its "
+                                    "installer, so it can't be verified. Install Ollama "
+                                    "yourself from https://ollama.com instead.")
+            return asset["browser_download_url"], digest[7:].lower(), release.get("tag_name", "")
+    raise AIWriterError("Couldn't find the Windows installer in Ollama's latest release.")
+
+
+def verify_sha256(path: str, expected: str) -> None:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    if h.hexdigest().lower() != expected.lower():
+        raise AIWriterError("The downloaded Ollama installer doesn't match the checksum "
+                            "Ollama published, so it was not run (the download may be "
+                            "corrupt or tampered with). Try again, or install Ollama "
+                            "yourself from https://ollama.com.")
+
+
+def signature_status(path: str) -> tuple:
+    """(Authenticode status, signer subject) via PowerShell."""
+    # The path goes in through an environment variable: -Command doesn't
+    # populate $args, and splicing it into the script text would need
+    # quoting that a crafted file name could break out of.
+    ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:CC_SIGNED_FILE; "
+          "\"$($s.Status)|$($s.SignerCertificate.Subject)\"")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                         capture_output=True, text=True, timeout=60,
+                         env=dict(os.environ, CC_SIGNED_FILE=path),
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    status, _, subject = out.stdout.strip().partition("|")
+    return status, subject
+
+
+def verify_signature(path: str, expected_signer: Optional[str] = None,
+                     allow_unsigned: bool = False) -> str:
+    """Refuse a file whose Windows code signature is invalid or tampered
+    with — or, if expected_signer is given, signed by someone else.
+    Returns the signer subject ("" if unsigned and allowed)."""
+    if sys.platform != "win32":
+        raise AIWriterError("Automatic install is only supported on Windows.")
+    status, subject = signature_status(path)
+    if status == "NotSigned" and allow_unsigned:
+        return ""
+    if status != "Valid" or (expected_signer and expected_signer.lower() not in subject.lower()):
+        raise AIWriterError(
+            "The downloaded Ollama installer failed its signature check "
+            f"(status: {status or 'unknown'}, signer: {subject or 'none'}), so it was not run. "
+            "You can install Ollama yourself from https://ollama.com instead.")
+    return subject
+
+
+def run_installer(path: str) -> None:
+    """Run the Ollama installer silently (it installs per-user, no admin)."""
+    proc = subprocess.run([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
+    if proc.returncode != 0:
+        raise AIWriterError(f"The Ollama installer exited with code {proc.returncode}.")
+
+
+def start_ollama(exe: str, base: str = OLLAMA_URL, wait: float = 60.0) -> None:
+    """Start `ollama serve` in the background (if not already up) and wait
+    for it to answer."""
+    if ollama_running(base):
+        return
+    subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if ollama_running(base):
+            return
+        time.sleep(1)
+    raise AIWriterError("Ollama is installed but its server did not start. "
+                        "Launch Ollama from the Start menu, then press Refresh.")
+
+
+def pull_model(name: str, progress: ProgressFn, cancel: Optional[threading.Event] = None,
+               base: str = OLLAMA_URL) -> None:
+    """Download a model through Ollama's /api/pull, reporting progress.
+    Cancelling stops this download; Ollama resumes it on the next pull."""
+    try:
+        resp = requests.post(base + "/api/pull", json={"model": name, "stream": True},
+                             stream=True, timeout=(15, 600))
+    except requests.RequestException as e:
+        raise AIWriterError(f"Couldn't ask Ollama to download {name}: {e}") from None
+    with resp:
+        if resp.status_code != 200:
+            raise AIWriterError(f"Ollama couldn't download {name}: {resp.text[:300]}")
+        for raw in resp.iter_lines():
+            if cancel is not None and cancel.is_set():
+                raise SetupCancelled
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if "error" in event:
+                raise AIWriterError(f"Ollama couldn't download {name}: {event['error']}")
+            total, done = event.get("total"), event.get("completed")
+            status = event.get("status", "")
+            if total and done is not None:
+                progress(f"Downloading {name}… {done / 1e9:.1f} of {total / 1e9:.1f} GB",
+                         done / total)
+            elif status:
+                progress(f"{name}: {status}", None)
+            if status == "success":
+                return
+    raise AIWriterError(f"The download of {name} ended before it finished. Try again.")
+
+
+def setup_ollama(model: str, progress: ProgressFn,
+                 cancel: Optional[threading.Event] = None) -> dict:
+    """Install Ollama if needed, start it, pull `model`, then save and
+    return AI writer settings pointing at it."""
+    if not ollama_running():
+        exe = find_ollama_exe()
+        if exe is None:
+            import tempfile
+            tmp_dir = tempfile.mkdtemp(prefix="cc_ollama_")
+            installer = os.path.join(tmp_dir, "OllamaSetup.exe")
+            try:
+                url, sha256, version = latest_ollama_installer()
+                download_file(url, installer, progress, cancel,
+                              label=f"Downloading Ollama {version}")
+                progress("Verifying the installer…", None)
+                verify_sha256(installer, sha256)
+                # The checksum is the authority on authenticity; the
+                # signature check additionally rejects a broken/tampered
+                # signature. Ollama's signing name isn't documented, so
+                # any valid publisher (or none) is accepted here.
+                verify_signature(installer, allow_unsigned=True)
+                progress("Installing Ollama (this takes a minute)…", None)
+                run_installer(installer)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            exe = find_ollama_exe()
+            if exe is None:
+                raise AIWriterError("Ollama's installer finished, but ollama.exe was not found.")
+        if not ollama_running():
+            progress("Starting Ollama…", None)
+            start_ollama(exe)
+    installed = ollama_models()
+    if model not in installed and f"{model}:latest" not in installed:
+        pull_model(model, progress, cancel)
+    settings = dict(load_settings(), base_url=PRESETS["Ollama"], model=model, api_key="")
+    save_settings(settings)
+    progress("Ready.", 1.0)
+    return settings

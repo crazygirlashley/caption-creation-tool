@@ -107,6 +107,140 @@ class AIWriterTests(unittest.TestCase):
         self.assertEqual(list(ai_writer.stream_story("p", 60, self.settings(), cancel)), [])
 
 
+class _OllamaHandler(BaseHTTPRequestHandler):
+    """Just enough of Ollama's native API for the setup flow."""
+    models: list = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/api/version":
+            self._json({"version": "0.0-test"})
+        elif self.path == "/api/tags":
+            self._json({"models": [{"name": m} for m in _OllamaHandler.models]})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        if body["model"] == "nope":
+            self.wfile.write(b'{"error":"pull model manifest: file does not exist"}\n')
+            return
+        for line in ({"status": "pulling manifest"},
+                     {"status": "pulling abc", "total": 1000, "completed": 250},
+                     {"status": "pulling abc", "total": 1000, "completed": 1000},
+                     {"status": "success"}):
+            self.wfile.write((json.dumps(line) + "\n").encode())
+            self.wfile.flush()
+        _OllamaHandler.models.append(body["model"])
+
+    def _json(self, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class OllamaSetupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _OllamaHandler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def test_pull_reports_progress_and_finishes(self):
+        seen = []
+        ai_writer.pull_model("hermes3:3b", lambda t, f: seen.append(f), base=self.base)
+        self.assertIn(0.25, seen)
+        self.assertIn(1.0, seen)
+
+    def test_pull_error_is_readable(self):
+        with self.assertRaises(ai_writer.AIWriterError) as ctx:
+            ai_writer.pull_model("nope", lambda t, f: None, base=self.base)
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_recommended_model_follows_ram(self):
+        self.assertEqual(ai_writer.recommended_model(8), "hermes3:3b")
+        self.assertEqual(ai_writer.recommended_model(16), "dolphin-mistral")
+        self.assertEqual(ai_writer.recommended_model(64),
+                         "huihui_ai/mistral-small-abliterated:24b")
+
+    def test_checksum_mismatch_is_rejected(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "OllamaSetup.exe")
+            with open(path, "wb") as f:
+                f.write(b"installer bytes")
+            good = hashlib.sha256(b"installer bytes").hexdigest()
+            ai_writer.verify_sha256(path, good.upper())
+            with self.assertRaises(ai_writer.AIWriterError):
+                ai_writer.verify_sha256(path, "0" * 64)
+
+    @unittest.skipUnless(sys.platform == "win32", "Authenticode is Windows-only")
+    def test_signature_check_rejects_unsigned_installer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "OllamaSetup.exe")
+            with open(fake, "wb") as f:
+                f.write(b"MZ" + b"\0" * 1024)
+            with self.assertRaises(ai_writer.AIWriterError):
+                ai_writer.verify_signature(fake)
+
+    @unittest.skipUnless(sys.platform == "win32", "Authenticode is Windows-only")
+    def test_signature_check_accepts_validly_signed_file(self):
+        signed = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell",
+                              "v1.0", "powershell.exe")
+        self.assertIn("Microsoft", ai_writer.verify_signature(signed))
+        with self.assertRaises(ai_writer.AIWriterError):
+            ai_writer.verify_signature(signed, expected_signer="Ollama")
+
+    def test_setup_flow_installs_starts_and_pulls(self):
+        """Fresh PC: download → verify → install → start → pull → save."""
+        calls = []
+        state = {"installed": False, "running": False}
+        saved = {}
+        patches = {
+            "find_ollama_exe": lambda: "C:/fake/ollama.exe" if state["installed"] else None,
+            "ollama_running": lambda base=None, timeout=2.0: state["running"],
+            "latest_ollama_installer": lambda: ("https://x/OllamaSetup.exe", "ab" * 32, "v1"),
+            "download_file": lambda url, dest, p, c=None, label="": calls.append("download"),
+            "verify_sha256": lambda path, expected: calls.append("checksum"),
+            "verify_signature": lambda path, **kw: calls.append("signature"),
+            "run_installer": lambda path: (calls.append("install"),
+                                           state.update(installed=True)),
+            "start_ollama": lambda exe, base=None, wait=60: (calls.append("start"),
+                                                             state.update(running=True)),
+            "ollama_models": lambda base=None: [],
+            "pull_model": lambda name, p, c=None, base=None: calls.append(f"pull {name}"),
+            "save_settings": lambda s: saved.update(s),
+            "load_settings": lambda: dict(ai_writer.DEFAULTS),
+        }
+        originals = {k: getattr(ai_writer, k) for k in patches}
+        try:
+            for k, v in patches.items():
+                setattr(ai_writer, k, v)
+            settings = ai_writer.setup_ollama("hermes3:3b", lambda t, f: None)
+        finally:
+            for k, v in originals.items():
+                setattr(ai_writer, k, v)
+        self.assertEqual(calls, ["download", "checksum", "signature", "install", "start",
+                                 "pull hermes3:3b"])
+        self.assertEqual(settings["model"], "hermes3:3b")
+        self.assertEqual(saved["base_url"], ai_writer.PRESETS["Ollama"])
+
+
 class ThinkFilterTests(unittest.TestCase):
     def test_tag_split_at_every_position(self):
         text = "a<think>hidden</think>b<think>x</think>c"
