@@ -26,6 +26,7 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
+import ai_writer
 import da_client
 import themes
 import web_lookup
@@ -1729,11 +1730,13 @@ class CaptionApp:
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         self._text_box.insert("1.0", "Your caption here")
         self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
+        self._ai_btn = ttk.Button(f, text="✍ Write with AI…", command=self._open_ai_writer)
+        self._ai_btn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self._chat_frame = ttk.Frame(f)
         self._chat_frame.grid(row=r, column=0, columnspan=2, sticky="nsew", pady=(2, 8))
         self._build_chat_frame(self._chat_frame)
         self._chat_frame.grid_remove()
-        r += 1
+        r += 2  # caption box + the Write with AI button below it
 
         ttk.Label(f, text="Page BG Color:").grid(row=r, column=0, sticky="w", pady=4)
         bg_row = ttk.Frame(f)
@@ -2044,6 +2047,7 @@ class CaptionApp:
     def _open_settings_menu(self) -> None:
         menu = tk.Menu(self.root, tearoff=False)
         menu.add_command(label="DA Settings…", command=self._da_settings)
+        menu.add_command(label="AI Writer Settings…", command=self._ai_settings_dialog)
         menu.add_separator()
         theme_menu = tk.Menu(menu, tearoff=False)
         # Rescan themes/ on every open (cheap — a handful of small JSON
@@ -2063,6 +2067,261 @@ class CaptionApp:
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    # ------------------------------------------------------------------
+    # AI writer — caption stories from a prompt, via a local LLM
+    # (see ai_writer.py)
+    # ------------------------------------------------------------------
+
+    def _ai_settings_dialog(self) -> Optional[dict]:
+        """Server address / model picker. Returns the saved settings, or
+        None if cancelled."""
+        settings = ai_writer.load_settings()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("AI Writer Settings")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Runs on your own computer through any app with an "
+                             "OpenAI-compatible server (Ollama, LM Studio, KoboldCpp, "
+                             "llama.cpp, text-generation-webui). Start it and load a "
+                             "model first.", wraplength=380, foreground="#888").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(body, text="Server:").grid(row=1, column=0, sticky="w", pady=4)
+        preset_var = tk.StringVar(value=next(
+            (k for k, v in ai_writer.PRESETS.items() if v == settings["base_url"]), "Custom"))
+        url_var = tk.StringVar(value=settings["base_url"])
+        preset_box = ttk.Combobox(body, textvariable=preset_var, state="readonly", width=22,
+                                  values=list(ai_writer.PRESETS) + ["Custom"])
+        preset_box.grid(row=1, column=1, sticky="w", padx=6)
+
+        def _on_preset(_e=None) -> None:
+            if preset_var.get() in ai_writer.PRESETS:
+                url_var.set(ai_writer.PRESETS[preset_var.get()])
+        preset_box.bind("<<ComboboxSelected>>", _on_preset)
+
+        ttk.Label(body, text="Address:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=url_var, width=40).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=6)
+
+        ttk.Label(body, text="API key:").grid(row=3, column=0, sticky="w", pady=4)
+        key_var = tk.StringVar(value=settings["api_key"])
+        ttk.Entry(body, textvariable=key_var, width=40, show="•").grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=6)
+        ttk.Label(body, text="(only if your server requires one)", foreground="#888").grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(body, text="Model:").grid(row=5, column=0, sticky="w", pady=4)
+        model_var = tk.StringVar(value=settings["model"])
+        model_box = ttk.Combobox(body, textvariable=model_var, width=30)
+        model_box.grid(row=5, column=1, sticky="ew", padx=6)
+        status = ttk.Label(body, text="", foreground="#888", wraplength=380)
+        status.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def _refresh_models() -> None:
+            status.config(text="Asking the server for its models…")
+            url, key = url_var.get().strip(), key_var.get().strip()
+
+            def _work() -> None:
+                try:
+                    models, err = ai_writer.list_models(url, key), None
+                except ai_writer.AIWriterError as e:
+                    models, err = [], str(e)
+                self.root.after(0, lambda: _show(models, err))
+
+            def _show(models: list, err: Optional[str]) -> None:
+                if not dlg.winfo_exists():
+                    return
+                if err:
+                    status.config(text=err)
+                    return
+                model_box.config(values=models)
+                if models and model_var.get() not in models:
+                    model_var.set(models[0])
+                status.config(text=f"Connected — {len(models)} model(s) available."
+                              if models else "Connected, but the server lists no models. "
+                              "Load or download one in your LLM app.")
+            threading.Thread(target=_work, daemon=True).start()
+
+        ttk.Button(body, text="Refresh", command=_refresh_models).grid(row=5, column=2, padx=(0, 6))
+
+        ttk.Label(body, text="Creativity:").grid(row=6, column=0, sticky="w", pady=4)
+        temp_var = tk.DoubleVar(value=settings["temperature"])
+        temp_row = ttk.Frame(body)
+        temp_row.grid(row=6, column=1, columnspan=2, sticky="ew", padx=6)
+        temp_label = ttk.Label(temp_row, width=4)
+        ttk.Scale(temp_row, from_=0.2, to=1.5, variable=temp_var, orient="horizontal",
+                  command=lambda _v: temp_label.config(text=f"{temp_var.get():.2f}")
+                  ).pack(side="left", fill="x", expand=True)
+        temp_label.config(text=f"{temp_var.get():.2f}")
+        temp_label.pack(side="left", padx=(6, 0))
+
+        result: list = [None]
+
+        def _save() -> None:
+            new = dict(base_url=url_var.get().strip() or ai_writer.DEFAULTS["base_url"],
+                       model=model_var.get().strip(), api_key=key_var.get().strip(),
+                       temperature=round(float(temp_var.get()), 2))
+            try:
+                ai_writer.save_settings(new)
+            except OSError as e:
+                messagebox.showerror("AI Writer Settings", f"Couldn't save settings: {e}",
+                                     parent=dlg)
+                return
+            result[0] = new
+            dlg.destroy()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="Save", command=_save).pack(side="right", padx=(0, 6))
+
+        _refresh_models()
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result[0]
+
+    def _open_ai_writer(self) -> None:
+        """Prompt → story dialog. The story streams straight into the
+        caption box (replacing or appending), and the preview refreshes
+        once it's done."""
+        if getattr(self, "_ai_win", None) is not None and self._ai_win.winfo_exists():
+            self._ai_win.lift()
+            return
+        settings = ai_writer.load_settings()
+        if not settings["model"]:
+            settings = self._ai_settings_dialog()
+            if not settings or not settings["model"]:
+                return
+
+        win = tk.Toplevel(self.root)
+        self._ai_win = win
+        win.title("Write with AI")
+        win.transient(self.root)
+        win.minsize(420, 320)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(body, text="Describe the story — POV, who does what, how it ends, "
+                             "any lines to include:", wraplength=460).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        prompt_box = tk.Text(body, width=56, height=8, wrap="word", relief="solid",
+                             bd=1, padx=4, pady=4)
+        prompt_box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 8))
+        prompt_box.insert("1.0", getattr(self, "_ai_last_prompt", ""))
+        prompt_box.focus_set()
+
+        opts = ttk.Frame(body)
+        opts.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Label(opts, text="Length:").pack(side="left")
+        length_var = tk.StringVar(value=getattr(self, "_ai_last_length", "Medium (~120 words)"))
+        ttk.Combobox(opts, textvariable=length_var, state="readonly", width=20,
+                     values=list(ai_writer.LENGTHS)).pack(side="left", padx=(6, 14))
+        mode_var = tk.StringVar(value="replace")
+        ttk.Radiobutton(opts, text="Replace caption", value="replace",
+                        variable=mode_var).pack(side="left")
+        ttk.Radiobutton(opts, text="Add to end", value="append",
+                        variable=mode_var).pack(side="left", padx=(6, 0))
+
+        model_label = ttk.Label(body, text=f"Model: {settings['model']}", foreground="#888")
+        model_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        def _change_settings() -> None:
+            new = self._ai_settings_dialog()
+            if new:
+                settings.update(new)
+                model_label.config(text=f"Model: {settings['model']}")
+        ttk.Button(body, text="Settings…", command=_change_settings).grid(
+            row=3, column=1, sticky="e", pady=(8, 0))
+
+        status = ttk.Label(body, text="", foreground="#888", wraplength=460)
+        status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        gen_btn = ttk.Button(btns, text="Write")
+        stop_btn = ttk.Button(btns, text="Stop", state="disabled")
+        ttk.Button(btns, text="Close", command=lambda: _close()).pack(side="right")
+        stop_btn.pack(side="right", padx=(0, 6))
+        gen_btn.pack(side="right", padx=(0, 6))
+
+        state = {"cancel": None, "words": 0}
+
+        def _append(chunk: str) -> None:
+            self._text_box.insert("end-1c", chunk)
+            self._text_box.see("end")
+            state["words"] += chunk.count(" ")
+            status.config(text=f"Writing… ~{state['words']} words")
+
+        def _finish(err: Optional[str], cancelled: bool) -> None:
+            state["cancel"] = None
+            if win.winfo_exists():
+                gen_btn.config(state="normal")
+                stop_btn.config(state="disabled")
+                if err:
+                    status.config(text="")
+                    messagebox.showerror("Write with AI", err, parent=win)
+                else:
+                    status.config(text="Stopped." if cancelled else
+                                  "Done — edit the caption freely, or Write again for "
+                                  "another take.")
+            self._safe_refresh()
+
+        def _generate() -> None:
+            prompt = prompt_box.get("1.0", "end-1c").strip()
+            if not prompt:
+                status.config(text="Type a prompt first.")
+                return
+            self._ai_last_prompt = prompt
+            self._ai_last_length = length_var.get()
+            words = ai_writer.LENGTHS.get(length_var.get(), 120)
+            if mode_var.get() == "replace":
+                self._text_box.delete("1.0", "end")
+            elif self._text_box.get("1.0", "end-1c").strip():
+                self._text_box.insert("end-1c", "\n\n")
+            gen_btn.config(state="disabled")
+            stop_btn.config(state="normal")
+            state["words"] = 0
+            status.config(text=f"Waiting for {settings['model']}… (the first run can "
+                               "take a while as the model loads)")
+            cancel = threading.Event()
+            state["cancel"] = cancel
+
+            def _work() -> None:
+                err = None
+                try:
+                    for chunk in ai_writer.stream_story(prompt, words, settings, cancel):
+                        self.root.after(0, lambda c=chunk: _append(c))
+                except ai_writer.AIWriterError as e:
+                    err = str(e)
+                except Exception as e:
+                    log.exception("AI_WRITER_ERROR")
+                    err = f"Unexpected error: {e}"
+                log.info("AI_WRITER_DONE  model=%s cancelled=%s error=%s",
+                         settings["model"], cancel.is_set(), bool(err))
+                self.root.after(0, lambda: _finish(err, cancel.is_set()))
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _stop() -> None:
+            if state["cancel"] is not None:
+                state["cancel"].set()
+                status.config(text="Stopping…")
+
+        def _close() -> None:
+            _stop()
+            self._ai_win = None
+            win.destroy()
+
+        gen_btn.config(command=_generate)
+        stop_btn.config(command=_stop)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        prompt_box.bind("<Control-Return>", lambda _e: (_generate(), "break")[1])
 
     def _set_theme(self, name: str) -> None:
         if name == self._theme_name:
@@ -2297,6 +2556,7 @@ class CaptionApp:
                 (self._stroke_color_label, self._stroke_color_row))
         if chat_mode:
             self._text_box.grid_remove()
+            self._ai_btn.grid_remove()
             self._chat_frame.grid()
             for a, b in rows:
                 a.grid_remove()
@@ -2304,6 +2564,7 @@ class CaptionApp:
         else:
             self._chat_frame.grid_remove()
             self._text_box.grid()
+            self._ai_btn.grid()
             for a, b in rows:
                 a.grid()
                 b.grid()

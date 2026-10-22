@@ -34,3 +34,6 @@ themes/*.json
 !themes/Dark.json
 !themes/Bubblegum.json
 !themes/Basic.json
+
+# Local AI writer settings (server address, model, optional API key)
+ai_settings.json

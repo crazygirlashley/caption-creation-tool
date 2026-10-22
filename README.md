@@ -132,6 +132,33 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 
 ---
 
+## AI Writer (Optional)
+
+**✍ Write with AI…** (under the caption box) turns a prompt into a caption
+story and streams it straight into the caption text — e.g. *"TG story, first
+person POV of a man waking up from hypnosis to find his sister feminized him,
+ending on her line: …"*. Pick a length (~60 to ~350 words), and whether it
+replaces the caption or is added to the end; edit the result freely, or
+**Write** again for another take (Ctrl+Enter in the prompt box also writes).
+
+It runs on **your own computer** with whatever open-source model you choose,
+so you control what it will write (adult content included) and nothing is
+sent to a hosted AI service:
+
+1. Install a local LLM app with an OpenAI-compatible server —
+   [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai),
+   KoboldCpp, llama.cpp's `llama-server`, or text-generation-webui.
+2. Download a creative-writing model in it and start its server
+   (Ollama runs one automatically; in LM Studio, start the Local Server).
+3. In Caption Creator: **⚙ Settings → AI Writer Settings…**, choose your app
+   from the **Server** list (or type a custom address), press **Refresh**,
+   pick the model, and **Save**.
+
+Settings live in `ai_settings.json` (gitignored, never part of an update).
+Reasoning models' `<think>` sections are stripped automatically.
+
+---
+
 ## DeviantArt Upload (Optional)
 
 Caption Creator can save finished images, GIFs, and videos directly to Sta.sh — DeviantArt's private storage area — and optionally publish them to your gallery.
@@ -260,6 +287,7 @@ touched.
 caption-creation-tool/
 ├── app_paths.py              # Frozen-aware BASE_DIR/RESOURCE_DIR resolution
 ├── caption_creator.py        # Main application
+├── ai_writer.py              # Local-LLM caption story writer (OpenAI-compatible API)
 ├── da_client.py              # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
 ├── web_lookup.py             # Barnorama/AcidCow search client (Find Online…)
 ├── themes.py                 # UI theme loader/applier (⚙ Settings → Theme)
