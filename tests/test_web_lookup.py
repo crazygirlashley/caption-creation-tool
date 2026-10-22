@@ -64,10 +64,11 @@ class SimilarQueryTests(unittest.TestCase):
 
 class StreamTests(unittest.TestCase):
     def setUp(self):
-        self.orig = (wl._search_barnorama, wl._search_acidcow)
+        self.orig = (wl._search_barnorama, wl._search_acidcow, wl._search_sexcom)
+        wl._search_sexcom = lambda q, page: []  # keep these tests offline
 
     def tearDown(self):
-        wl._search_barnorama, wl._search_acidcow = self.orig
+        wl._search_barnorama, wl._search_acidcow, wl._search_sexcom = self.orig
 
     def test_multiword_query_also_searches_distinctive_term_and_dedupes(self):
         queries = []
