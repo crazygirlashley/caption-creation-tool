@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -401,6 +402,110 @@ def _hex_to_rgb(color: str) -> tuple:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+# ---------------------------------------------------------------------------
+# Emoji
+#
+# Caption fonts have no emoji glyphs, so pasted text like "Megan ❤️ ... 💕"
+# rendered as boxes. Emoji runs are drawn with Windows' color emoji font
+# (Segoe UI Emoji) instead, mixed into the line with the caption font.
+# Pillow here has no text-shaping library (raqm), so multi-part emoji —
+# skin tones, ZWJ sequences like 👩🏼‍🦰 — can't be joined into one glyph;
+# they're drawn as their base emoji (👩) rather than as loose pieces.
+# ---------------------------------------------------------------------------
+
+_EMOJI_FONT_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "seguiemj.ttf")
+# Emoji drawn at this fraction of the text size sit at about cap height.
+_EMOJI_SCALE = 0.8
+_EMOJI_BASE = "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF]"
+_EMOJI_RE = re.compile(
+    "(?:[\U0001F1E6-\U0001F1FF]{2})"  # flag pairs
+    "|(?:" + _EMOJI_BASE
+    + "(?:[\uFE0E\uFE0F]|[\U0001F3FB-\U0001F3FF]|\u200D" + _EMOJI_BASE + "?)*)")
+_EMOJI_MODIFIERS = re.compile("[\uFE0E\uFE0F\U0001F3FB-\U0001F3FF]")
+
+
+@functools.lru_cache(maxsize=64)
+def _emoji_font(size: float) -> Optional[ImageFont.FreeTypeFont]:
+    try:
+        return ImageFont.truetype(_EMOJI_FONT_PATH, max(1.0, size))
+    except OSError:
+        return None
+
+
+def _emoji_display(seq: str) -> str:
+    """What to draw for one matched emoji sequence: its base emoji (see the
+    raqm note above); flag pairs are kept as-is."""
+    if "\u200D" in seq:
+        seq = seq.split("\u200D", 1)[0]
+    return _EMOJI_MODIFIERS.sub("", seq) or seq
+
+
+def _rich_segments(text: str) -> list:
+    """[(text, is_emoji)] — consecutive runs; [] emoji runs hold the display
+    form from _emoji_display."""
+    segs, pos = [], 0
+    for m in _EMOJI_RE.finditer(text):
+        if m.start() > pos:
+            segs.append((text[pos:m.start()], False))
+        segs.append((_emoji_display(m.group()), True))
+        pos = m.end()
+    if pos < len(text):
+        segs.append((text[pos:], False))
+    return segs
+
+
+def _has_emoji(text: str) -> bool:
+    return _EMOJI_RE.search(text) is not None
+
+
+def _emoji_font_for(font: ImageFont.FreeTypeFont) -> Optional[ImageFont.FreeTypeFont]:
+    size = getattr(font, "size", None)
+    return _emoji_font(round(size * _EMOJI_SCALE * 4) / 4) if size else None
+
+
+def _text_w(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> float:
+    """Rendered width of text including any emoji. Text without emoji is
+    measured exactly as before (bbox right edge)."""
+    efont = _emoji_font_for(font) if _has_emoji(text) else None
+    if efont is None:
+        return draw.textbbox((0, 0), text, font=font)[2]
+    return sum((efont if is_emoji else font).getlength(seg)
+               for seg, is_emoji in _rich_segments(text))
+
+
+@functools.lru_cache(maxsize=256)
+def _emoji_dy(font: ImageFont.FreeTypeFont, efont: ImageFont.FreeTypeFont) -> float:
+    """Vertical offset that centers emoji on the text's "Ag" band."""
+    t = font.getbbox("Ag")
+    e = efont.getbbox("\U0001F600")
+    return (t[1] + t[3]) / 2 - (e[1] + e[3]) / 2
+
+
+def _draw_rich(draw: ImageDraw.ImageDraw, xy: tuple, text: str,
+               font: ImageFont.FreeTypeFont, fill, stroke_width: int = 0,
+               stroke_fill=None, emoji_color: bool = True) -> None:
+    """draw.text() that also renders emoji. emoji_color=False draws emoji as
+    solid `fill` silhouettes (used for drop shadows)."""
+    efont = _emoji_font_for(font) if _has_emoji(text) else None
+    if efont is None:
+        draw.text(xy, text, font=font, fill=fill, stroke_width=stroke_width,
+                  stroke_fill=stroke_fill)
+        return
+    x, y = xy
+    dy = _emoji_dy(font, efont)
+    for seg, is_emoji in _rich_segments(text):
+        if is_emoji:
+            if emoji_color:
+                draw.text((x, y + dy), seg, font=efont, embedded_color=True)
+            else:
+                draw.text((x, y + dy), seg, font=efont, fill=fill)
+            x += efont.getlength(seg)
+        else:
+            draw.text((x, y), seg, font=font, fill=fill, stroke_width=stroke_width,
+                      stroke_fill=stroke_fill)
+            x += font.getlength(seg)
+
+
 def _split_long_words(words: list, font: ImageFont.FreeTypeFont, max_px: int,
                       draw: ImageDraw.ImageDraw) -> list:
     """Break any word wider than max_px (a URL, "Aaaaaaah", ...) into
@@ -409,12 +514,12 @@ def _split_long_words(words: list, font: ImageFont.FreeTypeFont, max_px: int,
     only counts lines against the panel height — never noticed."""
     out = []
     for word in words:
-        if len(word) <= 1 or draw.textbbox((0, 0), word, font=font)[2] <= max_px:
+        if len(word) <= 1 or _text_w(draw, word, font) <= max_px:
             out.append(word)
             continue
         piece = ""
         for ch in word:
-            if piece and draw.textbbox((0, 0), piece + ch, font=font)[2] > max_px:
+            if piece and _text_w(draw, piece + ch, font) > max_px:
                 out.append(piece)
                 piece = ch
             else:
@@ -443,7 +548,7 @@ def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
         current_words: list = []
         current_w = 0
         for word in _split_long_words(words, font, max_px, draw):
-            word_w = draw.textbbox((0, 0), word, font=font)[2]
+            word_w = _text_w(draw, word, font)
             added_w = word_w if not current_words else space_w + word_w
             if current_words and current_w + added_w > max_px:
                 lines.append(" ".join(current_words))
@@ -567,7 +672,10 @@ def _text_x(draw: ImageDraw.ImageDraw, line: str, font: ImageFont.FreeTypeFont,
              x: int, w: int, padding: int, stroke_width: int, align: str) -> int:
     """Compute the left edge for a line of text based on alignment."""
     inner_w = w - padding * 2
-    line_w = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)[2]
+    if _has_emoji(line):
+        line_w = _text_w(draw, line, font) + stroke_width
+    else:
+        line_w = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)[2]
     if align == "left":
         return x + padding
     if align == "right":
@@ -596,15 +704,13 @@ def _draw_text_block(draw: ImageDraw.ImageDraw,
         ty = ty_start
         for line in lines:
             tx = _text_x(draw, line, font, x, w, padding, stroke_width, align)
-            shadow_draw.text((tx + ox, ty + oy), line, font=font,
-                             fill=(0, 0, 0, 180), stroke_width=stroke_width,
-                             stroke_fill=(0, 0, 0, 180))
+            _draw_rich(shadow_draw, (tx + ox, ty + oy), line, font,
+                       (0, 0, 0, 180), stroke_width, (0, 0, 0, 180), emoji_color=False)
             ty += line_h
     ty = ty_start
     for line in lines:
         tx = _text_x(draw, line, font, x, w, padding, stroke_width, align)
-        draw.text((tx, ty), line, font=font, fill=fc,
-                  stroke_width=stroke_width, stroke_fill=sc)
+        _draw_rich(draw, (tx, ty), line, font, fc, stroke_width, sc)
         ty += line_h
 
 
@@ -618,10 +724,9 @@ def _draw_text_overlay(draw: ImageDraw.ImageDraw,
     sc = _hex_to_rgb(stroke_color) if stroke_width > 0 else None
     ox, oy = shadow_offset
     if shadow_draw is not None:
-        shadow_draw.text((pos[0] + ox, pos[1] + oy), text, font=font,
-                         fill=(0, 0, 0, 180), stroke_width=stroke_width,
-                         stroke_fill=(0, 0, 0, 180))
-    draw.text(pos, text, font=font, fill=fc, stroke_width=stroke_width, stroke_fill=sc)
+        _draw_rich(shadow_draw, (pos[0] + ox, pos[1] + oy), text, font,
+                   (0, 0, 0, 180), stroke_width, (0, 0, 0, 180), emoji_color=False)
+    _draw_rich(draw, pos, text, font, fc, stroke_width, sc)
 
 
 def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
@@ -636,9 +741,9 @@ def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
     ty = ay + max(padding, (ah - block_h) // 2)
     fc = _hex_to_rgb(color)
     for line in lines:
-        tw = draw.textbbox((0, 0), line, font=font)[2]
+        tw = _text_w(draw, line, font)
         tx = ax + padding + max(0, (inner_w - tw) // 2)
-        draw.text((tx, ty), line, font=font, fill=fc)
+        _draw_rich(draw, (tx, ty), line, font, fc)
         ty += line_h
 
 
@@ -650,7 +755,7 @@ def _chat_measure_message(text: str, font: ImageFont.FreeTypeFont,
     _draw_chat_panel (the actual draw) so the two can never disagree on how
     tall a message's bubble is."""
     lines = _wrap_lines(text, font, max_bubble_w - pad_x * 2, draw)
-    text_w = max((draw.textbbox((0, 0), ln, font=font)[2] for ln in lines), default=0)
+    text_w = max((_text_w(draw, ln, font) for ln in lines), default=0)
     bubble_w = text_w + pad_x * 2
     bubble_h = len(lines) * line_h + pad_y * 2
     return lines, bubble_w, bubble_h
@@ -748,7 +853,7 @@ def _draw_chat_panel(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
         draw.rounded_rectangle((bx0, by0, bx1, by1), radius=radius, fill=fill + (255,))
         ly = by0 + pad_y
         for line in lines:
-            draw.text((bx0 + pad_x, ly), line, font=font, fill=fg)
+            _draw_rich(draw, (bx0 + pad_x, ly), line, font, fg)
             ly += line_h
         ty += bubble_h + spacing
 

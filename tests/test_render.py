@@ -150,6 +150,34 @@ class CompositeTests(unittest.TestCase):
         self.assertEqual(cc._auto_watermark_height((350, 242), 160, "vertical"), 67)
 
 
+class EmojiTests(unittest.TestCase):
+    def test_segments(self):
+        segs = cc._rich_segments("Megan ❤️: trim. 💕")
+        self.assertEqual(segs, [("Megan ", False), ("❤", True), (": trim. ", False),
+                                ("💕", True)])
+        self.assertEqual(cc._rich_segments("plain — “quotes” ©"),
+                         [("plain — “quotes” ©", False)])
+
+    def test_zwj_sequence_falls_back_to_base_emoji(self):
+        self.assertEqual(cc._rich_segments("👩🏼‍🦰")[0], ("👩", True))
+
+    @unittest.skipUnless(os.path.isfile(cc._EMOJI_FONT_PATH), "needs Segoe UI Emoji")
+    def test_emoji_render_in_color(self):
+        kw = dict(cap_width=200, page_bg="#ffffff", font_family="Arial", font_size=30,
+                  font_color="#000000", padding=10)
+        frame = Image.new("RGBA", (300, 200), "black")
+        out = cc.build_composite(frame, text="💕", **kw).convert("RGB")
+        panel = np.asarray(out)[:, out.width * 3 // 5:].astype(int)
+        # Black text on white can only produce grays; color means a real emoji.
+        saturation = panel.max(axis=2) - panel.min(axis=2)
+        self.assertGreater(int(saturation.max()), 100)
+
+    def test_emoji_widen_measured_width(self):
+        d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        font = cc._pil_font("Arial", 30)
+        self.assertGreater(cc._text_w(d, "hi 💕💕", font), cc._text_w(d, "hi ", font) + 30)
+
+
 class GifExportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
