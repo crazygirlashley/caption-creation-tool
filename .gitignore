@@ -40,3 +40,6 @@ ai_settings.json
 
 # Recent files / projects / Find Online searches (per-user)
 recent.json
+
+# Words added via the spell checker's "Add to dictionary"
+user_dictionary.txt

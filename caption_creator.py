@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 import ai_writer
 import da_client
 import recent_store
+import spellcheck
 import themes
 import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
@@ -611,6 +612,46 @@ def _fit_font_size(text: str, font_family: str, max_size: int,
         if total_h <= area_h:
             best = mid
             lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _words_that_fit(text: str, raw: dict) -> int:
+    """How many of text's words fit the caption panel at a comfortably
+    readable size (~4.2% of the output height, at least 24px) — the target
+    for the AI assistant's "Shorten to fit". Returns len(words) when it
+    already fits."""
+    words = text.split()
+    if not words or raw.get("frame_size") is None:
+        return len(words)
+    fw, fh = raw["frame_size"]
+    layout = raw["layout"]
+    total_w, total_h = _panel_total_size(fw, fh, raw["width"], layout)
+    scale, new_w, new_h = _output_scale(total_w, total_h, raw["output_override"],
+                                        raw["output_size_pct"])
+    if (new_w, new_h) == (total_w, total_h):
+        scale = 1.0
+    s_cap = max(1, round(raw["width"] * scale))
+    area_w, area_h = (new_w, s_cap) if layout == "vertical" else (s_cap, new_h)
+    pad = round(raw["pad"] * scale)
+    stroke = round(raw["stroke_w"] * scale)
+    size = max(24, round(new_h * 0.042))
+    font = _pil_font(raw["font_family"], size, raw["bold"])
+    line_h = int(size * 1.3)
+    draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+
+    def fits(n: int) -> bool:
+        lines = _wrap_lines(" ".join(words[:n]), font, area_w - pad * 2 - stroke * 2, draw)
+        return len(lines) * line_h + pad * 2 <= area_h
+
+    if fits(len(words)):
+        return len(words)
+    lo, hi, best = 1, len(words), 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
         else:
             hi = mid - 1
     return best
@@ -1982,8 +2023,19 @@ class CaptionApp:
         self._text_box.insert("1.0", "Your caption here")
         self._text_box.edit_reset()  # the placeholder isn't an undoable edit
         self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
-        self._ai_btn = ttk.Button(f, text="✍ Write with AI…", command=self._open_ai_writer)
+        # Row under the caption box: write a new story, or edit this one.
+        # (self._ai_btn is the row — hidden with the caption box in chat mode.)
+        self._ai_btn = ttk.Frame(f)
         self._ai_btn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Button(self._ai_btn, text="✍ Write with AI…",
+                   command=self._open_ai_writer).pack(side="left")
+        self._ai_edit_btn = ttk.Menubutton(self._ai_btn, text="✨ Edit with AI ▾")
+        self._ai_edit_menu = tk.Menu(self._ai_edit_btn, tearoff=False,
+                                     postcommand=self._fill_ai_edit_menu)
+        self._ai_edit_btn.config(menu=self._ai_edit_menu)
+        self._ai_edit_btn.pack(side="left", padx=(6, 0))
+        self._ai_edit_cancel: Optional[threading.Event] = None
+        self._setup_spellcheck(self._text_box)
         self._chat_frame = ttk.Frame(f)
         self._chat_frame.grid(row=r, column=0, columnspan=2, sticky="nsew", pady=(2, 8))
         self._build_chat_frame(self._chat_frame)
@@ -2655,6 +2707,229 @@ class CaptionApp:
         self.root.wait_window(dlg)
         return result[0]
 
+    # ------------------------------------------------------------------
+    # AI caption assistant — edit the existing caption (ai_writer.stream_edit)
+    # ------------------------------------------------------------------
+
+    def _ai_edit_target(self) -> tuple:
+        """(start index, end index, text): the selection, or the whole caption."""
+        box = self._text_box
+        try:
+            start, end = box.index("sel.first"), box.index("sel.last")
+        except tk.TclError:
+            start, end = "1.0", box.index("end-1c")
+        return start, end, box.get(start, end)
+
+    def _ai_edit_targets(self) -> dict:
+        """Word targets per action for the current caption/selection."""
+        _s, _e, text = self._ai_edit_target()
+        n = len(text.split())
+        full = self._text_box.get("1.0", "end-1c")
+        raw = self._gather_raw_params()
+        shorten = n
+        if raw is not None:
+            fit = _words_that_fit(full, raw)
+            overflow = len(full.split()) - fit
+            shorten = max(10, int((n - overflow) * 0.9)) if overflow > 0 else max(10, int(n * 0.8))
+        return {"smooth": max(1, n), "shorten": shorten,
+                "expand": max(n + 40, int(n * 1.5)), "grammar": max(1, n)}
+
+    def _fill_ai_edit_menu(self) -> None:
+        menu = self._ai_edit_menu
+        menu.delete(0, "end")
+        if self._ai_edit_cancel is not None:
+            menu.add_command(label="■ Stop editing", command=self._ai_edit_cancel.set)
+            return
+        _s, _e, text = self._ai_edit_target()
+        scope = "selection" if self._text_box.tag_ranges("sel") else "caption"
+        if not text.strip():
+            menu.add_command(label="Type or write a caption first", state="disabled")
+            return
+        targets = self._ai_edit_targets()
+        for key, (label, _instr) in ai_writer.EDIT_ACTIONS.items():
+            if key == "shorten":
+                label = f"{label} (~{targets['shorten']} words)"
+            elif key == "expand":
+                label = f"{label} (~{targets['expand']} words)"
+            menu.add_command(label=label, command=lambda k=key: self._run_ai_edit(k))
+        menu.add_command(label="Custom instruction…", command=lambda: self._run_ai_edit("custom"))
+        menu.add_separator()
+        menu.add_command(label=f"(edits the {scope}; Ctrl+Z undoes it)", state="disabled")
+
+    def _run_ai_edit(self, action: str, custom: str = "") -> None:
+        if self._ai_edit_cancel is not None:
+            return
+        if action == "custom" and not custom:
+            custom = simpledialog.askstring(
+                "Edit with AI", "How should the caption change?\n"
+                "(e.g. \"make it more teasing\", \"switch to third person\")",
+                parent=self.root) or ""
+            if not custom.strip():
+                return
+        start, end, text = self._ai_edit_target()
+        if not text.strip():
+            return
+        words = self._ai_edit_targets().get(action, len(text.split()))
+        settings = self._ensure_ai_ready()
+        if not settings:
+            return
+        instruction = ai_writer.edit_instruction(action, words, custom)
+        box = self._text_box
+        # One undo step for the whole edit; streamed text goes in at a mark.
+        box.edit_separator()
+        box.config(autoseparators=False)
+        box.delete(start, end)
+        box.mark_set("ai_edit", start)
+        box.mark_gravity("ai_edit", "right")
+        cancel = threading.Event()
+        self._ai_edit_cancel = cancel
+        self._ai_edit_btn.config(text="■ AI editing… ▾")
+        label = ai_writer.EDIT_ACTIONS.get(action, ("Custom edit",))[0]
+        self._status.config(text=f"AI: {label}…")
+        state = {"wrote": False}
+
+        def _append(chunk: str) -> None:
+            box.insert("ai_edit", chunk)
+            state["wrote"] = True
+
+        def _work() -> None:
+            err = None
+            try:
+                for chunk in ai_writer.stream_edit(text, instruction, words, settings, cancel):
+                    self.root.after(0, lambda c=chunk: _append(c))
+            except ai_writer.AIWriterError as e:
+                err = str(e)
+            except Exception as e:
+                log.exception("AI_EDIT_ERROR")
+                err = f"Unexpected error: {e}"
+            log.info("AI_EDIT_DONE  action=%s cancelled=%s error=%s", action,
+                     cancel.is_set(), bool(err))
+            self.root.after(0, lambda: _finish(err))
+
+        def _finish(err: Optional[str]) -> None:
+            self._ai_edit_cancel = None
+            self._ai_edit_btn.config(text="✨ Edit with AI ▾")
+            if err or cancel.is_set() or not state["wrote"]:
+                # Put the original back — a half-rewritten caption isn't useful.
+                box.delete(start, "ai_edit")
+                box.insert(start, text)
+            box.mark_unset("ai_edit")
+            box.edit_separator()
+            box.config(autoseparators=True)
+            self._status.config(text="AI edit stopped." if cancel.is_set() and not err
+                                else ("" if err else f"AI: {label} done — Ctrl+Z to undo."))
+            if err:
+                messagebox.showerror("Edit with AI", err)
+            self._schedule_spellcheck()
+            self._safe_refresh()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Spell check & grammar hints (spellcheck.py) on the caption box
+    # ------------------------------------------------------------------
+
+    def _setup_spellcheck(self, box: tk.Text) -> None:
+        self._spell_var = tk.BooleanVar(value=True)
+        self._spell_ignored: set = set()
+        self._spell_job = None
+        box.tag_configure("misspelled", underline=True, underlinefg="#e0393e")
+        box.tag_configure("grammar", underline=True, underlinefg="#2f80ed")
+        box.bind("<KeyRelease>", lambda _e: self._schedule_spellcheck(), add="+")
+        box.bind("<Button-3>", lambda e: self._caption_context_menu(e))
+        # Load the dictionary off the main thread so the first check is instant.
+        threading.Thread(target=spellcheck.available, daemon=True).start()
+
+    def _schedule_spellcheck(self, delay_ms: int = 400) -> None:
+        if getattr(self, "_spell_job", None):
+            self.root.after_cancel(self._spell_job)
+        self._spell_job = self.root.after(delay_ms, self._run_spellcheck)
+
+    def _run_spellcheck(self) -> None:
+        self._spell_job = None
+        box = self._text_box
+        box.tag_remove("misspelled", "1.0", "end")
+        box.tag_remove("grammar", "1.0", "end")
+        if not self._spell_var.get() or self._ai_edit_cancel is not None:
+            return
+        text = box.get("1.0", "end-1c")
+        for start, end, word in spellcheck.misspellings(text):
+            if word.lower() not in self._spell_ignored:
+                box.tag_add("misspelled", f"1.0+{start}c", f"1.0+{end}c")
+        self._grammar_issues = spellcheck.grammar_issues(text)
+        for start, end, _fix, _msg in self._grammar_issues:
+            box.tag_add("grammar", f"1.0+{start}c", f"1.0+{end}c")
+
+    def _caption_context_menu(self, event) -> str:
+        box = self._text_box
+        index = box.index(f"@{event.x},{event.y}")
+        menu = tk.Menu(self.root, tearoff=False)
+        tags = box.tag_names(index)
+        if "misspelled" in tags:
+            start, end = box.tag_prevrange("misspelled", f"{index}+1c")
+            word = box.get(start, end)
+            options = spellcheck.suggestions(word)
+            for option in options:
+                menu.add_command(label=option, font=("TkDefaultFont", 9, "bold"),
+                                 command=lambda o=option, s=start, e=end: self._replace_text(s, e, o))
+            if not options:
+                menu.add_command(label="(no suggestions)", state="disabled")
+            menu.add_command(label=f"Add “{word}” to dictionary",
+                             command=lambda w=word: (spellcheck.add_to_dictionary(w),
+                                                     self._run_spellcheck()))
+            menu.add_command(label="Ignore", command=lambda w=word: (
+                self._spell_ignored.add(w.lower()), self._run_spellcheck()))
+            menu.add_separator()
+        elif "grammar" in tags:
+            offset = len(box.get("1.0", index))
+            for start, end, fix, msg in getattr(self, "_grammar_issues", []):
+                if start <= offset < end or (start == offset and end == offset):
+                    shown = fix.strip() or "remove extra space"
+                    menu.add_command(label=f"Change to “{shown}”", font=("TkDefaultFont", 9, "bold"),
+                                     command=lambda s=start, e=end, f=fix: self._replace_text(
+                                         f"1.0+{s}c", f"1.0+{e}c", f))
+                    menu.add_command(label=msg, state="disabled")
+                    menu.add_separator()
+                    break
+        menu.add_command(label="Undo", accelerator="Ctrl+Z",
+                         command=lambda: self._text_edit("edit_undo"))
+        menu.add_command(label="Redo", accelerator="Ctrl+Y",
+                         command=lambda: self._text_edit("edit_redo"))
+        menu.add_separator()
+        for label, seq in (("Cut", "<<Cut>>"), ("Copy", "<<Copy>>"), ("Paste", "<<Paste>>")):
+            menu.add_command(label=label, command=lambda q=seq: (box.event_generate(q),
+                                                                 self._after_caption_edit()))
+        menu.add_command(label="Select All", command=lambda: box.tag_add("sel", "1.0", "end-1c"))
+        menu.add_separator()
+        menu.add_command(label="Fix spelling & grammar with AI",
+                         command=lambda: self._run_ai_edit("grammar"))
+        menu.add_checkbutton(label="Check spelling & grammar", variable=self._spell_var,
+                             command=self._run_spellcheck)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _replace_text(self, start: str, end: str, new: str) -> None:
+        box = self._text_box
+        box.edit_separator()
+        box.delete(start, end)
+        box.insert(start, new)
+        box.edit_separator()
+        self._after_caption_edit()
+
+    def _text_edit(self, op: str) -> None:
+        try:
+            getattr(self._text_box, op)()
+        except tk.TclError:
+            pass  # nothing to undo/redo
+        self._after_caption_edit()
+
+    def _after_caption_edit(self) -> None:
+        self._schedule_spellcheck(50)
+        self._on_text_keyrelease()
+
     def _open_ai_writer(self) -> None:
         """Prompt → story dialog. The story streams straight into the
         caption box (replacing or appending), and the preview refreshes
@@ -2731,6 +3006,7 @@ class CaptionApp:
             if self._text_box.winfo_exists():
                 self._text_box.edit_separator()
                 self._text_box.config(autoseparators=True)
+                self._schedule_spellcheck()
             if win.winfo_exists():
                 gen_btn.config(state="normal")
                 stop_btn.config(state="disabled")
@@ -5599,6 +5875,7 @@ class CaptionApp:
         self._text_box.delete("1.0", "end")
         self._text_box.insert("1.0", data.get("caption", ""))
         self._text_box.edit_reset()
+        self._schedule_spellcheck()
         if data.get("chat_messages"):
             self._chat_messages = [dict(m) for m in data["chat_messages"]]
             self._rebuild_chat_rows()

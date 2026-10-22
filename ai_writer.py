@@ -156,17 +156,73 @@ class _ThinkFilter:
         return "" if self._inside else rest
 
 
+EDIT_SYSTEM_PROMPT = (
+    "You are an editor for an adult caption-art community that makes TG "
+    "(gender transformation) captions: an image paired with a short story "
+    "panel. Revise the text the user sends as instructed: {instruction} "
+    "Unless the instruction says otherwise, keep the point of view, tense, "
+    "names, any quoted dialogue, emoji and the ending line. Explicit adult "
+    "content is allowed. All characters are adults. Output only the revised "
+    "text — no title, preamble, notes, quotation marks around it, or markdown."
+)
+
+# key -> (menu label, instruction; {words} is the target length)
+EDIT_ACTIONS = {
+    "smooth": ("Smooth & polish",
+               "Improve the flow, rhythm and word choice and fix awkward phrasing, "
+               "keeping the length about the same (about {words} words)."),
+    "shorten": ("Shorten to fit",
+                "Condense it to about {words} words, keeping the key story beats, the "
+                "strongest details and the final line."),
+    "expand": ("Add more detail",
+               "Expand it to about {words} words with richer sensory, physical and "
+               "emotional detail, without changing what happens."),
+    "grammar": ("Fix spelling & grammar",
+                "Fix only spelling, grammar and punctuation. Change as little as "
+                "possible and keep the wording, style and length."),
+}
+
+
+def edit_instruction(action: str, words: int, custom: str = "") -> str:
+    if action == "custom":
+        return custom.strip().rstrip(".") + "."
+    return EDIT_ACTIONS[action][1].format(words=words)
+
+
+def stream_edit(text: str, instruction: str, words: int, settings: dict,
+                cancel: Optional[threading.Event] = None) -> Iterator[str]:
+    """Yield a revised version of text as it streams."""
+    messages = [
+        {"role": "system", "content": EDIT_SYSTEM_PROMPT.format(instruction=instruction)},
+        {"role": "user", "content": text.strip()},
+    ]
+    # Grammar fixes should stay faithful, so they run cooler.
+    temperature = 0.3 if "Fix only spelling" in instruction else None
+    yield from _stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
+                            settings, cancel, temperature=temperature)
+
+
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
                  timeout: float = 300.0) -> Iterator[str]:
     """Yield the story text as it streams from POST /chat/completions."""
+    yield from _stream_chat(build_messages(prompt, words), int(words * 2.5) + 200,
+                            settings, cancel, timeout=timeout)
+
+
+def _stream_chat(messages: list, max_tokens: int, settings: dict,
+                 cancel: Optional[threading.Event] = None, timeout: float = 300.0,
+                 temperature: Optional[float] = None) -> Iterator[str]:
+    """Stream the assistant's reply text from POST /chat/completions,
+    with reasoning (<think>) blocks and leading whitespace removed."""
     if not settings.get("model"):
         raise AIWriterError("No model selected — pick one under ⚙ Settings → AI Writer.")
     body = {
         "model": settings["model"],
-        "messages": build_messages(prompt, words),
-        "temperature": float(settings.get("temperature", 0.9)),
-        "max_tokens": int(words * 2.5) + 200,
+        "messages": messages,
+        "temperature": (temperature if temperature is not None
+                        else float(settings.get("temperature", 0.9))),
+        "max_tokens": max_tokens,
         "stream": True,
     }
     try:
