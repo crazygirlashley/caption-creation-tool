@@ -37,3 +37,6 @@ themes/*.json
 
 # Local AI writer settings (server address, model, optional API key)
 ai_settings.json
+
+# Recent files / projects / Find Online searches (per-user)
+recent.json

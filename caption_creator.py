@@ -29,6 +29,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSeque
 
 import ai_writer
 import da_client
+import recent_store
 import themes
 import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
@@ -351,6 +352,31 @@ _WL_STRIP_CANDIDATES = 12
 import concurrent.futures as _cf
 _WL_GALLERY_POOL = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="wl-gallery")
 _WL_PREVIEW_POOL = _cf.ThreadPoolExecutor(max_workers=6, thread_name_prefix="wl-preview")
+
+
+# Values _on_format_change falls back to when a format file omits a key —
+# so a project snapshot (which lists every key) compares equal to the
+# format it came from when nothing was actually changed.
+_FORMAT_DEFAULTS = {
+    "font_color": "#111111", "page_bg_color": "#f5f5f5", "stroke_color": "#000000",
+    "stroke_width": 0, "font_family": "Arial", "bold": False, "padding": 20,
+    "auto_size": False, "align": "center", "caption_side": "right",
+    "dynamic_width": False, "header_font": "Arial", "header_size": 28,
+    "footer_font": "Arial", "footer_size": 16, "footer_enabled": False,
+}
+# Per-caption text, not part of what makes a format different.
+_FORMAT_PER_CAPTION_KEYS = ("header_text", "footer_text", "name")
+
+
+def _format_differs(stored: dict, snapshot: dict) -> bool:
+    keys = (set(stored) | set(snapshot)) - set(_FORMAT_PER_CAPTION_KEYS)
+    return any(stored.get(k, _FORMAT_DEFAULTS.get(k)) != snapshot.get(k, _FORMAT_DEFAULTS.get(k))
+               for k in keys)
+
+
+def _short_path(path: str, max_len: int = 70) -> str:
+    """A menu-friendly path: the tail end if it's too long to show whole."""
+    return path if len(path) <= max_len else "…" + path[-(max_len - 1):]
 
 
 def _wl_badge_gif(img: Image.Image) -> Image.Image:
@@ -1694,6 +1720,10 @@ class CaptionApp:
         ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Find Online…", command=self._web_lookup).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
+        file_btn = ttk.Menubutton(bar, text="File ▾")
+        self._file_menu = tk.Menu(file_btn, tearoff=False, postcommand=self._fill_file_menu)
+        file_btn.config(menu=self._file_menu)
+        file_btn.pack(side="left", padx=4)
         self._bind_shortcuts()
         # Only shown for animated sources (GIF/MP4) — hidden for static images.
         self._single_frame_check = ttk.Checkbutton(
@@ -2845,11 +2875,13 @@ class CaptionApp:
         so the shortcut is also bound on the Text class and stops there —
         otherwise pressing it in the caption box would add a stray line
         break before opening the file dialog."""
-        for keys, action in ((("<Control-o>", "<Control-O>"), self._open),
-                             (("<Control-s>", "<Control-S>"), self._save)):
-            for key in keys:
-                self.root.bind_all(key, lambda _e, a=action: a())
-                self.root.bind_class("Text", key, lambda _e, a=action: (a(), "break")[1])
+        # With Shift held, Tk reports the capital letter: Ctrl+Shift+O/S open
+        # and save a project.
+        bindings = (("<Control-o>", self._open), ("<Control-O>", self._open_project),
+                    ("<Control-s>", self._save), ("<Control-S>", self._save_project))
+        for key, action in bindings:
+            self.root.bind_all(key, lambda _e, a=action: a())
+            self.root.bind_class("Text", key, lambda _e, a=action: (a(), "break")[1])
 
     def _on_dynamic_width_toggle(self) -> None:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
@@ -3411,6 +3443,8 @@ class CaptionApp:
         log.info("FILE_OPEN  %s  %s  %dx%d", name, kind, w, h)
 
         self._source_path = path
+        if not is_temp_download:
+            recent_store.add("files", path)
         self._single_frame_var.set(bool(self._deferred_path))
         self._update_single_frame_visibility()
         self._update_gif_compress_visibility()
@@ -3457,7 +3491,10 @@ class CaptionApp:
         full_caption = self._get_caption_text()
         default_query = web_lookup.extract_keywords(full_caption)
         query_var = tk.StringVar(value=default_query)
-        entry = ttk.Entry(search_row, textvariable=query_var)
+        # Editable dropdown of recent searches (newest first).
+        entry = ttk.Combobox(search_row, textvariable=query_var,
+                             values=recent_store.get("searches"))
+        entry.bind("<<ComboboxSelected>>", lambda _e: self._wl_run_search(1))
         entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         search_btn = ttk.Button(search_row, text="Search")
         search_btn.pack(side="left")
@@ -3508,6 +3545,7 @@ class CaptionApp:
         query = self._wl_query_var.get().strip()
         if not query:
             return
+        recent_store.add("searches", query)
         self._wl_page = page
         for w in self._wl_results_frame.winfo_children():
             w.destroy()
@@ -5086,6 +5124,228 @@ class CaptionApp:
             self._fit_btn.config(state="disabled" if self._fit_running else "normal")
             self._fit_btn.pack(side="left", padx=(8, 0))
 
+    def _set_output_override(self, pct: Optional[int]) -> None:
+        """Turn Output Size Override on at pct (or off with None) without
+        the checkbox's own "start at today's size" recalculation."""
+        if pct is None:
+            self._output_override_var.set(False)
+            self._output_pct_row.pack_forget()
+            return
+        self._output_override_var.set(True)
+        self._output_pct_row.pack(side="top", fill="x", pady=(0, 4),
+                                  before=self._gif_compress_frame
+                                  if self._gif_compress_frame.winfo_manager()
+                                  else self._size_est_row)
+        self._output_pct_var.set(int(pct))
+
+    def _set_gif_compress(self, colors: Optional[int]) -> None:
+        if colors is None or colors >= 256:
+            self._gif_compress_var.set(False)
+            self._gif_colors_var.set(256)
+            self._gif_colors_row.pack_forget()
+            return
+        self._gif_compress_var.set(True)
+        self._gif_colors_row.pack(side="top", fill="x", pady=(0, 4))
+        self._gif_colors_var.set(int(colors))
+
+    # ------------------------------------------------------------------
+    # File menu: recent files and projects (.ccproj)
+    # ------------------------------------------------------------------
+
+    def _fill_file_menu(self) -> None:
+        menu = self._file_menu
+        menu.delete(0, "end")
+        menu.add_command(label="Open Image / GIF / MP4…", accelerator="Ctrl+O",
+                         command=self._open)
+        recent = tk.Menu(menu, tearoff=False)
+        files = recent_store.get("files")
+        for path in files:
+            recent.add_command(label=_short_path(path),
+                               command=lambda p=path: self._load_source(p))
+        if files:
+            recent.add_separator()
+            recent.add_command(label="Clear list",
+                               command=lambda: recent_store.clear("files"))
+        else:
+            recent.add_command(label="(none yet)", state="disabled")
+        menu.add_cascade(label="Recent Files", menu=recent)
+        menu.add_separator()
+        menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
+                         command=self._open_project)
+        recent_proj = tk.Menu(menu, tearoff=False)
+        projects = recent_store.get("projects")
+        for path in projects:
+            recent_proj.add_command(label=_short_path(path),
+                                    command=lambda p=path: self._open_project(p))
+        if not projects:
+            recent_proj.add_command(label="(none yet)", state="disabled")
+        menu.add_cascade(label="Recent Projects", menu=recent_proj)
+        menu.add_command(label="Save Project…", accelerator="Ctrl+Shift+S",
+                         command=self._save_project)
+
+    def _project_dict(self, project_path: str) -> Optional[dict]:
+        fmt = self._format_var.get()
+        settings = self._collect_format_dict(fmt)
+        if settings is None:
+            return None
+        project_dir = os.path.dirname(os.path.abspath(project_path))
+        source = self._source_path or ""
+        if source and self._temp_source_path == source:
+            # A Find Online download lives in a temp folder that's cleaned
+            # up later — keep a copy beside the project instead.
+            base = os.path.splitext(os.path.basename(project_path))[0]
+            ext = os.path.splitext(source)[1] or ".jpg"
+            kept = os.path.join(project_dir, f"{base}_source{ext}")
+            shutil.copyfile(source, kept)
+            source = kept
+        try:
+            rel = os.path.relpath(source, project_dir) if source else ""
+        except ValueError:  # different drive
+            rel = ""
+        first, last = self._trim_range() if self._is_anim else (0, 0)
+        try:
+            return {
+                "app": "Caption Creator project",
+                "version": 1,
+                "source": os.path.abspath(source) if source else "",
+                "source_rel": rel,
+                "source_url": getattr(self, "_image_source_url", None),
+                "format": fmt,
+                "format_settings": settings,
+                "caption": self._text_box.get("1.0", "end-1c"),
+                "chat_messages": [dict(m) for m in self._chat_messages],
+                "bubble_color": self._chat_bubble_var.get(),
+                "font_size": self._size_var.get(),
+                "caption_width": self._width_var.get(),
+                "output_size_pct": (self._output_pct_var.get()
+                                    if self._output_override_var.get() else None),
+                "gif_colors": (self._gif_colors_var.get()
+                               if self._gif_compress_var.get() else None),
+                "watermark_auto": self._wm_auto_var.get(),
+                "watermark_height": self._watermark_height_var.get(),
+                "trim": [first + 1, last + 1] if self._is_anim else None,
+                "speed": self._speed() if self._is_anim else 1.0,
+            }
+        except tk.TclError:
+            messagebox.showerror("Save Project", "Fix the invalid number fields first.")
+            return None
+
+    def _save_project(self) -> None:
+        if not self._source_path:
+            messagebox.showinfo("Save Project", "Open an image, GIF or video first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Project", defaultextension=".ccproj",
+            initialfile=getattr(self, "_project_path", None) and
+            os.path.basename(self._project_path) or "",
+            filetypes=[("Caption Creator project", "*.ccproj")])
+        if not path:
+            return
+        try:
+            data = self._project_dict(path)
+            if data is None:
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            messagebox.showerror("Save Project", f"Couldn't save the project:\n{e}")
+            return
+        self._project_path = path
+        recent_store.add("projects", path)
+        log.info("PROJECT_SAVE  %s", os.path.basename(path))
+        self._status.config(text=f"Saved project {os.path.basename(path)}")
+
+    def _open_project(self, path: Optional[str] = None) -> None:
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open Project", filetypes=[("Caption Creator project", "*.ccproj"),
+                                                 ("All files", "*.*")])
+            if not path:
+                return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("app") != "Caption Creator project":
+                raise ValueError("not a Caption Creator project file")
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Open Project", f"Couldn't open the project:\n{e}")
+            return
+        project_dir = os.path.dirname(os.path.abspath(path))
+        source = data.get("source") or ""
+        if source and not os.path.isfile(source):
+            rel = os.path.join(project_dir, data.get("source_rel") or "")
+            source = rel if data.get("source_rel") and os.path.isfile(rel) else ""
+            if not source:
+                if messagebox.askyesno(
+                        "Open Project",
+                        f"The project's image wasn't found:\n{data.get('source')}\n\n"
+                        "Locate it?"):
+                    source = filedialog.askopenfilename(title="Locate the project's image")
+                if not source:
+                    return
+        self._load_source(source)
+        if self._source_path != source:
+            return  # load failed or was cancelled; it already said why
+        self._image_source_url = data.get("source_url")
+        self._apply_project(data)
+        self._project_path = path
+        recent_store.add("projects", path)
+        log.info("PROJECT_OPEN  %s", os.path.basename(path))
+
+    def _apply_project(self, data: dict) -> None:
+        fmt = data.get("format") or self._format_var.get()
+        settings = dict(data.get("format_settings") or {})
+        if settings:
+            # Use the project's own snapshot of the format; if a format by
+            # that name exists with different settings, keep both.
+            if fmt in self._formats and _format_differs(self._formats[fmt], settings):
+                fmt = f"{fmt} (project)"
+                settings["name"] = fmt
+            self._formats[fmt] = settings
+            self._fmt_combo.config(values=list(self._formats.keys()))
+        for box in (self._header_text_box, self._footer_text_box):
+            box.delete("1.0", "end")
+        if self._format_var.get() == fmt:
+            self._on_format_change()
+        else:
+            self._format_var.set(fmt)  # its trace applies the format
+        for box, key in ((self._header_text_box, "header_text"),
+                         (self._footer_text_box, "footer_text")):
+            box.delete("1.0", "end")
+            box.insert("1.0", settings.get(key, ""))
+            box.edit_reset()
+        self._text_box.delete("1.0", "end")
+        self._text_box.insert("1.0", data.get("caption", ""))
+        self._text_box.edit_reset()
+        if data.get("chat_messages"):
+            self._chat_messages = [dict(m) for m in data["chat_messages"]]
+            self._rebuild_chat_rows()
+        self._chat_bubble_var.set(data.get("bubble_color", "blue"))
+        if data.get("font_size") is not None:
+            self._size_var.set(data["font_size"])
+        if data.get("caption_width") and not self._dynamic_width_var.get():
+            self._width_var.set(data["caption_width"])
+        self._set_output_override(data.get("output_size_pct"))
+        self._set_gif_compress(data.get("gif_colors"))
+        self._wm_auto_var.set(bool(data.get("watermark_auto", True)))
+        if not self._wm_auto_var.get() and data.get("watermark_height"):
+            self._updating_wm_display = True
+            try:
+                self._watermark_height_var.set(data["watermark_height"])
+            finally:
+                self._updating_wm_display = False
+        if self._is_anim:
+            self._trim_updating = True
+            try:
+                if data.get("trim"):
+                    self._trim_start_var.set(int(data["trim"][0]))
+                    self._trim_end_var.set(int(data["trim"][1]))
+                self._speed_var.set(f"{float(data.get('speed', 1.0)):g}")
+            finally:
+                self._trim_updating = False
+            self._update_trim_info()
+        self._safe_refresh(debounce_ms=0)
+
     def _fit_to_da_limit(self) -> None:
         """Find the highest-quality output settings whose GIF fits under
         DeviantArt's upload cap, then apply them. Quality is given up in
@@ -5181,16 +5441,9 @@ class CaptionApp:
                 return
             pct, colors = result
             log.info("FIT_DA_LIMIT  pct=%d colors=%d", pct, colors)
-            self._output_override_var.set(True)
-            self._output_pct_row.pack(side="top", fill="x", pady=(0, 4),
-                                      before=self._gif_compress_frame
-                                      if self._gif_compress_frame.winfo_manager()
-                                      else self._size_est_row)
-            self._output_pct_var.set(pct)
+            self._set_output_override(pct)
             if colors < 256:
-                self._gif_compress_var.set(True)
-                self._gif_colors_row.pack(side="top", fill="x", pady=(0, 4))
-                self._gif_colors_var.set(colors)
+                self._set_gif_compress(colors)
             self._size_est_label.config(text="Est. size: recalculating…", foreground="#888")
 
         threading.Thread(target=_run, daemon=True).start()
