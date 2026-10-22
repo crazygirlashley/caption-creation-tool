@@ -5995,8 +5995,8 @@ class CaptionApp:
                 messagebox.showinfo(
                     "Fit under 80 MB",
                     "Even at the smallest output size (1280×720) with 32 colors this "
-                    "GIF is still over 80 MB.\n\nTrimming it to fewer frames (or a "
-                    "shorter clip) is the remaining way to bring it under the limit.")
+                    "GIF is still over 80 MB.\n\nUse Frames … to … under the preview to "
+                    "keep a shorter part of it, then press Fit under 80 MB again.")
                 return
             pct, colors = result
             log.info("FIT_DA_LIMIT  pct=%d colors=%d", pct, colors)
