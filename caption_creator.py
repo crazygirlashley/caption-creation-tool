@@ -314,6 +314,9 @@ _MIN_OUTPUT_H = 720
 # displays whatever size that search lands on, it's not itself a cap (see
 # CaptionApp._collect_render_params).
 _MAX_AUTO_FONT_SIZE = 200
+# Image height the title/tagline sizes are meant for when "Scale title &
+# tagline with image" is on.
+_OVERLAY_REF_H = 300
 
 # Auto watermark height (footer off, Auto checked): this fraction of the
 # image's height, so the watermark keeps the same proportions on a 242px GIF
@@ -369,6 +372,7 @@ _FORMAT_DEFAULTS = {
     "auto_size": False, "align": "center", "caption_side": "right",
     "dynamic_width": False, "header_font": "Arial", "header_size": 28,
     "footer_font": "Arial", "footer_size": 16, "footer_enabled": False,
+    "scale_overlays": False,
 }
 # Per-caption text, not part of what makes a format different.
 _FORMAT_PER_CAPTION_KEYS = ("header_text", "footer_text", "name")
@@ -656,6 +660,18 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
     else:
         size = raw["field_size"]
 
+    # "Scale title & tagline with image": sizes are for an image
+    # _OVERLAY_REF_H px tall and grow/shrink with the real one, so they keep
+    # the same proportion on any source. The footer-linked watermark (2x
+    # footer size) follows along.
+    overlay_k = 1.0
+    if raw.get("scale_overlays") and raw.get("frame_size"):
+        overlay_k = raw["frame_size"][1] / _OVERLAY_REF_H
+    footer_size = raw["footer_size"] * overlay_k
+    watermark_height = raw["watermark_height"]
+    if raw["footer_enabled"] and overlay_k != 1.0:
+        watermark_height = max(1, round(watermark_height * overlay_k))
+
     kwargs: dict = dict(
         text=text,
         chat_messages=raw.get("chat_messages"),
@@ -677,9 +693,9 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         footer_enabled=raw["footer_enabled"],
         footer_text=raw["footer_text"],
         footer_font=raw["footer_font"],
-        footer_size=raw["footer_size"],
+        footer_size=footer_size,
         watermark_path=raw["watermark_path"],
-        watermark_height=raw["watermark_height"],
+        watermark_height=watermark_height,
         output_override=raw["output_override"],
         output_size_pct=raw["output_size_pct"],
         # GIF sources are already low-res and dithered: LANCZOS only blurs
@@ -692,7 +708,7 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         kwargs.update(
             header_text=raw["header_text"],
             header_font=raw["header_font"],
-            header_size=raw["header_size"],
+            header_size=raw["header_size"] * overlay_k,
         )
 
     return kwargs, size
@@ -1653,12 +1669,15 @@ class CaptionApp:
 
         # Header
         self._header_font_var = tk.StringVar(value="Arial")
-        self._header_size_var = tk.IntVar(value=28)
+        self._header_size_var = tk.DoubleVar(value=28)
 
         # Footer overlay
         self._footer_enabled = tk.BooleanVar(value=False)
         self._footer_font_var = tk.StringVar(value="Arial")
-        self._footer_size_var = tk.IntVar(value=16)
+        self._footer_size_var = tk.DoubleVar(value=16)
+        # Scale title/tagline (and the footer-linked watermark) with the
+        # image's height instead of fixed pixel sizes — see _OVERLAY_REF_H.
+        self._scale_overlays_var = tk.BooleanVar(value=False)
 
         # Watermark
         self._watermark_path = ""
@@ -1878,7 +1897,7 @@ class CaptionApp:
         for v in (self._width_var, self._pad_var,
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._side_var, self._header_size_var,
-                  self._footer_size_var, self._wm_auto_var,
+                  self._footer_size_var, self._wm_auto_var, self._scale_overlays_var,
                   self._output_pct_var, self._gif_colors_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
@@ -2207,8 +2226,12 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Header Size:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=8, to=144, textvariable=self._header_size_var,
+        ttk.Spinbox(f, from_=4, to=144, increment=0.5, textvariable=self._header_size_var,
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
+        r += 1
+        ttk.Checkbutton(f, text="Scale title & tagline with image",
+                        variable=self._scale_overlays_var).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(2, 4))
         r += 1
 
 
@@ -2238,8 +2261,12 @@ class CaptionApp:
         r += 1
 
         ttk.Label(f, text="Footer Size:").grid(row=r, column=0, sticky="w", pady=4)
-        ttk.Spinbox(f, from_=8, to=72, textvariable=self._footer_size_var,
+        ttk.Spinbox(f, from_=4, to=72, increment=0.5, textvariable=self._footer_size_var,
                     width=7).grid(row=r, column=1, sticky="w", padx=6)
+        r += 1
+        ttk.Checkbutton(f, text="Scale title & tagline with image",
+                        variable=self._scale_overlays_var).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(2, 4))
         r += 1
 
 
@@ -4160,6 +4187,7 @@ class CaptionApp:
             base["footer_enabled"] = self._footer_enabled.get()
             base["footer_font"] = self._footer_font_var.get()
             base["footer_size"] = self._footer_size_var.get()
+            base["scale_overlays"] = self._scale_overlays_var.get()
             base["footer_text"] = self._footer_text_box.get("1.0", "end-1c")
         except tk.TclError:
             messagebox.showerror("Invalid Settings",
@@ -4268,6 +4296,7 @@ class CaptionApp:
             ffont = "Arial Bold"
         self._footer_font_var.set(ffont)
         self._footer_size_var.set(data.get("footer_size", 16))
+        self._scale_overlays_var.set(data.get("scale_overlays", False))
         self._footer_enabled.set(data.get("footer_enabled", False))
         self._update_watermark_height_visibility()
         if not self._footer_text_box.get("1.0", "end-1c").strip():
@@ -4391,6 +4420,7 @@ class CaptionApp:
             auto_size=self._auto_size_var.get(),
             frame_size=self._frames[0].size if self._frames else None,
             source_is_gif=self._is_anim and not self._is_video,
+            scale_overlays=self._scale_overlays_var.get(),
             font_family=self._font_var.get(),
             page_bg=self._page_bg_color,
             font_color=self._fc_color,

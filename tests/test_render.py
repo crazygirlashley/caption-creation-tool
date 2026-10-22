@@ -148,6 +148,27 @@ class CompositeTests(unittest.TestCase):
         self.assertEqual(cc._auto_watermark_height((2000, 1500)), 250)
 
 
+class OverlayScaleTests(unittest.TestCase):
+    def _kwargs(self, frame_size, **kw):
+        raw = _raw(frame_size, text="x", header_enabled=True, header_text="Part 6",
+                   header_font="Arial Bold", header_size=28.5, footer_enabled=True,
+                   footer_text="tag", footer_size=16, watermark_height=32, **kw)
+        return cc._resolve_composite_kwargs(raw)[0]
+
+    def test_fixed_sizes_by_default(self):
+        kw = self._kwargs((350, 242))
+        self.assertEqual((kw["header_size"], kw["footer_size"]), (28.5, 16))
+
+    def test_scaled_sizes_follow_image_height(self):
+        small = self._kwargs((350, 150), scale_overlays=True)
+        big = self._kwargs((1500, 1200), scale_overlays=True)
+        self.assertAlmostEqual(small["header_size"], 28.5 * 150 / cc._OVERLAY_REF_H)
+        self.assertAlmostEqual(big["footer_size"], 16 * 1200 / cc._OVERLAY_REF_H)
+        self.assertEqual(big["watermark_height"], round(32 * 1200 / cc._OVERLAY_REF_H))
+        # Same proportion of the image height on both:
+        self.assertAlmostEqual(small["header_size"] / 150, big["header_size"] / 1200)
+
+
 class EmojiTests(unittest.TestCase):
     def test_segments(self):
         segs = cc._rich_segments("Megan ❤️: trim. 💕")
