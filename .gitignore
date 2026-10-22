@@ -43,3 +43,6 @@ recent.json
 
 # Words added via the spell checker's "Add to dictionary"
 user_dictionary.txt
+
+# App background images chosen in Settings -> Background (per-user)
+backgrounds/

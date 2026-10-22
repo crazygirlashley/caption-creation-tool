@@ -37,6 +37,7 @@ import ai_writer
 import da_client
 import recent_store
 import spellcheck
+import wallpaper
 import themes
 import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
@@ -315,6 +316,7 @@ _MIN_OUTPUT_H = 720
 # displays whatever size that search lands on, it's not itself a cap (see
 # CaptionApp._collect_render_params).
 _MAX_AUTO_FONT_SIZE = 200
+_EDITOR_SIDEBAR_W = 340
 # Image height the title/tagline sizes are meant for when "Scale title &
 # tagline with image" is on.
 _OVERLAY_REF_H = 300
@@ -1746,6 +1748,7 @@ class CaptionApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._build_editor_view()  # needs the builder's caption box to exist
+        self._load_wallpaper()
         self._on_format_change()  # sync all fields to the initially-selected format
         self._apply_view()  # open in the last-used view (Editor by default)
         self._auto_detect_watermark()
@@ -2370,6 +2373,7 @@ class CaptionApp:
         menu = tk.Menu(self.root, tearoff=False)
         menu.add_command(label="DA Settings…", command=self._da_settings)
         menu.add_command(label="AI Writer Settings…", command=self._ai_settings_dialog)
+        menu.add_command(label="Background…", command=self._background_dialog)
         menu.add_separator()
         theme_menu = tk.Menu(menu, tearoff=False)
         # Rescan themes/ on every open (cheap — a handful of small JSON
@@ -3123,6 +3127,10 @@ class CaptionApp:
             box.configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
         for rw in getattr(self, "_chat_row_widgets", []):
             rw["text"].configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
+        if getattr(self, "_editor_preview", None) is not None:
+            self._editor_preview.configure(bg=colors["bg"])
+        if getattr(self, "_editor_view", None) is not None:
+            self._load_wallpaper()  # re-dim toward the new theme's background
 
     # ------------------------------------------------------------------
     # Aardvark Cafe prompt
@@ -3220,13 +3228,18 @@ class CaptionApp:
         return self._text_box
 
     def _build_editor_view(self) -> None:
-        ed = ttk.Frame(self.root, padding=(10, 4, 10, 6))
+        # A canvas holding two cards — the writing area and the sidebar — so
+        # an app background image can show around them (see _layout_editor).
+        ed = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=self.root.cget("bg"))
         self._editor_view = ed
-        ed.columnconfigure(0, weight=1)
-        ed.rowconfigure(0, weight=1)
+        card = ttk.Frame(ed, padding=(0, 0, 0, 4))
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(0, weight=1)
+        self._editor_card = card
+        self._editor_card_win = ed.create_window(0, 0, window=card, anchor="nw")
 
         # Writing area
-        text_frame = ttk.Frame(ed)
+        text_frame = ttk.Frame(card)
         text_frame.grid(row=0, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
@@ -3242,14 +3255,18 @@ class CaptionApp:
         self._editor_box.bind("<<Paste>>", lambda _e: self.root.after(10, self._schedule_editor_sync),
                               add="+")
         self._setup_spellcheck(self._editor_box)
-        self._editor_stats = ttk.Label(ed, text="", foreground="#888")
+        self._editor_stats = ttk.Label(card, text="", foreground="#888", padding=(6, 0))
         self._editor_stats.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         # Sidebar
-        side = ttk.Frame(ed, width=330)
-        side.grid(row=0, column=1, rowspan=2, sticky="ns", padx=(12, 0))
+        side = ttk.Frame(ed, width=_EDITOR_SIDEBAR_W, padding=(8, 0, 8, 8))
         side.grid_propagate(False)
         side.columnconfigure(0, weight=1)
+        self._editor_side = side
+        self._editor_side_win = ed.create_window(0, 0, window=side, anchor="nw")
+        self._editor_wall_item = ed.create_image(0, 0, anchor="nw", tags=("wall",))
+        ed.tag_lower("wall")
+        ed.bind("<Configure>", lambda _e: self._layout_editor())
 
         ai = ttk.LabelFrame(side, text="AI writing", padding=8)
         ai.grid(row=0, column=0, sticky="ew")
@@ -3290,6 +3307,192 @@ class CaptionApp:
         self._editor_preview_photo = None
         self._editor_sync_job = None
 
+    def _layout_editor(self) -> None:
+        """Place the writing card and sidebar card; with a background
+        image they float on it with margins, otherwise they fill the view."""
+        ed = self._editor_view
+        w, h = ed.winfo_width(), ed.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        on = self._wall_active()
+        margin, gap = (22, 18) if on else (10, 12)
+        side_w = _EDITOR_SIDEBAR_W
+        card_w = max(200, w - side_w - 2 * margin - gap)
+        ed.coords(self._editor_card_win, margin, margin)
+        ed.itemconfigure(self._editor_card_win, width=card_w, height=max(100, h - 2 * margin))
+        ed.coords(self._editor_side_win, margin + card_w + gap, margin)
+        ed.itemconfigure(self._editor_side_win, width=side_w,
+                         height=max(100, h - 2 * margin) if on else max(100, h - margin))
+        self._update_wall_items()
+
+    # ------------------------------------------------------------------
+    # App background image / GIF (wallpaper.py)
+    # ------------------------------------------------------------------
+
+    def _wall_settings(self) -> dict:
+        defaults = {"path": "", "mode": "off", "dim": 0.35, "animate": True}
+        saved = recent_store.get_setting("background", {}) or {}
+        return {**defaults, **{k: v for k, v in saved.items() if k in defaults}}
+
+    def _load_wallpaper(self) -> None:
+        self._wall_cfg = self._wall_settings()
+        self._wall = (wallpaper.load(self._wall_cfg["path"])
+                      if self._wall_cfg["mode"] != "off" else None)
+        self._wall_idx = 0
+        self._wall_cache = {}
+        if getattr(self, "_wall_job", None):
+            self.root.after_cancel(self._wall_job)
+        self._wall_job = None
+        self._editor_view.configure(bg=self.root.cget("bg"))
+        self._layout_editor()
+        self._redraw_preview_bg()
+        if self._wall is not None and self._wall.animated and self._wall_cfg["animate"]:
+            self._wall_job = self.root.after(self._wall.durations[0], self._wall_tick)
+
+    def _wall_active(self) -> bool:
+        return getattr(self, "_wall", None) is not None
+
+    def _wall_dim_color(self) -> tuple:
+        r, g, b = self.root.winfo_rgb(self.root.cget("bg"))
+        return r // 257, g // 257, b // 257
+
+    def _wall_photo(self, size: tuple) -> Optional[ImageTk.PhotoImage]:
+        """The current background frame rendered for an area of `size`
+        (cached per size and frame — sizes change only on resize)."""
+        if not self._wall_active() or size[0] <= 1 or size[1] <= 1:
+            return None
+        cfg = self._wall_cfg
+        key = (size, self._wall_idx, cfg["mode"], cfg["dim"], self.root.cget("bg"))
+        photo = self._wall_cache.get(key)
+        if photo is None:
+            if len(self._wall_cache) > 2 * wallpaper.MAX_FRAMES + 4:
+                self._wall_cache.clear()
+            img = self._wall.render(self._wall_idx, size, cfg["mode"], float(cfg["dim"]),
+                                    self._wall_dim_color())
+            photo = ImageTk.PhotoImage(img)
+            self._wall_cache[key] = photo
+        return photo
+
+    def _update_wall_items(self) -> None:
+        """Point the editor's and the preview's background items at the
+        current frame."""
+        ed = self._editor_view
+        if self._view_var.get() == "editor":
+            photo = self._wall_photo((ed.winfo_width(), ed.winfo_height()))
+            ed.itemconfigure(self._editor_wall_item, image=photo or "")
+        else:
+            # Size is 1x1 until the preview has been laid out; the canvas's
+            # <Configure> redraw then calls back here at the real size.
+            photo = self._wall_photo((self._canvas.winfo_width(), self._canvas.winfo_height()))
+            if self._canvas.find_withtag("wall"):
+                self._canvas.itemconfigure("wall", image=photo or "")
+            elif photo is not None:
+                self._canvas.create_image(0, 0, anchor="nw", image=photo, tags=("wall",))
+                self._canvas.tag_lower("wall")
+
+    def _redraw_preview_bg(self) -> None:
+        if self._cache:
+            self._redraw()
+        else:
+            self._canvas.delete("wall")
+            self._update_wall_items()
+
+    def _wall_tick(self) -> None:
+        self._wall_job = None
+        if not self._wall_active() or not self._wall.animated:
+            return
+        self._wall_idx = (self._wall_idx + 1) % len(self._wall.frames)
+        self._update_wall_items()
+        # Background animation is capped at ~16fps to keep CPU use low.
+        delay = max(60, self._wall.durations[self._wall_idx])
+        self._wall_job = self.root.after(delay, self._wall_tick)
+
+    def _background_dialog(self) -> None:
+        cfg = self._wall_settings()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("App Background")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        path_var = tk.StringVar(value=cfg["path"])
+        mode_var = tk.StringVar(value=cfg["mode"] if cfg["path"] else "off")
+        dim_var = tk.DoubleVar(value=float(cfg["dim"]))
+        anim_var = tk.BooleanVar(value=bool(cfg["animate"]))
+
+        ttk.Label(body, text="Image or GIF shown behind the Editor and the Caption "
+                             "Builder's preview.", foreground="#888", wraplength=380).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(body, text="Picture:").grid(row=1, column=0, sticky="w")
+        name_lbl = ttk.Label(body, text=os.path.basename(cfg["path"]) or "(none)", width=34)
+        name_lbl.grid(row=1, column=1, sticky="w", padx=6)
+
+        def _choose() -> None:
+            p = filedialog.askopenfilename(
+                parent=dlg, title="Choose a background image or GIF",
+                filetypes=[("Images & GIFs", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
+                           ("All files", "*.*")])
+            if not p:
+                return
+            if wallpaper.load(p) is None:
+                messagebox.showerror("App Background", "That file couldn't be opened as an image.",
+                                     parent=dlg)
+                return
+            path_var.set(p)
+            name_lbl.config(text=os.path.basename(p))
+            if mode_var.get() == "off":
+                mode_var.set("fit")
+            _apply()
+
+        ttk.Button(body, text="Choose…", command=_choose).grid(row=1, column=2)
+
+        ttk.Label(body, text="Layout:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        modes = ttk.Frame(body)
+        modes.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(10, 0))
+        for label, value in (("Fit to window", "fit"), ("Tile pattern", "tile"), ("Off", "off")):
+            ttk.Radiobutton(modes, text=label, value=value, variable=mode_var,
+                            command=lambda: _apply()).pack(side="left", padx=(0, 10))
+
+        ttk.Label(body, text="Dim:").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        dim_row = ttk.Frame(body)
+        dim_row.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=(10, 0))
+        dim_lbl = ttk.Label(dim_row, width=5)
+        ttk.Scale(dim_row, from_=0, to=0.85, variable=dim_var, orient="horizontal",
+                  command=lambda _v: (dim_lbl.config(text=f"{dim_var.get():.0%}"),
+                                      _schedule_apply())).pack(side="left", fill="x", expand=True)
+        dim_lbl.config(text=f"{dim_var.get():.0%}")
+        dim_lbl.pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(body, text="Animate GIF backgrounds", variable=anim_var,
+                        command=lambda: _apply()).grid(row=4, column=1, columnspan=2, sticky="w",
+                                                       padx=6, pady=(8, 0))
+        job = {"id": None}
+
+        def _schedule_apply() -> None:
+            if job["id"]:
+                dlg.after_cancel(job["id"])
+            job["id"] = dlg.after(200, _apply)
+
+        def _apply() -> None:
+            job["id"] = None
+            p = path_var.get()
+            stored = p
+            if p and mode_var.get() != "off" and os.path.isfile(p):
+                try:
+                    stored = wallpaper.store_copy(p)
+                except OSError:
+                    stored = p
+                path_var.set(stored)
+            recent_store.set_setting("background", {
+                "path": stored, "mode": mode_var.get() if stored else "off",
+                "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get())})
+            self._load_wallpaper()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side="right")
+
     def _apply_view(self) -> None:
         view = self._view_var.get()
         recent_store.set_setting("view", view)
@@ -3300,12 +3503,14 @@ class CaptionApp:
             self._editor_view.pack(side="top", fill="both", expand=True)
             self._editor_box.focus_set()
             self._update_editor_preview()
+            self.root.after_idle(self._layout_editor)
         else:
             self._sync_editor_to_caption()
             self._editor_view.pack_forget()
             self._right_frame.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
             self._preview_frame.pack(side="left", fill="both", expand=True, padx=(4, 2),
                                      pady=(0, 4))
+            self.root.after(50, self._redraw_preview_bg)  # once it's laid out
         self._schedule_spellcheck(50)
 
     def _sync_caption_to_editor(self) -> None:
@@ -6223,6 +6428,8 @@ class CaptionApp:
 
     def _redraw(self) -> None:
         if not self._cache:
+            if self._view_var.get() == "builder":
+                self._update_wall_items()  # background still fills an empty preview
             return
         if self._view_var.get() == "editor":
             if self._anim_idx == 0:
@@ -6246,6 +6453,7 @@ class CaptionApp:
         self._preview_pil_img = disp  # kept for the color-eyedropper to sample from
         self._tk_img = ImageTk.PhotoImage(disp)
         self._canvas.delete("all")
+        self._update_wall_items()  # app background (if any) underneath
         self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._tk_img)
 
     def _start_anim(self) -> None:

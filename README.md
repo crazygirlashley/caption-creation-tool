@@ -8,6 +8,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 
 ## Features
 
+- **App background** — **⚙ Settings → Background…** puts an image or animated GIF behind the Editor (around its writing and sidebar cards) and the Caption Builder's preview, **fit to the window** or **tiled** as a repeating pattern, with a **dim** slider so text stays readable (it dims toward the current theme's color) and an option to pause GIF animation. The picture is copied into `backgrounds/` so it keeps working if the original moves; works with every theme
 - **Editor and Caption Builder views** — the toolbar's **✍ Editor / 🖼 Caption Builder** toggle switches between a focused writing view and the image builder. The Editor is a full-width writing space for the caption story with the AI tools as one-click buttons (write from a prompt, Smooth & polish, Shorten to fit, Add more detail, Fix spelling & grammar, custom instruction), spell check, a live word count that says whether the text fits beside the image at a readable size, and a small live preview of the caption on the image. Both views edit the same caption; the app reopens in whichever you used last
 - **Standard format** — image on the left, styled text panel on the right
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
@@ -311,6 +312,7 @@ caption-creation-tool/
 ├── caption_creator.py        # Main application
 ├── ai_writer.py              # Local-LLM caption story writer (OpenAI-compatible API)
 ├── da_client.py              # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
+├── wallpaper.py              # App background image/GIF rendering (fit / tile / dim)
 ├── web_lookup.py             # Barnorama/AcidCow search client (Find Online…)
 ├── themes.py                 # UI theme loader/applier (⚙ Settings → Theme)
 ├── assets/
