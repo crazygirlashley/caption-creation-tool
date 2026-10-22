@@ -99,6 +99,52 @@ class StreamTests(unittest.TestCase):
         self.assertEqual([r["url"] for r in wl.search("bikini")], ["https://a/1"])
 
 
+class SexComTests(unittest.TestCase):
+    """_search_sexcom against a fake session — no network."""
+
+    class _Resp:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    def setUp(self):
+        self.calls = []
+        self.orig = wl._SESSION.get
+
+        def fake_get(url, params=None, timeout=None):
+            self.calls.append((url, dict(params or {})))
+            return self._Resp({"data": [
+                {"uri": "/images/pinporn/2020/01/01/1.jpg", "title": "Gorgeous blonde in red"},
+                {"uri": "/images/pinporn/2020/01/01/2.jpg", "title": "Blonde #teen #petite"},
+                {"uri": "", "title": "no image"},
+            ]})
+        wl._SESSION.get = fake_get
+
+    def tearDown(self):
+        wl._SESSION.get = self.orig
+
+    def test_groups_pins_and_filters_titles(self):
+        posts = wl._search_sexcom("blonde woman", 1)
+        self.assertEqual([p["title"] for p in posts],
+                         ["sex.com pictures: blonde (1)", "sex.com GIFs: blonde (1)"])
+        self.assertEqual(self.calls[0][1]["search"], "blonde")
+        self.assertEqual(self.calls[0][1]["sexual-orientation"], "straight")
+        items = wl.fetch_gallery(posts[0]["url"])
+        self.assertEqual(items[0]["url"], "https://cdn.sex.com/images/pinporn/2020/01/01/1.jpg")
+        self.assertTrue(items[0]["thumb"].endswith("?width=300"))
+        self.assertTrue(wl.fetch_gallery(posts[1]["url"])[0]["gif"])
+
+    def test_male_subjects_use_gay_orientation(self):
+        wl._search_sexcom("muscular men", 1)
+        self.assertEqual(self.calls[0][1]["sexual-orientation"], "gay")
+        self.assertEqual(self.calls[0][1]["search"], "muscular")
+
+
 class GalleryItemTests(unittest.TestCase):
     def test_gif_detection_and_thumb_fallback(self):
         item = wl._gallery_item("https://cdn.x/pics/a.GIF")

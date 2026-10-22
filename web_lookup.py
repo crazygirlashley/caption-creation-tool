@@ -52,6 +52,13 @@ import app_paths
 
 _BARNORAMA_BASE = "https://www.barnorama.com"
 _ACIDCOW_BASE = "https://acidcow.com"
+# sex.com: its pages render client-side, but the JSON search API they call
+# (/portal/api/{pictures,gifs}/search — allowed by its robots.txt) returns
+# each pin's title and image path; files are served from cdn.sex.com, which
+# also resizes on request (?width=N) for previews.
+_SEXCOM_API = "https://www.sex.com/portal/api/{kind}/search"
+_SEXCOM_CDN = "https://cdn.sex.com"
+_SEXCOM_PAGE_SIZE = 40
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CaptionCreator/1.0"
 _TIMEOUT = 15
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
@@ -399,6 +406,51 @@ def _search_acidcow(query: str, page: int) -> list:
     return results
 
 
+# sex.com results are single pins, not gallery posts, so each search's pins
+# are grouped into one pseudo-post per kind ("sexcom:<kind>:<term>:<page>");
+# fetch_gallery() serves its items from here.
+_SEXCOM_GROUPS: dict = {}
+_sexcom_lock = threading.Lock()
+
+
+def _search_sexcom(query: str, page: int) -> list:
+    terms = query.lower().split()
+    male = set(_SYNONYM_GROUPS[1])
+    gender = set().union(*_SYNONYM_GROUPS[:2])
+    # Its search matches whole phrases poorly ("redhead man" -> 0), so use
+    # the most distinctive term; male subjects live under "gay".
+    term = next((t for t in terms if t not in gender), terms[0] if terms else "")
+    if not term:
+        return []
+    orientation = "gay" if any(t in male for t in terms) else "straight"
+    posts = []
+    for kind, label in (("pictures", "pictures"), ("gifs", "GIFs")):
+        resp = _SESSION.get(_SEXCOM_API.format(kind=kind), timeout=_TIMEOUT, params={
+            "search": term, "sexual-orientation": orientation, "order": "likeCount",
+            "page": page, "limit": _SEXCOM_PAGE_SIZE})
+        resp.raise_for_status()
+        items = []
+        for pin in resp.json().get("data", []):
+            uri = pin.get("uri") or ""
+            title = re.sub(r"\s+", " ", pin.get("title") or "")
+            if not uri.startswith("/") or _is_excluded_title(title):
+                continue
+            url = _SEXCOM_CDN + uri
+            item = _gallery_item(url, url + "?width=300")
+            item["gif"] = kind == "gifs" or item["gif"]
+            items.append(item)
+        if not items:
+            continue
+        key = f"sexcom:{kind}:{term}:{orientation}:{page}"
+        with _sexcom_lock:
+            _SEXCOM_GROUPS[key] = items
+            while len(_SEXCOM_GROUPS) > 50:
+                _SEXCOM_GROUPS.pop(next(iter(_SEXCOM_GROUPS)))
+        posts.append({"title": f"sex.com {label}: {term} ({len(items)})", "url": key,
+                      "thumb_url": items[0]["thumb"]})
+    return posts
+
+
 def _rank_results(results: list, query: str) -> list:
     """Sort results the way a web search does: the query's first word is
     the primary term and decides who's in the top tier, exactly like
@@ -473,6 +525,7 @@ def search_stream(query: str, page: int = 1):
         distinctive = next((t for t in terms if t.lower() not in gender), terms[0])
         queries.append(distinctive)
     jobs = [(src, q) for q in queries for src in (_search_barnorama, _search_acidcow)]
+    jobs.append((_search_sexcom, query))  # picks its own single term
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = [pool.submit(src, q, page) for src, q in jobs]
@@ -543,6 +596,9 @@ def fetch_gallery(post_url: str) -> list:
     """Return the images embedded in a post as [{"url", "thumb", "gif"}],
     in page order. Dispatches on post_url's host, since Barnorama and
     AcidCow need different selectors."""
+    if post_url.startswith("sexcom:"):
+        with _sexcom_lock:
+            return list(_SEXCOM_GROUPS.get(post_url, []))
     host = urllib.parse.urlparse(post_url).netloc
     if "acidcow.com" in host:
         return _fetch_gallery_acidcow(post_url)

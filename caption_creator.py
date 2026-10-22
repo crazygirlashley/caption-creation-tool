@@ -3859,7 +3859,7 @@ class CaptionApp:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Find Online — Barnorama + AcidCow")
+        win.title("Find Online — Barnorama + AcidCow + sex.com")
         if not hasattr(self, "_wl_single_var"):
             self._wl_single_var = tk.BooleanVar(value=True)
         # Load the face detector now (~1s) rather than on the first preview.
