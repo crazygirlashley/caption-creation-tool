@@ -27,6 +27,11 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
 
+try:  # drag-and-drop support (optional: the app works without it)
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+except ImportError:  # pragma: no cover
+    TkinterDnD = None
+
 import ai_writer
 import da_client
 import recent_store
@@ -1810,6 +1815,7 @@ class CaptionApp:
         self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
+        self._setup_drop_target()
 
         # Format selector + Reload + Apply
         fmt_bar = tk.Frame(right, bg=right.cget("bg"))
@@ -2868,6 +2874,86 @@ class CaptionApp:
         else:
             return
         self._safe_refresh()
+
+    _OPENABLE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".mp4")
+
+    def _setup_drop_target(self) -> None:
+        """Accept files (and image links dragged from a browser) dropped
+        anywhere on the main window. Needs the root to be a TkinterDnD.Tk
+        (see main()); silently does nothing otherwise."""
+        if not hasattr(self.root, "drop_target_register"):
+            return
+        try:
+            self.root.drop_target_register(DND_FILES, DND_TEXT)
+        except tk.TclError:
+            return
+        canvas_bg = self._canvas.cget("bg")
+
+        def _enter(event):
+            self._canvas.config(bg="#3a4a5a")
+            return event.action
+
+        def _leave(event):
+            self._canvas.config(bg=canvas_bg)
+            return event.action
+
+        def _drop(event):
+            self._canvas.config(bg=canvas_bg)
+            self.root.after(0, lambda d=event.data, t=event.type: self._on_drop(d, t))
+            return event.action
+
+        self.root.dnd_bind("<<DropEnter>>", _enter)
+        self.root.dnd_bind("<<DropLeave>>", _leave)
+        self.root.dnd_bind("<<Drop>>", _drop)
+
+    def _on_drop(self, data: str, kind: str) -> None:
+        items = [i for i in self.root.tk.splitlist(data) if i.strip()]
+        if not items:
+            return
+        files = [i for i in items if os.path.isfile(i)]
+        if not files:
+            url = items[0].strip()
+            if url.lower().startswith(("http://", "https://")):
+                self._open_dropped_url(url)
+            return
+        projects = [f for f in files if f.lower().endswith(".ccproj")]
+        if projects:
+            self._open_project(projects[0])
+            return
+        openable = [f for f in files if f.lower().endswith(self._OPENABLE_EXTS)]
+        if not openable:
+            messagebox.showinfo("Open", "Drop an image, GIF, MP4 or .ccproj project.")
+            return
+        if len(openable) > 1 and hasattr(self, "_batch_export"):
+            if messagebox.askyesno(
+                    "Several files dropped",
+                    f"{len(openable)} files were dropped.\n\nBatch-export all of them "
+                    "with the current caption and format? (No opens just the first.)"):
+                self._batch_export(openable)
+                return
+        self._load_source(openable[0])
+
+    def _open_dropped_url(self, url: str) -> None:
+        """An image dragged from a web browser arrives as its URL —
+        download it like a Find Online pick and open it."""
+        self._status.config(text="Downloading dropped image…")
+
+        def _work() -> None:
+            try:
+                path = web_lookup.download_to_tempfile(url)
+                err = None
+            except Exception as e:
+                path, err = None, e
+            self.root.after(0, lambda: _done(path, err))
+
+        def _done(path: Optional[str], err) -> None:
+            if err is not None or not path:
+                self._status.config(text="")
+                messagebox.showerror("Open", f"Couldn't download the dropped image:\n{err}")
+                return
+            self._load_source(path, is_temp_download=True, source_url=url)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _bind_shortcuts(self) -> None:
         """Ctrl+O opens a file and Ctrl+S saves the output, from anywhere in
@@ -5501,7 +5587,9 @@ class CaptionApp:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    root = tk.Tk()
+    # TkinterDnD.Tk is a tk.Tk with the tkdnd extension loaded — needed for
+    # dropping files onto the window (see CaptionApp._setup_drop_target).
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     root.geometry("1100x680")
 
     # logo.png is the window/taskbar icon shown top-left next to the title —
