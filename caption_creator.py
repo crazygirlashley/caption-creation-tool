@@ -1745,7 +1745,9 @@ class CaptionApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        self._build_editor_view()  # needs the builder's caption box to exist
         self._on_format_change()  # sync all fields to the initially-selected format
+        self._apply_view()  # open in the last-used view (Editor by default)
         self._auto_detect_watermark()
         self.root.after(100, self._da_update_status)
         if self._warn_aardvark:
@@ -1783,10 +1785,16 @@ class CaptionApp:
         # now instead of as standalone toolbar buttons.
         self._settings_btn = ttk.Button(bar, text="⚙ Settings", command=self._open_settings_menu)
         self._settings_btn.pack(side="right", padx=4)
+        # Editor (write the caption) / Caption Builder (put it on the image).
+        self._view_var = tk.StringVar(value=recent_store.get_setting("view", "editor"))
+        for label, value in (("✍ Editor", "editor"), ("🖼 Caption Builder", "builder")):
+            ttk.Radiobutton(bar, text=label, value=value, variable=self._view_var,
+                            style="Toolbutton", command=self._apply_view).pack(side="left", padx=(0, 2))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
         ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
         ttk.Button(bar, text="Find Online…", command=self._web_lookup).pack(side="left", padx=4)
         ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
-        file_btn = ttk.Menubutton(bar, text="File ▾")
+        file_btn = ttk.Menubutton(bar, text="File")
         self._file_menu = tk.Menu(file_btn, tearoff=False, postcommand=self._fill_file_menu)
         file_btn.config(menu=self._file_menu)
         file_btn.pack(side="left", padx=4)
@@ -2027,9 +2035,9 @@ class CaptionApp:
         # (self._ai_btn is the row — hidden with the caption box in chat mode.)
         self._ai_btn = ttk.Frame(f)
         self._ai_btn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Button(self._ai_btn, text="✍ Write with AI…",
+        ttk.Button(self._ai_btn, text="✍ AI Write…",
                    command=self._open_ai_writer).pack(side="left")
-        self._ai_edit_btn = ttk.Menubutton(self._ai_btn, text="✨ Edit with AI ▾")
+        self._ai_edit_btn = ttk.Menubutton(self._ai_btn, text="✨ AI Edit")
         self._ai_edit_menu = tk.Menu(self._ai_edit_btn, tearoff=False,
                                      postcommand=self._fill_ai_edit_menu)
         self._ai_edit_btn.config(menu=self._ai_edit_menu)
@@ -2713,7 +2721,7 @@ class CaptionApp:
 
     def _ai_edit_target(self) -> tuple:
         """(start index, end index, text): the selection, or the whole caption."""
-        box = self._text_box
+        box = self._text_target()
         try:
             start, end = box.index("sel.first"), box.index("sel.last")
         except tk.TclError:
@@ -2724,7 +2732,7 @@ class CaptionApp:
         """Word targets per action for the current caption/selection."""
         _s, _e, text = self._ai_edit_target()
         n = len(text.split())
-        full = self._text_box.get("1.0", "end-1c")
+        full = self._text_target().get("1.0", "end-1c")
         raw = self._gather_raw_params()
         shorten = n
         if raw is not None:
@@ -2741,7 +2749,7 @@ class CaptionApp:
             menu.add_command(label="■ Stop editing", command=self._ai_edit_cancel.set)
             return
         _s, _e, text = self._ai_edit_target()
-        scope = "selection" if self._text_box.tag_ranges("sel") else "caption"
+        scope = "selection" if self._text_target().tag_ranges("sel") else "caption"
         if not text.strip():
             menu.add_command(label="Type or write a caption first", state="disabled")
             return
@@ -2774,7 +2782,7 @@ class CaptionApp:
         if not settings:
             return
         instruction = ai_writer.edit_instruction(action, words, custom)
-        box = self._text_box
+        box = self._text_target()
         # One undo step for the whole edit; streamed text goes in at a mark.
         box.edit_separator()
         box.config(autoseparators=False)
@@ -2783,7 +2791,8 @@ class CaptionApp:
         box.mark_gravity("ai_edit", "right")
         cancel = threading.Event()
         self._ai_edit_cancel = cancel
-        self._ai_edit_btn.config(text="■ AI editing… ▾")
+        self._ai_edit_btn.config(text="■ AI editing…")
+        self._update_editor_ai_buttons()
         label = ai_writer.EDIT_ACTIONS.get(action, ("Custom edit",))[0]
         self._status.config(text=f"AI: {label}…")
         state = {"wrote": False}
@@ -2808,7 +2817,8 @@ class CaptionApp:
 
         def _finish(err: Optional[str]) -> None:
             self._ai_edit_cancel = None
-            self._ai_edit_btn.config(text="✨ Edit with AI ▾")
+            self._ai_edit_btn.config(text="✨ AI Edit")
+            self._update_editor_ai_buttons()
             if err or cancel.is_set() or not state["wrote"]:
                 # Put the original back — a half-rewritten caption isn't useful.
                 box.delete(start, "ai_edit")
@@ -2821,6 +2831,7 @@ class CaptionApp:
             if err:
                 messagebox.showerror("Edit with AI", err)
             self._schedule_spellcheck()
+            self._sync_editor_to_caption()
             self._safe_refresh()
 
         threading.Thread(target=_work, daemon=True).start()
@@ -2830,15 +2841,17 @@ class CaptionApp:
     # ------------------------------------------------------------------
 
     def _setup_spellcheck(self, box: tk.Text) -> None:
-        self._spell_var = tk.BooleanVar(value=True)
-        self._spell_ignored: set = set()
-        self._spell_job = None
+        if not hasattr(self, "_spell_var"):
+            self._spell_var = tk.BooleanVar(value=True)
+            self._spell_ignored: set = set()
+            self._spell_job = None
         box.tag_configure("misspelled", underline=True, underlinefg="#e0393e")
         box.tag_configure("grammar", underline=True, underlinefg="#2f80ed")
         box.bind("<KeyRelease>", lambda _e: self._schedule_spellcheck(), add="+")
         box.bind("<Button-3>", lambda e: self._caption_context_menu(e))
         # Load the dictionary off the main thread so the first check is instant.
-        threading.Thread(target=spellcheck.available, daemon=True).start()
+        if box is self._text_box:
+            threading.Thread(target=spellcheck.available, daemon=True).start()
 
     def _schedule_spellcheck(self, delay_ms: int = 400) -> None:
         if getattr(self, "_spell_job", None):
@@ -2847,7 +2860,11 @@ class CaptionApp:
 
     def _run_spellcheck(self) -> None:
         self._spell_job = None
-        box = self._text_box
+        box = self._text_target()
+        other = self._text_box if box is not self._text_box else getattr(self, "_editor_box", None)
+        if other is not None:
+            other.tag_remove("misspelled", "1.0", "end")
+            other.tag_remove("grammar", "1.0", "end")
         box.tag_remove("misspelled", "1.0", "end")
         box.tag_remove("grammar", "1.0", "end")
         if not self._spell_var.get() or self._ai_edit_cancel is not None:
@@ -2861,7 +2878,7 @@ class CaptionApp:
             box.tag_add("grammar", f"1.0+{start}c", f"1.0+{end}c")
 
     def _caption_context_menu(self, event) -> str:
-        box = self._text_box
+        box = event.widget if isinstance(event.widget, tk.Text) else self._text_target()
         index = box.index(f"@{event.x},{event.y}")
         menu = tk.Menu(self.root, tearoff=False)
         tags = box.tag_names(index)
@@ -2912,7 +2929,7 @@ class CaptionApp:
         return "break"
 
     def _replace_text(self, start: str, end: str, new: str) -> None:
-        box = self._text_box
+        box = self._text_target()
         box.edit_separator()
         box.delete(start, end)
         box.insert(start, new)
@@ -2921,14 +2938,17 @@ class CaptionApp:
 
     def _text_edit(self, op: str) -> None:
         try:
-            getattr(self._text_box, op)()
+            getattr(self._text_target(), op)()
         except tk.TclError:
             pass  # nothing to undo/redo
         self._after_caption_edit()
 
     def _after_caption_edit(self) -> None:
         self._schedule_spellcheck(50)
-        self._on_text_keyrelease()
+        if self._view_var.get() == "editor":
+            self._schedule_editor_sync()
+        else:
+            self._on_text_keyrelease()
 
     def _open_ai_writer(self) -> None:
         """Prompt → story dialog. The story streams straight into the
@@ -2996,17 +3016,19 @@ class CaptionApp:
         state = {"cancel": None, "words": 0}
 
         def _append(chunk: str) -> None:
-            self._text_box.insert("end-1c", chunk)
-            self._text_box.see("end")
+            state["target"].insert("end-1c", chunk)
+            state["target"].see("end")
             state["words"] += chunk.count(" ")
             status.config(text=f"Writing… ~{state['words']} words")
 
         def _finish(err: Optional[str], cancelled: bool) -> None:
             state["cancel"] = None
-            if self._text_box.winfo_exists():
-                self._text_box.edit_separator()
-                self._text_box.config(autoseparators=True)
+            target = state.get("target") or self._text_box
+            if target.winfo_exists():
+                target.edit_separator()
+                target.config(autoseparators=True)
                 self._schedule_spellcheck()
+                self._sync_editor_to_caption()
             if win.winfo_exists():
                 gen_btn.config(state="normal")
                 stop_btn.config(state="disabled")
@@ -3027,13 +3049,16 @@ class CaptionApp:
             self._ai_last_prompt = prompt
             self._ai_last_length = length_var.get()
             words = ai_writer.LENGTHS.get(length_var.get(), 120)
-            # The whole run (clear + every streamed chunk) is one undo step.
-            self._text_box.edit_separator()
-            self._text_box.config(autoseparators=False)
+            # The whole run (clear + every streamed chunk) is one undo step,
+            # written into whichever caption editor is showing.
+            target = self._text_target()
+            state["target"] = target
+            target.edit_separator()
+            target.config(autoseparators=False)
             if mode_var.get() == "replace":
-                self._text_box.delete("1.0", "end")
-            elif self._text_box.get("1.0", "end-1c").strip():
-                self._text_box.insert("end-1c", "\n\n")
+                target.delete("1.0", "end")
+            elif target.get("1.0", "end-1c").strip():
+                target.insert("end-1c", "\n\n")
             gen_btn.config(state="disabled")
             stop_btn.config(state="normal")
             state["words"] = 0
@@ -3093,7 +3118,8 @@ class CaptionApp:
         self._right_frame.configure(bg=colors["bg"])
         self._fmt_bar.configure(bg=colors["bg"])
         self._pill_frame.configure(bg=colors["bg"])
-        for box in (self._text_box, self._header_text_box, self._footer_text_box):
+        for box in (self._text_box, self._header_text_box, self._footer_text_box,
+                    self._editor_box):
             box.configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
         for rw in getattr(self, "_chat_row_widgets", []):
             rw["text"].configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
@@ -3178,6 +3204,190 @@ class CaptionApp:
         else:
             return
         self._safe_refresh()
+
+    # ------------------------------------------------------------------
+    # Editor view — a focused writing space for the caption story; the
+    # Caption Builder (image, formats, export) is the other view. Both edit
+    # the same caption: the editor's text is copied into the builder's
+    # caption box as you type (see _sync_editor_to_caption).
+    # ------------------------------------------------------------------
+
+    def _text_target(self) -> tk.Text:
+        """The caption text box that's currently showing."""
+        if getattr(self, "_view_var", None) is not None and self._view_var.get() == "editor" \
+                and getattr(self, "_editor_box", None) is not None:
+            return self._editor_box
+        return self._text_box
+
+    def _build_editor_view(self) -> None:
+        ed = ttk.Frame(self.root, padding=(10, 4, 10, 6))
+        self._editor_view = ed
+        ed.columnconfigure(0, weight=1)
+        ed.rowconfigure(0, weight=1)
+
+        # Writing area
+        text_frame = ttk.Frame(ed)
+        text_frame.grid(row=0, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        self._editor_box = tk.Text(
+            text_frame, wrap="word", undo=True, autoseparators=True, maxundo=-1,
+            font=("Georgia", 13), padx=28, pady=20, relief="flat", bd=0,
+            spacing1=2, spacing2=3, spacing3=10, insertwidth=2, highlightthickness=1)
+        self._editor_box.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self._editor_box.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self._editor_box.configure(yscrollcommand=scroll.set)
+        self._editor_box.bind("<KeyRelease>", lambda _e: self._schedule_editor_sync())
+        self._editor_box.bind("<<Paste>>", lambda _e: self.root.after(10, self._schedule_editor_sync),
+                              add="+")
+        self._setup_spellcheck(self._editor_box)
+        self._editor_stats = ttk.Label(ed, text="", foreground="#888")
+        self._editor_stats.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # Sidebar
+        side = ttk.Frame(ed, width=330)
+        side.grid(row=0, column=1, rowspan=2, sticky="ns", padx=(12, 0))
+        side.grid_propagate(False)
+        side.columnconfigure(0, weight=1)
+
+        ai = ttk.LabelFrame(side, text="AI writing", padding=8)
+        ai.grid(row=0, column=0, sticky="ew")
+        ai.columnconfigure(0, weight=1)
+        ttk.Button(ai, text="✍ Write a story from a prompt…",
+                   command=self._open_ai_writer).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._editor_ai_buttons = []
+        actions = [(key, label) for key, (label, _i) in ai_writer.EDIT_ACTIONS.items()]
+        actions.append(("custom", "Custom instruction…"))
+        for i, (key, label) in enumerate(actions, start=1):
+            btn = ttk.Button(ai, text=label, command=lambda k=key: self._run_ai_edit(k))
+            btn.grid(row=i, column=0, sticky="ew", pady=1)
+            self._editor_ai_buttons.append(btn)
+        self._editor_stop_btn = ttk.Button(ai, text="■ Stop", state="disabled",
+                                           command=lambda: self._ai_edit_cancel and
+                                           self._ai_edit_cancel.set())
+        self._editor_stop_btn.grid(row=len(actions) + 1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(ai, text="Select text first to change only that part.",
+                  foreground="#888", wraplength=290).grid(row=len(actions) + 2, column=0,
+                                                         sticky="w", pady=(6, 0))
+        ttk.Checkbutton(ai, text="Check spelling & grammar", variable=self._spell_var,
+                        command=self._run_spellcheck).grid(row=len(actions) + 3, column=0,
+                                                           sticky="w", pady=(4, 0))
+
+        pv = ttk.LabelFrame(side, text="On the image", padding=8)
+        pv.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        pv.columnconfigure(0, weight=1)
+        self._editor_preview = tk.Label(pv, text="No image yet", foreground="#888",
+                                        bg=self.root.cget("bg"))
+        self._editor_preview.grid(row=0, column=0, sticky="ew")
+        row = ttk.Frame(pv)
+        row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(row, text="Open image…", command=self._open).pack(side="left")
+        ttk.Button(row, text="Find online…", command=self._web_lookup).pack(side="left", padx=4)
+        ttk.Button(pv, text="Caption Builder →",
+                   command=lambda: (self._view_var.set("builder"), self._apply_view())).grid(
+            row=2, column=0, sticky="ew", pady=(8, 0))
+        self._editor_preview_photo = None
+        self._editor_sync_job = None
+
+    def _apply_view(self) -> None:
+        view = self._view_var.get()
+        recent_store.set_setting("view", view)
+        if view == "editor":
+            self._right_frame.pack_forget()
+            self._preview_frame.pack_forget()
+            self._sync_caption_to_editor()
+            self._editor_view.pack(side="top", fill="both", expand=True)
+            self._editor_box.focus_set()
+            self._update_editor_preview()
+        else:
+            self._sync_editor_to_caption()
+            self._editor_view.pack_forget()
+            self._right_frame.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
+            self._preview_frame.pack(side="left", fill="both", expand=True, padx=(4, 2),
+                                     pady=(0, 4))
+        self._schedule_spellcheck(50)
+
+    def _sync_caption_to_editor(self) -> None:
+        text = self._text_box.get("1.0", "end-1c")
+        if text != self._editor_box.get("1.0", "end-1c"):
+            self._editor_box.delete("1.0", "end")
+            self._editor_box.insert("1.0", text)
+            self._editor_box.edit_reset()
+        self._update_editor_stats()
+
+    def _sync_editor_to_caption(self) -> None:
+        """Copy the editor's text into the builder's caption box (the one
+        rendering reads), refreshing the preview if it changed."""
+        if getattr(self, "_editor_sync_job", None):
+            self.root.after_cancel(self._editor_sync_job)
+            self._editor_sync_job = None
+        if self._text_target() is not self._editor_box:
+            return
+        if self._flush_editor():
+            self._on_text_keyrelease()
+        self._update_editor_stats()
+
+    def _flush_editor(self) -> bool:
+        """Copy the editor's text into the caption box right now (no
+        refresh). True if it changed. Called before anything reads the
+        caption, so a save made a split second after typing is current."""
+        if getattr(self, "_editor_box", None) is None or self._text_target() is not self._editor_box:
+            return False
+        text = self._editor_box.get("1.0", "end-1c")
+        if text == self._text_box.get("1.0", "end-1c"):
+            return False
+        self._text_box.delete("1.0", "end")
+        self._text_box.insert("1.0", text)
+        return True
+
+    def _schedule_editor_sync(self, delay_ms: int = 350) -> None:
+        if self._editor_sync_job:
+            self.root.after_cancel(self._editor_sync_job)
+        self._editor_sync_job = self.root.after(delay_ms, self._sync_editor_to_caption)
+
+    def _update_editor_stats(self) -> None:
+        text = self._editor_box.get("1.0", "end-1c")
+        words = len(text.split())
+        parts = [f"{words} words", f"{len(text)} characters",
+                 f"~{max(1, round(words / 230))} min read" if words else "empty"]
+        raw = self._gather_raw_params() if self._frames else None
+        fmt_data = self._formats.get(self._format_var.get(), {})
+        if fmt_data.get("chat_mode"):
+            parts.append("Text Message format uses chat bubbles — edit them in Caption Builder")
+            color = "#888"
+        elif raw is not None and words:
+            fit = _words_that_fit(text, raw)
+            if fit >= words:
+                parts.append("✓ fits beside the image at a readable size")
+                color = "#2e8b57"
+            else:
+                parts.append(f"⚠ about {fit} words fit beside the image at a readable size "
+                             "— try Shorten to fit")
+                color = "#b8860b"
+        else:
+            color = "#888"
+        self._editor_stats.config(text="   ·   ".join(parts), foreground=color)
+
+    def _update_editor_preview(self) -> None:
+        """Small still of the caption on the image, in the editor sidebar."""
+        if getattr(self, "_view_var", None) is None or self._view_var.get() != "editor":
+            return
+        if not self._cache:
+            self._editor_preview.config(image="", text="No image yet")
+            self._editor_preview_photo = None
+            return
+        img = self._cache[0].convert("RGB")
+        img.thumbnail((310, 260), Image.LANCZOS)
+        self._editor_preview_photo = ImageTk.PhotoImage(img)
+        self._editor_preview.config(image=self._editor_preview_photo, text="")
+
+    def _update_editor_ai_buttons(self) -> None:
+        running = self._ai_edit_cancel is not None
+        for btn in getattr(self, "_editor_ai_buttons", []):
+            btn.config(state="disabled" if running else "normal")
+        if hasattr(self, "_editor_stop_btn"):
+            self._editor_stop_btn.config(state="normal" if running else "disabled")
 
     _OPENABLE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".mp4")
 
@@ -4640,6 +4850,7 @@ class CaptionApp:
         """Plain-text equivalent of the caption for consumers that don't
         need chat-bubble structure (Find Online's default search query, the
         Send-to-DA description prefill)."""
+        self._flush_editor()
         fmt_data = self._formats.get(self._format_var.get(), {})
         if fmt_data.get("chat_mode", False):
             return "\n".join(
@@ -4653,6 +4864,7 @@ class CaptionApp:
         itself, so it's fast. The returned dict holds no Tk objects, so it's
         safe to hand off to a background thread for the expensive part (see
         _resolve_composite_kwargs)."""
+        self._flush_editor()
         fmt = self._format_var.get()
         fmt_data = self._formats.get(fmt, {})
         header_enabled = fmt_data.get("header_enabled", False)
@@ -5875,6 +6087,8 @@ class CaptionApp:
         self._text_box.delete("1.0", "end")
         self._text_box.insert("1.0", data.get("caption", ""))
         self._text_box.edit_reset()
+        if self._view_var.get() == "editor":
+            self._sync_caption_to_editor()
         self._schedule_spellcheck()
         if data.get("chat_messages"):
             self._chat_messages = [dict(m) for m in data["chat_messages"]]
@@ -6010,6 +6224,10 @@ class CaptionApp:
     def _redraw(self) -> None:
         if not self._cache:
             return
+        if self._view_var.get() == "editor":
+            if self._anim_idx == 0:
+                self._update_editor_preview()
+            return  # the builder canvas isn't showing
         img = self._cache[self._anim_idx]
         cw = max(self._canvas.winfo_width(), 10)
         ch = max(self._canvas.winfo_height(), 10)

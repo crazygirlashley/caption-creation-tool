@@ -66,3 +66,19 @@ def clear(kind: str) -> None:
     data = _load()
     data[kind] = []
     _save(data)
+
+
+def get_setting(key: str, default=None):
+    """Small UI preferences (e.g. the last-used view) kept alongside the
+    recent lists."""
+    return _load().get("settings", {}).get(key, default)
+
+
+def set_setting(key: str, value) -> None:
+    data = _load()
+    settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+    if settings.get(key) == value:
+        return
+    settings[key] = value
+    data["settings"] = settings
+    _save(data)
