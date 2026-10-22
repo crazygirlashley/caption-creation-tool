@@ -143,11 +143,9 @@ class CompositeTests(unittest.TestCase):
         self.assertEqual(blue.getpixel((5, 5))[:3], (0, 0, 255))
 
     def test_auto_watermark_height_scales_with_image(self):
-        # 1/6 of the canvas height: the image alone side by side, image +
-        # caption panel when the caption sits below.
-        self.assertEqual(cc._auto_watermark_height((350, 242), 300), 40)
-        self.assertEqual(cc._auto_watermark_height((2000, 1500), 600), 250)
-        self.assertEqual(cc._auto_watermark_height((350, 242), 160, "vertical"), 67)
+        # 1/6 of the image's own height, whatever the layout.
+        self.assertEqual(cc._auto_watermark_height((350, 242)), 40)
+        self.assertEqual(cc._auto_watermark_height((2000, 1500)), 250)
 
 
 class EmojiTests(unittest.TestCase):
