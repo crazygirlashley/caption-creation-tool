@@ -336,8 +336,29 @@ _DEFERRED_SIZE_SAMPLE_FRAMES = 30
 # expand into their actual image galleries, and how many images to pull from
 # each, so a single search stays a bounded number of network requests rather
 # than fetching every image in every matching post's gallery (some run 40+).
-_WL_MAX_POSTS_TO_EXPAND = 10
+_WL_MAX_POSTS_TO_EXPAND = 12
 _WL_MAX_IMAGES_PER_POST = 6
+# Images previewed per post for its inline strip — more than are shown, so
+# the strip can still fill up after "Single person only" hides some.
+_WL_STRIP_CANDIDATES = 12
+
+# Shared, bounded worker pools for Find Online: gallery pages and preview
+# thumbnails. Previously every thumbnail started its own thread and pulled
+# the full-size image (multi-MB GIFs included) just to show 130px of it.
+import concurrent.futures as _cf
+_WL_GALLERY_POOL = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="wl-gallery")
+_WL_PREVIEW_POOL = _cf.ThreadPoolExecutor(max_workers=6, thread_name_prefix="wl-preview")
+
+
+def _wl_badge_gif(img: Image.Image) -> Image.Image:
+    """Stamp a small "GIF" tag on a preview so animated results stand out."""
+    img = img.copy()
+    d = ImageDraw.Draw(img)
+    font = _pil_font("Arial", 11, bold=True)
+    w = d.textbbox((0, 0), "GIF", font=font)[2] + 8
+    d.rectangle((2, 2, 2 + w, 17), fill=(20, 20, 20))
+    d.text((6, 3), "GIF", font=font, fill=(255, 255, 255))
+    return img
 
 
 def _human_size(num_bytes: float) -> str:
@@ -3165,6 +3186,10 @@ class CaptionApp:
 
         win = tk.Toplevel(self.root)
         win.title("Find Online — Barnorama + AcidCow")
+        if not hasattr(self, "_wl_single_var"):
+            self._wl_single_var = tk.BooleanVar(value=True)
+        # Load the face detector now (~1s) rather than on the first preview.
+        _WL_PREVIEW_POOL.submit(web_lookup.count_faces, Image.new("RGB", (64, 64)))
         win.geometry("860x620")
         self._wl_win = win
         self._wl_page = 1
@@ -3186,6 +3211,8 @@ class CaptionApp:
         entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         search_btn = ttk.Button(search_row, text="Search")
         search_btn.pack(side="left")
+        ttk.Checkbutton(search_row, text="Single person only", variable=self._wl_single_var,
+                        command=self._wl_apply_filter_all).pack(side="left", padx=(10, 0))
         self._wl_query_var = query_var
 
         status_lbl = ttk.Label(win, text="", foreground="#888", padding=(8, 2), wraplength=820,
@@ -3236,6 +3263,7 @@ class CaptionApp:
             w.destroy()
         self._wl_thumbs = []
         self._wl_image_buttons = []
+        self._wl_blocks: list = []
         # A fresh token per search — the Entry is never disabled while a
         # search is in flight (only the buttons are), so pressing Enter
         # again before the first request returns can start a second one.
@@ -3251,48 +3279,54 @@ class CaptionApp:
         self._wl_page_lbl.config(text=f"Page {page}")
 
         def _work() -> None:
+            # Results stream in per source (Barnorama answers in ~1s,
+            # AcidCow's search takes ~5s), and each post's gallery page is
+            # fetched on the shared pool as soon as the post is known — so
+            # the first images show up long before the slowest source is done.
+            posts_seen = 0
+            pending = []
             try:
-                posts = web_lookup.search(query, page)
+                for batch in web_lookup.search_stream(query, page):
+                    if token is not self._wl_search_token:
+                        return
+                    for post in batch:
+                        if posts_seen >= _WL_MAX_POSTS_TO_EXPAND:
+                            break
+                        posts_seen += 1
+                        pending.append(_WL_GALLERY_POOL.submit(
+                            self._wl_fetch_post, post, token))
+                    self.root.after(0, lambda n=posts_seen: self._wl_on_posts_found(n, token))
             except Exception as exc:
                 log.exception("WEB_LOOKUP_SEARCH_ERROR")
                 self.root.after(0, lambda e=exc: self._wl_on_search_error(e, token))
                 return
-            if not posts:
+            if not posts_seen:
                 self.root.after(0, lambda: self._wl_on_search_empty(token))
                 return
-            self.root.after(0, lambda n=len(posts): self._wl_on_posts_found(n, token))
-
-            # Expand each matching post into its actual images — capped to
-            # _WL_MAX_POSTS_TO_EXPAND posts so one search stays a bounded
-            # amount of network work, but the *images* fetched per post are
-            # NOT truncated here (only in how many _wl_add_post_block shows
-            # inline) — some galleries run 40+ images, and the full list is
-            # what lets "+N more" in the results view open all of them
-            # without a second network round-trip. Others, e.g. a
-            # single-photo celebrity post, only have one image — that's the
-            # real content, not a bug, but see _wl_add_post_block for why
-            # each post's images are grouped under its own title rather
-            # than rendered as one flat list.
             image_count = 0
-            for post in posts[:_WL_MAX_POSTS_TO_EXPAND]:
-                if token is not self._wl_search_token:
-                    return  # superseded — stop doing pointless network work
+            for fut in pending:
                 try:
-                    urls = web_lookup.fetch_gallery_images(post["url"])
+                    image_count += fut.result() or 0
                 except Exception:
-                    log.exception("WEB_LOOKUP_GALLERY_ERROR  %s", post["url"])
-                    continue
-                if not urls:
-                    continue
-                if token is not self._wl_search_token:
-                    return
-                self.root.after(
-                    0, lambda t=post["title"], u=urls, pu=post["url"]:
-                        self._wl_add_post_block(t, u, pu, token))
-                image_count += min(len(urls), _WL_MAX_IMAGES_PER_POST)
+                    pass
             self.root.after(0, lambda n=image_count: self._wl_on_search_complete(n, token))
 
         threading.Thread(target=_work, daemon=True).start()
+
+    def _wl_fetch_post(self, post: dict, token: object) -> int:
+        """Pool job: fetch one post's gallery and hand it to the UI.
+        Returns how many images it has."""
+        if token is not self._wl_search_token:
+            return 0
+        try:
+            items = web_lookup.fetch_gallery(post["url"])
+        except Exception:
+            log.exception("WEB_LOOKUP_GALLERY_ERROR  %s", post["url"])
+            return 0
+        if items and token is self._wl_search_token:
+            self.root.after(0, lambda t=post["title"], it=items, pu=post["url"]:
+                            self._wl_add_post_block(t, it, pu, token))
+        return len(items)
 
     def _wl_search_alive(self, token: object) -> bool:
         return (token is self._wl_search_token
@@ -3325,56 +3359,124 @@ class CaptionApp:
             return
         self._wl_next_btn.config(state="normal")
         if image_count:
-            self._wl_status_lbl.config(text=f"{image_count} image(s) — click one to use it")
+            self._wl_status_lbl.config(text="Click an image to use it.")
         else:
             self._wl_status_lbl.config(text="No images found in the matching posts.")
 
-    def _wl_add_post_block(self, post_title: str, urls: list, post_url: str,
+    def _wl_add_post_block(self, post_title: str, items: list, post_url: str,
                             token: object) -> None:
         """Render one matching post as a title header followed by a
-        horizontal strip of its own image thumbnails (up to
-        _WL_MAX_IMAGES_PER_POST, so a strip never wraps past the results
-        panel's width). Grouping this way — rather than one flat list of
-        image rows with the post title as a per-row caption — is what
-        makes it visually obvious that several thumbnails in a row are
-        different photos from the *same* article, instead of reading as
-        one row per article regardless of how many images it actually has.
-        A post with more images than fit inline gets a "+N more" button
-        that opens the full gallery — reusing this same (already fetched)
-        urls list, no extra network round-trip."""
+        horizontal strip of its own image thumbnails. Grouping by post
+        makes it obvious which thumbnails come from the same article.
+        Up to _WL_STRIP_CANDIDATES images are previewed and the first
+        _WL_MAX_IMAGES_PER_POST that pass the "Single person only" filter
+        are shown (see _wl_layout_block); a "+N more" button opens the full,
+        already-fetched gallery with no extra page request."""
         if not self._wl_search_alive(token):
             return
-        ttk.Label(self._wl_results_frame, text=post_title, foreground="#555",
-                  wraplength=820, justify="left",
-                  font=("TkDefaultFont", 9, "bold")).pack(
-            side="top", anchor="w", pady=(8, 2))
+        header = ttk.Label(self._wl_results_frame, text=post_title, foreground="#555",
+                           wraplength=820, justify="left",
+                           font=("TkDefaultFont", 9, "bold"))
         strip = ttk.Frame(self._wl_results_frame)
-        strip.pack(side="top", anchor="w", pady=(0, 4))
-        shown = urls[:_WL_MAX_IMAGES_PER_POST]
-        for url in shown:
-            self._wl_add_image_thumb(strip, url, post_url, token)
-        remaining = len(urls) - len(shown)
-        if remaining > 0:
-            ttk.Button(
-                strip, text=f"+{remaining} more…",
-                command=lambda t=post_title, u=urls, pu=post_url:
-                    self._wl_open_post_gallery(t, u, pu)
-            ).pack(side="left", padx=(4, 0))
+        block = {"title": post_title, "header": header, "strip": strip, "cells": [],
+                 "items": items, "post_url": post_url, "more": None}
+        self._wl_blocks.append(block)
+        for item in items[:_WL_STRIP_CANDIDATES]:
+            btn = tk.Button(strip, text="…", width=12, height=6, relief="flat",
+                            command=lambda u=item["url"]: self._wl_select_image(u, post_url))
+            cell = {"btn": btn, "faces": None, "loaded": False}
+            block["cells"].append(cell)
+            self._wl_image_buttons.append(btn)
+            fut = _WL_PREVIEW_POOL.submit(self._wl_make_preview, item)
+            fut.add_done_callback(
+                lambda f, c=cell, b=block: self.root.after(
+                    0, lambda: self._wl_on_preview(f, c, b, token)))
+        if len(items) > _WL_MAX_IMAGES_PER_POST:
+            block["more"] = ttk.Button(
+                strip, text="All images…",
+                command=lambda t=post_title, it=items, pu=post_url:
+                    self._wl_open_post_gallery(t, it, pu))
+        self._wl_layout_block(block)
 
-    def _wl_open_post_gallery(self, post_title: str, urls: list, post_url: str) -> None:
-        """Popup listing every image in `urls` — the full, already-fetched
-        gallery for one post — in a scrollable grid. Reached via the "+N
-        more…" button in _wl_add_post_block for posts whose gallery is
-        bigger than fits in the inline strip. Picking a thumbnail here
-        closes the popup and hands off to the same _wl_select_image flow
-        an inline thumbnail uses, so there's only one download/select path."""
+    @staticmethod
+    def _wl_make_preview(item: dict) -> tuple:
+        """Pool job: (PIL thumbnail, face count or None)."""
+        img, faces = web_lookup.load_preview(item)
+        if item["gif"]:
+            img = _wl_badge_gif(img)
+        return img, faces
+
+    def _wl_on_preview(self, fut, cell: dict, block: dict, token: object) -> None:
+        if not self._wl_search_alive(token) or not cell["btn"].winfo_exists():
+            return
+        try:
+            img, faces = fut.result()
+        except Exception:
+            cell["loaded"] = True
+            cell["faces"] = -1  # failed to load: never shown
+            self._wl_layout_block(block)
+            return
+        photo = ImageTk.PhotoImage(img)
+        self._wl_apply_thumb(photo, cell["btn"])
+        cell["loaded"] = True
+        cell["faces"] = faces
+        self._wl_layout_block(block)
+
+    def _wl_cell_visible(self, cell: dict) -> bool:
+        if cell["faces"] == -1:
+            return False
+        if self._wl_single_var.get() and cell["loaded"] and cell["faces"] is not None:
+            return cell["faces"] == 1
+        return True
+
+    def _wl_layout_block(self, block: dict) -> None:
+        """(Re)pack a post's strip: the first _WL_MAX_IMAGES_PER_POST
+        cells that pass the filter, in gallery order; hide the whole post
+        once every candidate has loaded and none pass."""
+        if not block["strip"].winfo_exists():
+            return
+        visible = [c for c in block["cells"] if self._wl_cell_visible(c)]
+        shown = visible[:_WL_MAX_IMAGES_PER_POST]
+        for c in block["cells"]:
+            c["btn"].pack_forget()
+        if block["more"] is not None:
+            block["more"].pack_forget()
+        for c in shown:
+            c["btn"].pack(side="left", padx=(0, 4))
+        if block["more"] is not None:
+            block["more"].pack(side="left", padx=(4, 0))
+
+        hidden = sum(1 for c in block["cells"] if c["loaded"] and not self._wl_cell_visible(c))
+        title = block["title"]
+        if hidden and self._wl_single_var.get():
+            title += f"   ·  {hidden} hidden (not a single person)"
+        block["header"].config(text=title)
+        all_loaded = all(c["loaded"] for c in block["cells"])
+        if all_loaded and not visible:
+            block["header"].pack_forget()
+            block["strip"].pack_forget()
+        elif not block["header"].winfo_ismapped():
+            block["header"].pack(side="top", anchor="w", pady=(8, 2))
+            block["strip"].pack(side="top", anchor="w", pady=(0, 4))
+
+    def _wl_apply_filter_all(self) -> None:
+        for block in getattr(self, "_wl_blocks", []):
+            self._wl_layout_block(block)
+
+    def _wl_open_post_gallery(self, post_title: str, items: list, post_url: str) -> None:
+        """Popup listing every image in the post in a scrollable grid,
+        honouring "Single person only" like the inline strips. Picking a
+        thumbnail closes the popup and hands off to the same
+        _wl_select_image flow an inline thumbnail uses."""
         gallery = tk.Toplevel(self._wl_win)
         gallery.title(post_title)
-        gallery.geometry("700x600")
+        gallery.geometry("720x620")
         gallery.transient(self._wl_win)
 
         thumbs: list = []  # keeps PhotoImage refs alive for this popup
         gallery._wl_gallery_thumbs = thumbs
+        status = ttk.Label(gallery, text="", foreground="#888", padding=(6, 4))
+        status.pack(side="top", anchor="w")
 
         canvas = tk.Canvas(gallery, highlightthickness=0)
         vsb = ttk.Scrollbar(gallery, orient="vertical", command=canvas.yview)
@@ -3390,50 +3492,52 @@ class CaptionApp:
             gallery.destroy()
             self._wl_select_image(u, post_url)
 
-        def _apply_gallery_thumb(photo: ImageTk.PhotoImage, button: tk.Button) -> None:
-            if not gallery.winfo_exists() or not button.winfo_exists():
-                return
-            button.config(image=photo, text="", width=0, height=0)
-            thumbs.append(photo)
-
+        cells = []
         cols = 5
-        for i, url in enumerate(urls):
-            btn = tk.Button(grid_frame, text="…", width=12, height=6, relief="flat",
-                            command=lambda u=url: _pick(u))
-            btn.grid(row=i // cols, column=i % cols, padx=4, pady=4)
 
-            def _work(u=url, b=btn) -> None:
-                try:
-                    data = web_lookup.download_bytes(u)
-                    img = Image.open(io.BytesIO(data)).convert("RGB")
-                    img.thumbnail((130, 95), Image.LANCZOS)
-                    photo = ImageTk.PhotoImage(img)
-                except Exception:
-                    return
-                self.root.after(0, lambda p=photo, b=b: _apply_gallery_thumb(p, b))
-
-            threading.Thread(target=_work, daemon=True).start()
-
-    def _wl_add_image_thumb(self, parent: ttk.Frame, url: str, post_url: str,
-                             token: object) -> None:
-        if not self._wl_search_alive(token):
-            return
-        btn = tk.Button(parent, text="…", width=12, height=6, relief="flat",
-                        command=lambda u=url: self._wl_select_image(u, post_url))
-        btn.pack(side="left", padx=(0, 4))
-        self._wl_image_buttons.append(btn)
-
-        def _work() -> None:
-            try:
-                data = web_lookup.download_bytes(url)
-                img = Image.open(io.BytesIO(data)).convert("RGB")
-                img.thumbnail((130, 95), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-            except Exception:
+        def _relayout() -> None:
+            if not gallery.winfo_exists():
                 return
-            self.root.after(0, lambda p=photo, b=btn: self._wl_apply_thumb(p, b))
+            shown = [c for c in cells if self._wl_cell_visible(c)]
+            for c in cells:
+                c["btn"].grid_forget()
+            for i, c in enumerate(shown):
+                c["btn"].grid(row=i // cols, column=i % cols, padx=4, pady=4)
+            hidden = sum(1 for c in cells if c["loaded"] and not self._wl_cell_visible(c))
+            loading = sum(1 for c in cells if not c["loaded"])
+            parts = [f"{len(shown)} shown"]
+            if hidden and self._wl_single_var.get():
+                parts.append(f"{hidden} hidden (not a single person)")
+            if loading:
+                parts.append(f"{loading} loading…")
+            status.config(text="  ·  ".join(parts))
 
-        threading.Thread(target=_work, daemon=True).start()
+        def _on_preview(fut, cell: dict) -> None:
+            if not gallery.winfo_exists() or not cell["btn"].winfo_exists():
+                return
+            try:
+                img, faces = fut.result()
+                photo = ImageTk.PhotoImage(img)
+                cell["btn"].config(image=photo, text="", width=0, height=0)
+                thumbs.append(photo)
+                cell["faces"] = faces
+            except Exception:
+                cell["faces"] = -1
+            cell["loaded"] = True
+            _relayout()
+
+        for item in items:
+            btn = tk.Button(grid_frame, text="…", width=12, height=6, relief="flat",
+                            command=lambda u=item["url"]: _pick(u))
+            cell = {"btn": btn, "faces": None, "loaded": False}
+            cells.append(cell)
+            fut = _WL_PREVIEW_POOL.submit(self._wl_make_preview, item)
+            fut.add_done_callback(
+                lambda f, c=cell: self.root.after(0, lambda: _on_preview(f, c)))
+        ttk.Checkbutton(gallery, text="Single person only", variable=self._wl_single_var,
+                        command=lambda: (_relayout(), self._wl_apply_filter_all())).pack(
+            side="top", anchor="e", before=status)
+        _relayout()
 
     def _wl_apply_thumb(self, photo: ImageTk.PhotoImage, button: tk.Button) -> None:
         if not button.winfo_exists():

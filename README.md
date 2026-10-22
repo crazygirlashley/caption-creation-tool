@@ -29,7 +29,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Keyboard shortcuts** — Ctrl+O opens a file, Ctrl+S saves the output (also from inside the caption text box)
 - **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
-- **Find Online…** — search [Barnorama](https://www.barnorama.com) and [AcidCow](https://acidcow.com) from inside the app for source images/GIFs. The query defaults to physical-description keywords (hair color, gender, body type, age, clothing) pulled from your current caption text, and results are ranked by how well their titles match it (hair color first). Posts about real celebrities are filtered out. Results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed
+- **Find Online…** — search [Barnorama](https://www.barnorama.com) and [AcidCow](https://acidcow.com) from inside the app for source images/GIFs. The query defaults to physical-description keywords (hair color, gender, body type, age, clothing) pulled from your current caption text, and results are ranked by how well their titles match it (hair color first). Posts about real celebrities are filtered out. Results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed Built for finding photos of one attractive person: both sites are searched at once and results appear as each answers, multi-word queries also search their most distinctive word ("brunette woman" no longer collapses to a handful of off-topic posts), person galleries rank above memes and listicles, anything framed around children or teens is never shown, and a **Single person only** filter (on by default) uses on-device face detection (OpenCV YuNet) to hide group shots, memes and screenshots — previews are small, cached, and tagged **GIF** when animated
 - **DeviantArt integration** — save finished output to Sta.sh (DeviantArt's private storage area) with one click; publish to gallery when ready
 - **UI themes** — Dark (default), Bubblegum, or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
@@ -307,6 +307,7 @@ caption-creation-tool/
 │   ├── logo.png              # Window/taskbar icon
 │   ├── icon.png              # .exe / Desktop shortcut icon (built releases only)
 │   ├── english_words.txt     # Wordlists used by Find Online's celebrity filter
+│   ├── face_detection_yunet_2023mar.onnx  # Face detector for Find Online (MIT, opencv_zoo)
 │   └── given_names.txt
 ├── formats/                  # Format definitions (JSON) — add your own here
 │   ├── Standard.json

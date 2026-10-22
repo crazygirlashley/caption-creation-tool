@@ -1,6 +1,13 @@
 """Online image/GIF lookup — search Barnorama + AcidCow and pull a source
 file from a result.
 
+Tuned for what Find Online is used for — photos of one attractive person:
+both sources are searched in parallel (results stream in per source),
+multi-word queries also search their most distinctive term, ranking
+prefers person galleries over memes/listicles, titles naming celebrities or
+referencing minors are dropped, and each preview gets a face count so the
+UI can show single-person photos only (see count_faces).
+
 Barnorama is a WordPress site with a real, working `?s=` search (unlike some
 similar sites, e.g. izispicy.com, which only offer date/tag browsing — it
 runs DataLife Engine with full-text search disabled server-side, and no
@@ -27,13 +34,19 @@ does the real filtering, for both sites, after the fact.
 """
 
 import collections
+import concurrent.futures
+import io
 import os
 import re
 import tempfile
+import threading
 import urllib.parse
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import app_paths
 
@@ -42,6 +55,18 @@ _ACIDCOW_BASE = "https://acidcow.com"
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CaptionCreator/1.0"
 _TIMEOUT = 15
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
+
+# One pooled, retrying session for everything — searches, galleries and the
+# many thumbnail downloads run concurrently, and reusing TLS connections to
+# the same few hosts is much faster than a fresh handshake per request.
+_SESSION = requests.Session()
+_SESSION.headers["User-Agent"] = _UA
+_adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16,
+                       max_retries=Retry(total=2, backoff_factor=0.5,
+                                         status_forcelist=(429, 502, 503, 504),
+                                         allowed_methods=("GET", "HEAD", "POST")))
+_SESSION.mount("https://", _adapter)
+_SESSION.mount("http://", _adapter)
 
 # Word lists for the physical/visual attributes that actually narrow an
 # image search on a photo site — a caption's plot nouns ("genie", "lamp",
@@ -67,8 +92,9 @@ _AGE_WORDS = {
     # Deliberately excludes "old" — transformation captions routinely say
     # "his old body"/"his old self" meaning *former*, not elderly, which
     # made every such caption falsely pick up an age keyword it didn't mean.
-    "young", "teen", "teenage", "teenager", "elderly", "mature",
-    "youthful", "adult", "senior",
+    # Also excludes teen/teenage/teenager: images found here end up in
+    # adult captions, so a query must never ask for minors.
+    "elderly", "mature", "adult", "senior",
 }
 _CLOTHING_WORDS = {
     "dress", "skirt", "jeans", "shirt", "blouse", "lingerie", "bikini",
@@ -135,6 +161,50 @@ _CELEBRITY_STOPWORDS = {
 }
 
 
+# Titles framed around children or teens are dropped outright — these images
+# are used for adult captions, so anything that might depict a minor (or
+# frames an adult by their childhood, e.g. "Child Stars Who Grew Up Hot") is
+# never offered.
+_MINOR_WORDS = {
+    "child", "children", "childhood", "kid", "kids", "kiddo", "teen", "teens",
+    "teenage", "teenager", "teenagers", "schoolgirl", "schoolgirls", "schoolboy",
+    "schoolboys", "underage", "minor", "minors", "baby", "babies", "toddler",
+    "toddlers", "preteen", "tween", "tweens", "youngster", "youngsters",
+}
+_MINOR_PHRASES = ("grew up", "growing up", "high school", "as kids", "young girls",
+                  "young boys", "little girls", "little boys")
+
+# Search-term synonyms, so "woman" also ranks "Girls"/"Babes" titles and a
+# hair color matches its other spellings.
+_SYNONYM_GROUPS = (
+    {"woman", "women", "girl", "girls", "lady", "ladies", "babe", "babes", "chick",
+     "chicks", "beauty", "beauties", "hottie", "hotties", "female", "females"},
+    {"man", "men", "guy", "guys", "dude", "dudes", "hunk", "hunks", "male", "males",
+     "gentleman", "gentlemen"},
+    {"blonde", "blond", "blondes", "blonds", "platinum"},
+    {"brunette", "brunettes"},
+    {"redhead", "redheads", "ginger", "gingers", "auburn"},
+)
+# Title words that suggest a gallery of individual attractive people, and
+# ones that suggest memes, listicles or non-people content.
+_PERSON_HINTS = {
+    "girl", "girls", "woman", "women", "babe", "babes", "beauty", "beauties",
+    "hottie", "hotties", "lady", "ladies", "guy", "guys", "men", "hunk", "hunks",
+    "model", "models", "bikini", "bikinis", "lingerie", "selfie", "selfies",
+    "sexy", "hot", "cute", "gorgeous", "stunning", "beautiful", "pretty",
+    "curvy", "fit", "bombshell", "bombshells", "blonde", "blondes", "brunette",
+    "brunettes", "redhead", "redheads", "busty", "petite", "legs", "yoga",
+}
+_OFFTOPIC_HINTS = {
+    "meme", "memes", "funny", "fail", "fails", "prank", "pranks", "comic",
+    "comics", "joke", "jokes", "facts", "history", "historical", "car", "cars",
+    "animal", "animals", "cat", "cats", "dog", "dogs", "food", "signs", "letters",
+    "tweets", "texts", "design", "house", "houses", "then", "how", "things",
+    "stories", "story", "photoshop", "weird", "random", "wtf", "side", "effects",
+    "top",
+}
+
+
 def _load_word_set(filename: str) -> frozenset:
     path = os.path.join(app_paths.RESOURCE_DIR, "assets", filename)
     try:
@@ -177,6 +247,26 @@ def _is_celebrity_title(title: str) -> bool:
     return False
 
 
+def _is_minor_title(title: str) -> bool:
+    lowered = title.lower()
+    if any(phrase in lowered for phrase in _MINOR_PHRASES):
+        return True
+    return any(w in _MINOR_WORDS for w in re.findall(r"[a-z]+", lowered))
+
+
+def _is_excluded_title(title: str) -> bool:
+    return _is_minor_title(title) or _is_celebrity_title(title)
+
+
+def _person_score(title: str) -> int:
+    """How strongly a title suggests a gallery of single attractive people
+    (positive) versus memes/listicles/objects (negative)."""
+    words = re.findall(r"[a-z]+", title.lower())
+    hits = sum(1 for w in words if w in _PERSON_HINTS)
+    misses = sum(1 for w in words if w in _OFFTOPIC_HINTS)
+    return min(hits, 3) - 2 * misses
+
+
 def extract_keywords(text: str, max_words: int = 6) -> str:
     """Pull a short, image-search-scoped query out of a caption: one word
     per attribute category (gender, hair color, body type, age, clothing)
@@ -199,10 +289,11 @@ def extract_keywords(text: str, max_words: int = 6) -> str:
     return " ".join(picked[:max_words])
 
 
-def _smallest_srcset_url(img_tag) -> str:
+def _smallest_srcset_url(img_tag, min_width: int = 0) -> str:
     """Prefer the smallest `srcset` candidate for a thumbnail — the bare
     `src` on a search-results page is the full 660px-wide image, several
-    times the bytes of the thumbnail we actually display."""
+    times the bytes of the thumbnail we actually display. With min_width,
+    the smallest candidate at least that wide (falling back to `src`)."""
     srcset = img_tag.get("srcset")
     if not srcset:
         return img_tag.get("src", "")
@@ -214,6 +305,7 @@ def _smallest_srcset_url(img_tag) -> str:
                 candidates.append((int(bits[1][:-1]), bits[0]))
             except ValueError:
                 continue
+    candidates = [c for c in candidates if c[0] >= min_width]
     if not candidates:
         return img_tag.get("src", "")
     return min(candidates, key=lambda c: c[0])[1]
@@ -221,8 +313,7 @@ def _smallest_srcset_url(img_tag) -> str:
 
 def _search_barnorama(query: str, page: int) -> list:
     url = f"{_BARNORAMA_BASE}/page/{page}/" if page > 1 else f"{_BARNORAMA_BASE}/"
-    resp = requests.get(url, params={"s": query}, headers={"User-Agent": _UA},
-                        timeout=_TIMEOUT)
+    resp = _SESSION.get(url, params={"s": query}, timeout=_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -232,7 +323,7 @@ def _search_barnorama(query: str, page: int) -> list:
         if not title_a or not title_a.get("href"):
             continue
         title = title_a.get_text(strip=True) or "(untitled)"
-        if _is_celebrity_title(title):
+        if _is_excluded_title(title):
             continue
         thumb_img = art.select_one(".post-thumbnail img")
         results.append({
@@ -265,8 +356,8 @@ def _search_acidcow(query: str, page: int) -> list:
         "replylimit": "0",
         "catlist[]": "0",
     }
-    resp = requests.post(f"{_ACIDCOW_BASE}/index.php", params={"do": "search"},
-                          data=data, headers={"User-Agent": _UA}, timeout=_TIMEOUT)
+    resp = _SESSION.post(f"{_ACIDCOW_BASE}/index.php", params={"do": "search"},
+                         data=data, timeout=_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -276,7 +367,7 @@ def _search_acidcow(query: str, page: int) -> list:
         if not title_a or not title_a.get("href"):
             continue
         title = title_a.get_text(strip=True) or "(untitled)"
-        if _is_celebrity_title(title):
+        if _is_excluded_title(title):
             continue
         thumb_img = post.select_one("img")
         results.append({
@@ -304,15 +395,24 @@ def _rank_results(results: list, query: str) -> list:
     terms = query.lower().split()
     if not terms:
         return results
-    patterns = [re.compile(r"\b" + re.escape(t)) for t in terms]
+    patterns = [_term_pattern(t) for t in terms]
     primary, secondary = patterns[0], patterns[1:]
 
     def rank_key(result):
         title = result["title"].lower()
         secondary_hits = sum(1 for p in secondary if p.search(title))
-        return (not primary.search(title), -secondary_hits)
+        # After query relevance, prefer galleries of individual attractive
+        # people over memes/listicles — what Find Online is used for.
+        return (not primary.search(title), -secondary_hits, -_person_score(title))
 
     return sorted(results, key=rank_key)
+
+
+def _term_pattern(term: str) -> "re.Pattern":
+    """Word-start match for a query term or any of its synonyms."""
+    group = next((g for g in _SYNONYM_GROUPS if term in g), {term})
+    alternation = "|".join(re.escape(t) for t in sorted(group, key=len, reverse=True))
+    return re.compile(r"\b(?:" + alternation + ")")
 
 
 def search(query: str, page: int = 1) -> list:
@@ -326,33 +426,73 @@ def search(query: str, page: int = 1) -> list:
     that source), and a failing source never blocks the other one's
     results. Results whose title names or references a real person (see
     _is_celebrity_title) are dropped rather than returned."""
-    query = query.strip()
-    if not query:
-        return []
     results = []
-    for source in (_search_barnorama, _search_acidcow):
-        try:
-            results.extend(source(query, page))
-        except requests.RequestException:
-            pass
+    for batch in search_stream(query, page):
+        results.extend(batch)
     return _rank_results(results, query)
 
 
+def search_stream(query: str, page: int = 1):
+    """Like search(), but yields each source's new (deduplicated, ranked)
+    results as soon as that source answers — Barnorama replies in under a
+    second while AcidCow's search takes ~5s server-side, so callers can show
+    the fast results without waiting on the slow ones."""
+    query = query.strip()
+    if not query:
+        return
+    # Both sites match multi-word searches as a phrase-ish full-text query,
+    # so "brunette woman" returned a handful of off-topic posts while
+    # "brunette" alone returns dozens of relevant galleries. Search the
+    # full query *and* its most distinctive single term, then let ranking
+    # (which still uses every term) sort them.
+    queries = [query]
+    terms = query.split()
+    if len(terms) > 1:
+        gender = set().union(*_SYNONYM_GROUPS[:2])
+        distinctive = next((t for t in terms if t.lower() not in gender), terms[0])
+        queries.append(distinctive)
+    jobs = [(src, q) for q in queries for src in (_search_barnorama, _search_acidcow)]
+    seen = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(src, q, page) for src, q in jobs]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                batch = fut.result()
+            except (requests.RequestException, ValueError):
+                continue
+            new = [r for r in batch if r["url"] not in seen]
+            seen.update(r["url"] for r in new)
+            if new:
+                yield _rank_results(new, query)
+
+
+def _gallery_item(url: str, thumb: str = "") -> dict:
+    """One gallery image: full-size `url`, a smaller `thumb` to preview it
+    with (the full image when the site offers nothing smaller), and whether
+    it's an animated GIF."""
+    path = urllib.parse.urlparse(url).path.lower()
+    return {"url": url, "thumb": thumb or url, "gif": path.endswith(".gif")}
+
+
 def _fetch_gallery_barnorama(post_url: str) -> list:
-    resp = requests.get(post_url, headers={"User-Agent": _UA}, timeout=_TIMEOUT)
+    resp = _SESSION.get(post_url, timeout=_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     entry = soup.select_one("div.entry")
     if entry is None:
         return []
 
-    urls, seen = [], set()
+    items, seen = [], set()
     for img in entry.select("img.size-full"):
         src = img.get("src")
         if src and src not in seen:
             seen.add(src)
-            urls.append(src)
-    return urls
+            # WordPress srcset offers ~240px variants — big enough for a
+            # preview and face check, a fraction of the full image's bytes.
+            # GIFs keep the original (resized variants are a single frame).
+            thumb = "" if src.lower().endswith(".gif") else _smallest_srcset_url(img, 200)
+            items.append(_gallery_item(src, thumb))
+    return items
 
 
 def _fetch_gallery_acidcow(post_url: str) -> list:
@@ -362,26 +502,26 @@ def _fetch_gallery_acidcow(post_url: str) -> list:
     them cleanly. (Tried matching the "/uploads/posts/" path segment first
     — some posts use a different path, e.g. "/pics/<date>/<id>_<hash>.jpg",
     so that missed real galleries entirely.)"""
-    resp = requests.get(post_url, headers={"User-Agent": _UA}, timeout=_TIMEOUT)
+    resp = _SESSION.get(post_url, timeout=_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     entry = soup.select_one("#dle-content")
     if entry is None:
         return []
 
-    urls, seen = [], set()
+    items, seen = [], set()
     for img in entry.select("img"):
         src = img.get("src", "")
         if urllib.parse.urlparse(src).netloc == "cdn.acidcow.com" and src not in seen:
             seen.add(src)
-            urls.append(src)
-    return urls
+            items.append(_gallery_item(src))
+    return items
 
 
-def fetch_gallery_images(post_url: str) -> list:
-    """Return the full-resolution image/GIF URLs embedded in a post, in the
-    order they appear on the page. Dispatches on post_url's host, since
-    Barnorama and AcidCow need different selectors."""
+def fetch_gallery(post_url: str) -> list:
+    """Return the images embedded in a post as [{"url", "thumb", "gif"}],
+    in page order. Dispatches on post_url's host, since Barnorama and
+    AcidCow need different selectors."""
     host = urllib.parse.urlparse(post_url).netloc
     if "acidcow.com" in host:
         return _fetch_gallery_acidcow(post_url)
@@ -389,9 +529,89 @@ def fetch_gallery_images(post_url: str) -> list:
 
 
 def download_bytes(url: str) -> bytes:
-    resp = requests.get(url, headers={"User-Agent": _UA}, timeout=_TIMEOUT)
+    resp = _SESSION.get(url, timeout=_TIMEOUT)
     resp.raise_for_status()
     return resp.content
+
+
+# ---------------------------------------------------------------------------
+# Previews + single-person detection
+#
+# Most searches here are for one attractive person per photo, but galleries
+# mix in group shots, memes and screenshots. OpenCV's YuNet face detector
+# (assets/face_detection_yunet_2023mar.onnx, MIT, from opencv_zoo) counts
+# faces in each preview so the results can show single-person photos only.
+# On a live sample it found exactly 1 face in 15/16 images of a "Beauty
+# Blondes" gallery and 0 in 16/16 of a pranks/memes post. If OpenCV or the
+# model is unavailable, face counts are None and nothing is filtered.
+# ---------------------------------------------------------------------------
+
+_FACE_MODEL = os.path.join(app_paths.RESOURCE_DIR, "assets", "face_detection_yunet_2023mar.onnx")
+# Faces smaller than this share of the image are background people, not the
+# subject — ignoring them keeps a crowd behind someone from disqualifying a
+# solo shot.
+_MIN_FACE_AREA = 0.004
+_face_lock = threading.Lock()
+_face_detector = None
+_face_unavailable = False
+
+_PREVIEW_CACHE: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()
+_PREVIEW_CACHE_MAX = 400
+_preview_lock = threading.Lock()
+
+
+def _get_face_detector():
+    global _face_detector, _face_unavailable
+    if _face_detector is None and not _face_unavailable:
+        try:
+            import cv2
+            _face_detector = cv2.FaceDetectorYN.create(_FACE_MODEL, "", (320, 320),
+                                                       0.7, 0.3, 50)
+        except Exception:
+            _face_unavailable = True
+    return _face_detector
+
+
+def count_faces(img: Image.Image) -> "int | None":
+    """Number of subject-sized faces in img, or None if detection isn't
+    available."""
+    with _face_lock:
+        det = _get_face_detector()
+        if det is None:
+            return None
+        import cv2
+        import numpy as np
+        work = img.convert("RGB")
+        work.thumbnail((480, 480))
+        arr = cv2.cvtColor(np.asarray(work), cv2.COLOR_RGB2BGR)
+        det.setInputSize((arr.shape[1], arr.shape[0]))
+        _ok, faces = det.detect(arr)
+    if faces is None:
+        return 0
+    min_area = _MIN_FACE_AREA * arr.shape[0] * arr.shape[1]
+    return sum(1 for f in faces if f[2] * f[3] >= min_area)
+
+
+def load_preview(item: dict, size: tuple = (130, 95)) -> tuple:
+    """(thumbnail PIL image, face count or None) for a gallery item —
+    downloads its small `thumb` version, cached so paging back and forth
+    or reopening a gallery doesn't download it again."""
+    key = item["thumb"]
+    with _preview_lock:
+        if key in _PREVIEW_CACHE:
+            _PREVIEW_CACHE.move_to_end(key)
+            return _PREVIEW_CACHE[key]
+    img = Image.open(io.BytesIO(download_bytes(key)))
+    img.seek(0)
+    img = img.convert("RGB")
+    faces = count_faces(img)
+    img.thumbnail(size, Image.LANCZOS)
+    result = (img, faces)
+    with _preview_lock:
+        _PREVIEW_CACHE[key] = result
+        while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX:
+            _PREVIEW_CACHE.popitem(last=False)
+    return result
 
 
 def download_to_tempfile(url: str) -> str:
