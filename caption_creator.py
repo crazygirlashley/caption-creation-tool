@@ -2,6 +2,7 @@
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
 import collections
+import contextlib
 import ctypes
 import functools
 import io
@@ -5268,6 +5269,158 @@ class CaptionApp:
         menu.add_cascade(label="Recent Projects", menu=recent_proj)
         menu.add_command(label="Save Project…", accelerator="Ctrl+Shift+S",
                          command=self._save_project)
+        menu.add_separator()
+        menu.add_command(label="Batch Export…", command=self._batch_export)
+
+    # ------------------------------------------------------------------
+    # Batch export
+    # ------------------------------------------------------------------
+
+    def _batch_export(self, paths: Optional[list] = None) -> None:
+        """Apply the current caption and format to several files. Each file
+        gets its own Auto-fit, dynamic panel size and auto watermark (they
+        depend on its size); stills save as PNG, GIFs as GIF, MP4s as MP4,
+        named "<file>_captioned" in the chosen folder."""
+        if self._batch_running():
+            self._batch_win.lift()
+            return
+        if not paths:
+            paths = list(filedialog.askopenfilenames(
+                title="Batch Export — choose files",
+                filetypes=[("Images, GIFs & Video", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp4"),
+                           ("All files", "*.*")]))
+            if not paths:
+                return
+        raw = self._gather_raw_params()
+        if raw is None:
+            messagebox.showerror("Batch Export", "Fix the invalid number fields first.")
+            return
+        out_dir = filedialog.askdirectory(title="Batch Export — save captioned files to…",
+                                          initialdir=os.path.dirname(paths[0]))
+        if not out_dir:
+            return
+        layout = raw["layout"]
+        dynamic = self._dynamic_width_var.get()
+        auto_wm = self._wm_auto_var.get() and not raw["footer_enabled"]
+
+        win = tk.Toplevel(self.root)
+        self._batch_win = win
+        win.title(f"Batch Export — {len(paths)} file(s)")
+        win.geometry("560x380")
+        win.transient(self.root)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+        listbox = tk.Listbox(body, height=12, activestyle="none")
+        listbox.pack(fill="both", expand=True)
+        for path in paths:
+            listbox.insert("end", f"⏳  {os.path.basename(path)}")
+        bar = ttk.Progressbar(body, maximum=len(paths))
+        bar.pack(fill="x", pady=(8, 4))
+        status = ttk.Label(body, text="Starting…", foreground="#888")
+        status.pack(anchor="w")
+        btns = ttk.Frame(body)
+        btns.pack(anchor="e", pady=(8, 0))
+        cancel = threading.Event()
+        cancel_btn = ttk.Button(btns, text="Cancel", command=cancel.set)
+        cancel_btn.pack(side="right")
+        open_btn = ttk.Button(btns, text="Open Folder",
+                              command=lambda: os.startfile(out_dir))
+
+        def _mark(i: int, icon: str, note: str = "") -> None:
+            if not win.winfo_exists():
+                return
+            listbox.delete(i)
+            listbox.insert(i, f"{icon}  {os.path.basename(paths[i])}{'  — ' + note if note else ''}")
+
+        def _one(i: int, path: str) -> str:
+            name, ext = os.path.splitext(os.path.basename(path))
+            ext = ext.lower()
+            is_video = ext == ".mp4"
+            if is_video:
+                reader = imageio.get_reader(path, "ffmpeg")
+                try:
+                    meta = reader.get_meta_data()
+                    fps = float(meta.get("fps") or 25)
+                    size = tuple(meta.get("size") or reader.get_data(0).shape[1::-1])
+                    total = int((meta.get("duration") or 0) * fps) or reader.count_frames()
+                finally:
+                    reader.close()
+                animated = True
+            else:
+                with Image.open(path) as img:
+                    size = img.size
+                    total = getattr(img, "n_frames", 1)
+                animated = total > 1
+            file_raw = dict(raw, frame_size=size, source_is_gif=ext == ".gif",
+                            output_override=raw["output_override"])
+            if dynamic:
+                file_raw["width"] = int(round((size[1] if layout == "vertical" else size[0])
+                                              * 1.25))
+            if auto_wm:
+                file_raw["watermark_height"] = _auto_watermark_height(size)
+            kwargs, _ = _resolve_composite_kwargs(file_raw)
+            if not animated:
+                with Image.open(path) as img:
+                    out = build_composite(img.convert("RGBA"), **kwargs)
+                out_path = os.path.join(out_dir, f"{name}_captioned.png")
+                out.save(out_path)
+                return out_path
+            out_ext = ".mp4" if is_video else ".gif"
+            out_path = os.path.join(out_dir, f"{name}_captioned{out_ext}")
+            job = {"source_path": path, "kind": "mp4" if is_video else "gif",
+                   "output_path": out_path, "as_mp4": is_video, "params": kwargs,
+                   "fps": fps if is_video else 10.0, "total_frames": total,
+                   "durations": None, "gif_colors": _resolve_gif_colors(file_raw)}
+            job_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
+                                                   encoding="utf-8")
+            json.dump(job, job_file)
+            job_file.close()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _export_worker_main(job_file.name)
+            finally:
+                os.unlink(job_file.name)
+            return out_path
+
+        def _work() -> None:
+            done = failed = 0
+            for i, path in enumerate(paths):
+                if cancel.is_set():
+                    break
+                self.root.after(0, lambda i=i: (_mark(i, "▶"),
+                                                status.config(text=f"Exporting {i + 1} of "
+                                                                   f"{len(paths)}…")))
+                try:
+                    out_path = _one(i, path)
+                    done += 1
+                    size_note = _human_size(os.path.getsize(out_path))
+                    self.root.after(0, lambda i=i, n=size_note: _mark(i, "✓", n))
+                except Exception as e:
+                    failed += 1
+                    log.exception("BATCH_EXPORT_ERROR  %s", path)
+                    self.root.after(0, lambda i=i, e=e: _mark(i, "✗", str(e)[:80]))
+                self.root.after(0, lambda v=i + 1: bar.config(value=v))
+            log.info("BATCH_EXPORT_DONE  ok=%d failed=%d cancelled=%s", done, failed,
+                     cancel.is_set())
+            self.root.after(0, lambda: _finish(done, failed))
+
+        def _finish(done: int, failed: int) -> None:
+            if not win.winfo_exists():
+                return
+            parts = [f"{done} exported"]
+            if failed:
+                parts.append(f"{failed} failed (see the list)")
+            if cancel.is_set():
+                parts.append("cancelled")
+            status.config(text=" · ".join(parts) + f" → {out_dir}")
+            cancel_btn.config(text="Close", command=win.destroy)
+            open_btn.pack(side="right", padx=(0, 6))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _batch_running(self) -> bool:
+        win = getattr(self, "_batch_win", None)
+        return bool(win) and win.winfo_exists()
 
     def _project_dict(self, project_path: str) -> Optional[dict]:
         fmt = self._format_var.get()
