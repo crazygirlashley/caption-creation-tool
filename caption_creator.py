@@ -3715,6 +3715,11 @@ class CaptionApp:
 
         threading.Thread(target=_work, daemon=True).start()
 
+    def _wl_search_for(self, query: str) -> None:
+        """Run a new search for query (the "More like this" buttons)."""
+        self._wl_query_var.set(query)
+        self._wl_run_search(1)
+
     def _wl_fetch_post(self, post: dict, token: object) -> int:
         """Pool job: fetch one post's gallery and hand it to the UI.
         Returns how many images it has."""
@@ -3776,12 +3781,20 @@ class CaptionApp:
         already-fetched gallery with no extra page request."""
         if not self._wl_search_alive(token):
             return
-        header = ttk.Label(self._wl_results_frame, text=post_title, foreground="#555",
-                           wraplength=820, justify="left",
-                           font=("TkDefaultFont", 9, "bold"))
+        header = ttk.Frame(self._wl_results_frame)
+        header_label = ttk.Label(header, text=post_title, foreground="#555",
+                                 wraplength=680, justify="left",
+                                 font=("TkDefaultFont", 9, "bold"))
+        header_label.pack(side="left")
+        similar = web_lookup.similar_query(post_title)
+        if similar:
+            ttk.Button(header, text="More like this",
+                       command=lambda q=similar: self._wl_search_for(q)).pack(
+                side="left", padx=(8, 0))
         strip = ttk.Frame(self._wl_results_frame)
-        block = {"title": post_title, "header": header, "strip": strip, "cells": [],
-                 "items": items, "post_url": post_url, "more": None}
+        block = {"title": post_title, "header": header, "header_label": header_label,
+                 "strip": strip, "cells": [], "items": items, "post_url": post_url,
+                 "more": None}
         self._wl_blocks.append(block)
         for item in items[:_WL_STRIP_CANDIDATES]:
             btn = tk.Button(strip, text="…", width=12, height=6, relief="flat",
@@ -3852,7 +3865,7 @@ class CaptionApp:
         title = block["title"]
         if hidden and self._wl_single_var.get():
             title += f"   ·  {hidden} hidden (not a single person)"
-        block["header"].config(text=title)
+        block["header_label"].config(text=title)
         all_loaded = all(c["loaded"] for c in block["cells"])
         if all_loaded and not visible:
             block["header"].pack_forget()

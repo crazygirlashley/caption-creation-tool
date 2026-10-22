@@ -55,6 +55,13 @@ class RankingTests(unittest.TestCase):
         self.assertTrue(wl._term_pattern("redhead").search("gingers at the beach"))
 
 
+class SimilarQueryTests(unittest.TestCase):
+    def test_uses_title_attributes_and_folds_plurals(self):
+        self.assertEqual(wl.similar_query("25 Adorable Brunette Girls"), "brunette girls")
+        self.assertEqual(wl.similar_query("Beauty Brunettes (35 pics)"), "brunette")
+        self.assertEqual(wl.similar_query("Hot Babes (30 pics)"), "babes")
+
+
 class StreamTests(unittest.TestCase):
     def setUp(self):
         self.orig = (wl._search_barnorama, wl._search_acidcow)

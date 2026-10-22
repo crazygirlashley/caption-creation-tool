@@ -289,6 +289,27 @@ def extract_keywords(text: str, max_words: int = 6) -> str:
     return " ".join(picked[:max_words])
 
 
+_VAGUE_HINTS = {"sexy", "hot", "cute", "gorgeous", "stunning", "beautiful", "pretty", "beauty"}
+
+
+def similar_query(title: str) -> str:
+    """Search query for "More like this" on a result: the post title's
+    descriptive words (hair color, gender, body type, clothing), with
+    plurals folded to their singular so "Beauty Brunettes" still gives
+    "brunette"; falls back to its person words if none of those match."""
+    vocab = set().union(*_ATTRIBUTE_CATEGORIES)
+    words = []
+    for w in re.findall(r"[a-z]+", title.lower()):
+        if w not in vocab and w.endswith("s") and w[:-1] in vocab:
+            w = w[:-1]
+        words.append(w)
+    query = extract_keywords(" ".join(words))
+    if query:
+        return query
+    fallback = [w for w in words if w in _PERSON_HINTS and w not in _VAGUE_HINTS]
+    return " ".join(fallback[:2])
+
+
 def _smallest_srcset_url(img_tag, min_width: int = 0) -> str:
     """Prefer the smallest `srcset` candidate for a thumbnail — the bare
     `src` on a search-results page is the full 660px-wide image, several
