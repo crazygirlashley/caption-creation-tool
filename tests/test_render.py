@@ -260,6 +260,57 @@ class SizeEstimateHelperTests(unittest.TestCase):
         self.assertLess(abs(sampled - full) / full, 0.10)
 
 
+class TrimSpeedTests(unittest.TestCase):
+    def test_retime_keeps_total_length(self):
+        self.assertEqual(cc._retime_delays([40, 50, 40], 1), [40, 50, 40])
+        self.assertEqual(sum(cc._retime_delays([40] * 30, 0.5)), 2400)
+        self.assertEqual(sum(cc._retime_delays([50] * 30, 2)), 750)
+        self.assertGreaterEqual(min(cc._retime_delays([30] * 10, 3)), 20)
+        self.assertEqual(cc._retime_delays([0, 10, 40], 2), [0, 10, 20])
+
+    def _job(self, tmp, src, kind, out, **extra):
+        params, _ = cc._resolve_composite_kwargs(_raw((200, 140), text="caption"))
+        job = dict(source_path=src, kind=kind, output_path=out, as_mp4=out.endswith(".mp4"),
+                   params=params, fps=25.0, total_frames=12, durations=None, gif_colors=None)
+        job.update(extra)
+        path = os.path.join(tmp, "job.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(job, f)
+        cc._export_worker_main(path)
+
+    def test_gif_trim_and_speed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.gif")
+            durations = _make_gif(src, n=12)
+            out = os.path.join(tmp, "out.gif")
+            self._job(tmp, src, "gif", out, durations=durations, trim=[2, 7], speed=2.0)
+            with Image.open(out) as im:
+                got = [f.info["duration"] for f in ImageSequence.Iterator(im)]
+            self.assertEqual(len(got), 6)
+            self.assertEqual(sum(got), sum(cc._retime_delays(durations[2:8], 2.0)))
+
+    def test_mp4_trim_and_speed(self):
+        import imageio.v2 as imageio
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.mp4")
+            writer = imageio.get_writer(src, fps=25, codec="libx264", quality=8)
+            for i in range(12):
+                im = Image.new("RGB", (192, 128), (40, 90, 160))
+                ImageDraw.Draw(im).rectangle((i * 8, 30, i * 8 + 30, 70), fill=(250, 200, 30))
+                writer.append_data(np.asarray(im))
+            writer.close()
+            out = os.path.join(tmp, "out.mp4")
+            self._job(tmp, src, "mp4", out, trim=[3, 8], speed=2.0)
+            reader = imageio.get_reader(out, "ffmpeg")
+            try:
+                frames = sum(1 for _ in reader)
+                fps = reader.get_meta_data()["fps"]
+            finally:
+                reader.close()
+            self.assertEqual(frames, 6)
+            self.assertAlmostEqual(fps, 50.0, delta=0.5)
+
+
 class Mp4ToGifTimingTests(unittest.TestCase):
     """fps-timed sources: GIF stores centisecond delays and can't go below
     20ms, so total length has to be preserved by spreading the rounding and

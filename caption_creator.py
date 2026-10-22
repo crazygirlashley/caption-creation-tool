@@ -1183,6 +1183,25 @@ def _gif_frame_delays(frame_ms: float):
         yield delay
 
 
+def _retime_delays(durations: list, speed: float) -> list:
+    """Per-frame delays (ms) played `speed` times faster, in the 10ms steps
+    GIF stores, rounding the running total so the overall length stays
+    exact. Delays of 0-10ms are left alone (browsers treat them as 100ms
+    either way), and nothing goes below 20ms."""
+    if speed == 1:
+        return list(durations)
+    out, target, written = [], 0.0, 0
+    for d in durations:
+        if d <= 10:
+            out.append(d)
+            continue
+        target += d / speed
+        delay = max(20, int(round((target - written) / 10.0)) * 10)
+        written += delay
+        out.append(delay)
+    return out
+
+
 def _write_gif(path: str, frames, samples: list, durations,
                gif_colors: Optional[int] = None, dither: bool = True) -> None:
     """Encode composited RGB(A) `frames` (any iterable) as a looping GIF.
@@ -1304,23 +1323,42 @@ def _export_worker_main(job_path: str) -> None:
     total = job["total_frames"]
     durations = job.get("durations")
     gif_colors = job.get("gif_colors")
+    # Trim (0-based, inclusive) and playback speed from the Frames/Speed
+    # controls; absent in older jobs = whole source at normal speed.
+    start, end = job.get("trim") or (0, total - 1)
+    speed = float(job.get("speed") or 1.0)
+    count = end - start + 1
+    out_fps = fps * speed
 
     try:
         ctypes.windll.kernel32.SetConsoleTitleW("Caption Creator — Exporting…")
     except Exception:
         pass
 
-    print(f"Exporting {os.path.basename(output_path)}  ({total} frames, {fps:.2f} fps)")
+    print(f"Exporting {os.path.basename(output_path)}  ({count} frames, {out_fps:.2f} fps)")
     print("This window closes automatically when the export finishes.\n")
 
     def _progress(i: int) -> None:
-        if i % 20 == 0 or i == total - 1:
-            print(f"\rExporting frame {i + 1}/{total}…", end="", flush=True)
+        if i % 20 == 0 or i == count - 1:
+            print(f"\rExporting frame {i + 1}/{count}…", end="", flush=True)
+
+    def _trimmed():
+        """(index within the trim, frame) for the kept source frames."""
+        frames = _iter_frames_from_path(source_path, kind)
+        try:
+            for i, frame in enumerate(frames):
+                if i < start:
+                    continue
+                if i > end:
+                    break
+                yield i - start, frame
+        finally:
+            frames.close()  # stopping early must still release the decoder
 
     if as_mp4:
-        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        writer = imageio.get_writer(output_path, fps=out_fps, codec="libx264", quality=8)
         try:
-            for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
+            for i, frame in _trimmed():
                 composited = build_composite(frame, **params)
                 writer.append_data(_pad_to_macro_block(np.array(composited.convert("RGB"))))
                 _progress(i)
@@ -1339,22 +1377,23 @@ def _export_worker_main(job_path: str) -> None:
             with Image.open(source_path) as img:
                 durations = [frm.info.get("duration", 100)
                              for frm in ImageSequence.Iterator(img)]
+        if durations:
+            durations = _retime_delays(durations[start:end + 1], speed)
         # GIF can't show frames faster than 20ms (50fps) — browsers slow
         # shorter delays to 100ms — so an fps-timed source above that keeps
         # every Nth frame, with each one held N frames' worth of time.
-        step = 1 if durations else max(1, math.ceil(fps / _GIF_MAX_FPS))
-        wanted = set(_gif_sample_indices(total))
+        step = 1 if durations else max(1, math.ceil(out_fps / _GIF_MAX_FPS))
+        wanted = set(_gif_sample_indices(count))
         samples = [build_composite(frame, **params)
-                   for i, frame in enumerate(_iter_frames_from_path(source_path, kind))
-                   if i in wanted]
+                   for i, frame in _trimmed() if i in wanted]
 
         def _composited():
-            for i, frame in enumerate(_iter_frames_from_path(source_path, kind)):
+            for i, frame in _trimmed():
                 if i % step == 0:
                     yield build_composite(frame, **params)
                 _progress(i)
 
-        duration = durations if durations else 1000.0 * step / fps
+        duration = durations if durations else 1000.0 * step / out_fps
         _write_gif(output_path, _composited(), samples, duration, gif_colors,
                    dither=kind != "gif")
     print("\nDone.")
@@ -1551,6 +1590,11 @@ class CaptionApp:
         self._output_override_var = tk.BooleanVar(value=False)
         self._output_pct_var = tk.IntVar(value=100)
         self._gif_compress_var = tk.BooleanVar(value=False)
+        # Frames/Speed controls for animated sources (1-based, inclusive).
+        self._trim_start_var = tk.IntVar(value=1)
+        self._trim_end_var = tk.IntVar(value=1)
+        self._speed_var = tk.StringVar(value="1")
+        self._play_durations: list = []
         self._gif_colors_var = tk.IntVar(value=256)  # 256 = no-op (GIF already tops out at 256/frame)
         self._pad_var = tk.IntVar(value=20)
         self._stroke_width_var = tk.IntVar(value=0)
@@ -1706,6 +1750,24 @@ class CaptionApp:
         self._gif_colors_row.pack_forget()  # hidden until the toggle above is checked
         self._gif_compress_frame.pack_forget()  # hidden until an eligible GIF source loads
 
+        # Trim + speed (animated sources only — see _update_trim_controls).
+        self._trim_row = ttk.Frame(pf)
+        ttk.Label(self._trim_row, text="Frames").pack(side="left")
+        self._trim_start_spin = ttk.Spinbox(self._trim_row, from_=1, to=1, width=5,
+                                            textvariable=self._trim_start_var)
+        self._trim_start_spin.pack(side="left", padx=(4, 2))
+        ttk.Label(self._trim_row, text="to").pack(side="left")
+        self._trim_end_spin = ttk.Spinbox(self._trim_row, from_=1, to=1, width=5,
+                                          textvariable=self._trim_end_var)
+        self._trim_end_spin.pack(side="left", padx=(2, 12))
+        ttk.Label(self._trim_row, text="Speed").pack(side="left")
+        ttk.Combobox(self._trim_row, textvariable=self._speed_var, width=5,
+                     values=["0.25", "0.5", "0.75", "1", "1.25", "1.5", "2", "3"]).pack(
+            side="left", padx=(4, 2))
+        ttk.Label(self._trim_row, text="×").pack(side="left")
+        self._trim_info = ttk.Label(self._trim_row, text="", foreground="#888")
+        self._trim_info.pack(side="left", padx=(10, 0))
+
         self._size_est_row = ttk.Frame(pf)
         self._size_est_row.pack(side="top", fill="x", pady=(0, 4))
         self._size_est_label = ttk.Label(self._size_est_row, text="", foreground="#888")
@@ -1783,6 +1845,8 @@ class CaptionApp:
                   self._output_pct_var, self._gif_colors_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
+        for v in (self._trim_start_var, self._trim_end_var, self._speed_var):
+            v.trace_add("write", lambda *_: self._on_trim_change())
         # _size_var also gets programmatically overwritten by Auto-fit itself
         # (see _collect_render_params) — skip those writes so they don't
         # recurse back into another refresh.
@@ -3139,6 +3203,72 @@ class CaptionApp:
             if packed:
                 self._single_frame_check.pack_forget()
 
+    def _total_source_frames(self) -> int:
+        return self._deferred_total_frames if self._deferred_path else len(self._frames)
+
+    def _trim_range(self) -> tuple:
+        """(first, last) 0-based inclusive frame indices to use, clamped."""
+        total = max(1, self._total_source_frames())
+        try:
+            first = int(self._trim_start_var.get())
+            last = int(self._trim_end_var.get())
+        except (tk.TclError, ValueError):
+            first, last = 1, total
+        first = max(1, min(first, total))
+        last = max(first, min(last, total))
+        return first - 1, last - 1
+
+    def _speed(self) -> float:
+        try:
+            value = float(str(self._speed_var.get()).strip().rstrip("×xX").strip())
+        except ValueError:
+            return 1.0
+        return max(0.1, min(10.0, value)) if value > 0 else 1.0
+
+    def _effective_durations(self) -> list:
+        """Per-frame delays (ms) of the trimmed, retimed animation — only
+        meaningful when every frame is loaded (not deferred)."""
+        first, last = self._trim_range()
+        return _retime_delays(self._durations[first:last + 1], self._speed())
+
+    def _update_trim_controls(self, reset: bool = False) -> None:
+        """Show Frames/Speed for animated sources; on a new file, reset to
+        the whole animation at normal speed."""
+        if not self._is_anim:
+            self._trim_row.pack_forget()
+            return
+        total = max(1, self._total_source_frames())
+        self._trim_start_spin.config(to=total)
+        self._trim_end_spin.config(to=total)
+        if reset:
+            self._trim_updating = True
+            try:
+                self._trim_start_var.set(1)
+                self._trim_end_var.set(total)
+                self._speed_var.set("1")
+            finally:
+                self._trim_updating = False
+        if not self._trim_row.winfo_manager():
+            self._trim_row.pack(side="top", fill="x", pady=(0, 4), before=self._size_est_row)
+        self._update_trim_info()
+
+    def _update_trim_info(self) -> None:
+        first, last = self._trim_range()
+        count = last - first + 1
+        speed = self._speed()
+        if self._deferred_path or not self._durations:
+            fps = self._export_fps() * speed
+            seconds = count / fps if fps else 0
+        else:
+            seconds = sum(self._effective_durations()) / 1000
+        self._trim_info.config(text=f"{count} frames · {seconds:.1f}s")
+
+    def _on_trim_change(self) -> None:
+        if getattr(self, "_trim_updating", False) or not self._is_anim:
+            return
+        self._update_trim_info()
+        self._safe_refresh()
+
     def _update_gif_compress_visibility(self) -> None:
         """The GIF compression toggle only makes sense for native GIF sources
         — an MP4 source's live estimate/label is always computed as MP4
@@ -3284,6 +3414,7 @@ class CaptionApp:
         self._single_frame_var.set(bool(self._deferred_path))
         self._update_single_frame_visibility()
         self._update_gif_compress_visibility()
+        self._update_trim_controls(reset=True)
 
         self._anim_idx = 0
         self._apply_dynamic_width()
@@ -3746,6 +3877,8 @@ class CaptionApp:
             "total_frames": total,
             "durations": durations,
             "gif_colors": gif_colors,
+            "trim": list(self._trim_range()),
+            "speed": self._speed(),
         }
         job_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, encoding="utf-8")
@@ -4220,7 +4353,9 @@ class CaptionApp:
 
         self._build_cancel.set()
         self._build_cancel = threading.Event()
-        job = (raw, self._frames[0], self._build_cancel, self._is_anim)
+        first, _last = self._trim_range()
+        preview_frame = self._frames[first] if first < len(self._frames) else self._frames[0]
+        job = (raw, preview_frame, self._build_cancel, self._is_anim)
 
         txt = self._status.cget("text")
         if "[Rendering" not in txt:
@@ -4295,9 +4430,10 @@ class CaptionApp:
         if raw is None:
             return
         path, kind = self._deferred_path, self._deferred_kind
-        total = self._deferred_total_frames or 1
+        first, last = self._trim_range()
+        total = last - first + 1
         as_mp4 = self._is_video
-        fps = self._export_fps()
+        fps = self._export_fps() * self._speed()
         gif_colors = _resolve_gif_colors(raw)
         sample_n = min(_DEFERRED_SIZE_SAMPLE_FRAMES, total)
 
@@ -4306,7 +4442,9 @@ class CaptionApp:
                 kwargs, _size = _resolve_composite_kwargs(raw)
                 src = []
                 for i, frame in enumerate(_iter_frames_from_path(path, kind)):
-                    if i >= sample_n:
+                    if i < first:
+                        continue
+                    if len(src) >= sample_n:
                         break
                     src.append(frame)
                 if not src:
@@ -4353,13 +4491,17 @@ class CaptionApp:
         self._build_cancel.set()
         self._build_cancel = threading.Event()
         cancel = self._build_cancel
-        frames = self._frames[:]  # snapshot so the thread doesn't see file reloads
+        first, last = self._trim_range()
+        speed = self._speed()
+        # Snapshot (trimmed) so the thread doesn't see file reloads.
+        frames = self._frames[first:last + 1]
+        play_durations = self._effective_durations()
         # Snapshot the other pieces the size-estimate encode below needs, for
         # the same reason — Tk state isn't safe to read from the background
         # thread once it starts.
         as_mp4 = self._is_video
-        fps = self._export_fps()
-        durations = list(self._durations) if (self._durations and not as_mp4) else None
+        fps = self._export_fps() * speed
+        durations = play_durations if (play_durations and not as_mp4) else None
         gif_colors = _resolve_gif_colors(raw)
 
         txt = self._status.cget("text")
@@ -4388,7 +4530,8 @@ class CaptionApp:
             # (several seconds) and used to hold the preview back until it
             # finished.
             self.root.after(
-                0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"]))
+                0, lambda r=results, s=size: self._on_rebuild_done(r, s, raw["field_size"],
+                                                                    play_durations))
             # MP4 bytes scale close to linearly with frame count, and a full
             # x264 encode of a 1080p clip takes ~1 minute — so MP4 estimates
             # come from a sample, like _estimate_deferred_bytes. GIFs keep the
@@ -4424,11 +4567,13 @@ class CaptionApp:
 
         threading.Thread(target=_build, daemon=True).start()
 
-    def _on_rebuild_done(self, results: list, size: int, field_size: int) -> None:
+    def _on_rebuild_done(self, results: list, size: int, field_size: int,
+                         play_durations: Optional[list] = None) -> None:
         """Called on the main thread when the background GIF build finishes
         (the size estimate follows separately via _set_size_estimate)."""
         self._apply_resolved_font_size(size, field_size)
         self._cache = results
+        self._play_durations = list(play_durations or [])
         self._disp_cache = {}
         self._cache_complete = True
         txt = self._status.cget("text")
@@ -4959,10 +5104,13 @@ class CaptionApp:
         self._size_est_label.config(text="Finding settings that fit under 80 MB…")
 
         deferred_path, deferred_kind = self._deferred_path, self._deferred_kind
-        total = self._deferred_total_frames if deferred_path else len(self._frames)
-        frames = None if deferred_path else self._frames[:_GIF_SIZE_SAMPLE_FRAMES]
-        durations = None if deferred_path else list(self._durations)
-        fps = self._export_fps()
+        first, last = self._trim_range()
+        speed = self._speed()
+        total = last - first + 1
+        frames = (None if deferred_path
+                  else self._frames[first:last + 1][:_GIF_SIZE_SAMPLE_FRAMES])
+        durations = None if deferred_path else self._effective_durations()
+        fps = self._export_fps() * speed
         fw, fh = self._frames[0].size
         current_pct = raw["output_size_pct"] if raw["output_override"] else None
         target = _DA_MAX_UPLOAD_BYTES * 0.95  # headroom for sampling error
@@ -4973,12 +5121,15 @@ class CaptionApp:
             if src is None:
                 src = []
                 for i, f in enumerate(_iter_frames_from_path(deferred_path, deferred_kind)):
-                    if i >= _GIF_SIZE_SAMPLE_FRAMES:
+                    if i < first:
+                        continue
+                    if len(src) >= _GIF_SIZE_SAMPLE_FRAMES:
                         break
                     src.append(f)
                 with Image.open(deferred_path) as img:
-                    src_durations = [frm.info.get("duration", 100)
-                                     for frm in ImageSequence.Iterator(img)]
+                    src_durations = _retime_delays(
+                        [frm.info.get("duration", 100)
+                         for frm in ImageSequence.Iterator(img)][first:last + 1], speed)
 
             def size_at(pct: int, colors: int) -> int:
                 kwargs, _ = _resolve_composite_kwargs(
@@ -5079,7 +5230,10 @@ class CaptionApp:
         # the time spent drawing — otherwise the preview plays slower than
         # the real GIF.
         spent_ms = int((time.perf_counter() - t0) * 1000)
-        delay = max(1, max(20, self._durations[self._anim_idx]) - spent_ms)
+        durs = (self._play_durations if len(self._play_durations) == len(self._cache)
+                else self._durations)
+        frame_ms = durs[self._anim_idx] if self._anim_idx < len(durs) else 100
+        delay = max(1, max(20, frame_ms) - spent_ms)
         self._anim_idx = (self._anim_idx + 1) % len(self._cache)
         self._anim_id = self.root.after(delay, self._anim_step)
 
