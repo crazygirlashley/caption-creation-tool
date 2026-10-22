@@ -1853,10 +1853,14 @@ class CaptionApp:
         r = 0
         ttk.Label(f, text="Caption Text:").grid(row=r, column=0, columnspan=2, sticky="w")
         r += 1
+        # undo=True: Ctrl+Z / Ctrl+Y undo and redo typing, pastes and AI
+        # writer runs (each run is one step — see _open_ai_writer).
         self._text_box = tk.Text(f, width=22, height=8, wrap="word",
-                                 relief="solid", bd=1, padx=4, pady=4)
+                                 relief="solid", bd=1, padx=4, pady=4,
+                                 undo=True, autoseparators=True, maxundo=-1)
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
         self._text_box.insert("1.0", "Your caption here")
+        self._text_box.edit_reset()  # the placeholder isn't an undoable edit
         self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
         self._ai_btn = ttk.Button(f, text="✍ Write with AI…", command=self._open_ai_writer)
         self._ai_btn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
@@ -2087,7 +2091,8 @@ class CaptionApp:
 
         ttk.Label(f, text="Title Text:").grid(row=r, column=0, sticky="nw", pady=4)
         self._header_text_box = tk.Text(f, width=18, height=3, wrap="word",
-                                        relief="solid", bd=1, padx=3, pady=3)
+                                        relief="solid", bd=1, padx=3, pady=3,
+                                        undo=True, autoseparators=True, maxundo=-1)
         self._header_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._header_text_box.insert("1.0", "")
         self._header_text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
@@ -2117,7 +2122,8 @@ class CaptionApp:
 
         ttk.Label(f, text="Footer Text:").grid(row=r, column=0, sticky="nw", pady=4)
         self._footer_text_box = tk.Text(f, width=18, height=3, wrap="word",
-                                        relief="solid", bd=1, padx=3, pady=3)
+                                        relief="solid", bd=1, padx=3, pady=3,
+                                        undo=True, autoseparators=True, maxundo=-1)
         self._footer_text_box.grid(row=r, column=1, sticky="ew", padx=6, pady=(2, 8))
         self._footer_text_box.insert("1.0", "")
         self._footer_text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
@@ -2594,6 +2600,9 @@ class CaptionApp:
 
         def _finish(err: Optional[str], cancelled: bool) -> None:
             state["cancel"] = None
+            if self._text_box.winfo_exists():
+                self._text_box.edit_separator()
+                self._text_box.config(autoseparators=True)
             if win.winfo_exists():
                 gen_btn.config(state="normal")
                 stop_btn.config(state="disabled")
@@ -2614,6 +2623,9 @@ class CaptionApp:
             self._ai_last_prompt = prompt
             self._ai_last_length = length_var.get()
             words = ai_writer.LENGTHS.get(length_var.get(), 120)
+            # The whole run (clear + every streamed chunk) is one undo step.
+            self._text_box.edit_separator()
+            self._text_box.config(autoseparators=False)
             if mode_var.get() == "replace":
                 self._text_box.delete("1.0", "end")
             elif self._text_box.get("1.0", "end-1c").strip():
