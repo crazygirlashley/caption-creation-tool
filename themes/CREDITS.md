@@ -11,8 +11,9 @@ redistributed freely; credit is given here anyway.
 - License: CC0 1.0 Public Domain —
   <https://creativecommons.org/publicdomain/zero/1.0/>
 - Changes: the kiss print was cut out of its preview background, recolored
-  (red, hot pink, berry), arranged into a repeating tile on the theme's pink,
-  and lightly animated (a soft pulse).
+  (reds, hot pinks, berry), scattered densely at varied sizes and angles into
+  a seamless repeating tile on the theme's pink, and lightly animated (a soft
+  pulse).
 
 ## Sissy — `Sissy_lace.png`
 

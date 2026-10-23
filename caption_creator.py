@@ -317,6 +317,9 @@ _MIN_OUTPUT_H = 720
 # CaptionApp._collect_render_params).
 _MAX_AUTO_FONT_SIZE = 200
 _EDITOR_SIDEBAR_W = 340
+# With a background image, the Editor's writing card stops at this width
+# (comfortable line length) so the background shows around it.
+_EDITOR_MAX_TEXT_W = 860
 # Image height the title/tagline sizes are meant for when "Scale title &
 # tagline with image" is on.
 _OVERLAY_REF_H = 300
@@ -1755,6 +1758,7 @@ class CaptionApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._build_editor_view()  # needs the builder's caption box to exist
+        self._build_builder_view()
         self._load_wallpaper()
         self._on_format_change()  # sync all fields to the initially-selected format
         self._apply_view()  # open in the last-used view (Editor by default)
@@ -3373,6 +3377,41 @@ class CaptionApp:
         self._editor_sync_job = None
         self._editor_preview.configure(bg=self._card_bg())
 
+    def _build_builder_view(self) -> None:
+        """Host the Caption Builder's two panels (preview, settings) as
+        windows on a canvas, like the Editor's cards, so an app background
+        can show around and between them instead of only inside the
+        preview. They're children of root, which a canvas window allows
+        for any descendant of the canvas's parent."""
+        bv = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=self.root.cget("bg"))
+        self._builder_view = bv
+        self._right_frame.pack_forget()
+        self._preview_frame.pack_forget()
+        self._builder_wall_item = bv.create_image(0, 0, anchor="nw", tags=("wall",))
+        self._builder_preview_win = bv.create_window(0, 0, window=self._preview_frame, anchor="nw")
+        self._builder_right_win = bv.create_window(0, 0, window=self._right_frame, anchor="nw")
+        # Created before the canvas, so raise them above it in stacking order.
+        self._preview_frame.lift(bv)
+        self._right_frame.lift(bv)
+        bv.bind("<Configure>", lambda _e: self._layout_builder())
+
+    def _layout_builder(self) -> None:
+        bv = self._builder_view
+        w, h = bv.winfo_width(), bv.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        on = self._wall_active()
+        margin, gap = (22, 22) if on else (4, 6)
+        right_w = 350
+        bv.coords(self._builder_preview_win, margin, 0 if not on else margin)
+        bv.itemconfigure(self._builder_preview_win,
+                         width=max(200, w - right_w - 2 * margin - gap),
+                         height=max(100, h - (2 * margin if on else margin)))
+        bv.coords(self._builder_right_win, w - margin - right_w, 0 if not on else margin)
+        bv.itemconfigure(self._builder_right_win, width=right_w,
+                         height=max(100, h - (2 * margin if on else margin)))
+        self._update_wall_items()
+
     def _layout_editor(self) -> None:
         """Place the writing card and sidebar card; with a background
         image they float on it with margins, otherwise they fill the view."""
@@ -3381,14 +3420,29 @@ class CaptionApp:
         if w <= 1 or h <= 1:
             return
         on = self._wall_active()
-        margin, gap = (22, 18) if on else (10, 12)
         side_w = _EDITOR_SIDEBAR_W
-        card_w = max(200, w - side_w - 2 * margin - gap)
-        ed.coords(self._editor_card_win, margin, margin)
-        ed.itemconfigure(self._editor_card_win, width=card_w, height=max(100, h - 2 * margin))
-        ed.coords(self._editor_side_win, margin + card_w + gap, margin)
-        ed.itemconfigure(self._editor_side_win, width=side_w,
-                         height=max(100, h - 2 * margin) if on else max(100, h - margin))
+        if on:
+            # Leave plenty of the background showing: wide margins, the
+            # writing card capped at a comfortable reading width and centered
+            # in its space, and the sidebar only as tall as its contents.
+            margin, gap = 36, 28
+            room = w - side_w - 2 * margin - gap
+            card_w = max(320, min(room, _EDITOR_MAX_TEXT_W))
+            card_x = margin + max(0, (room - card_w) // 2)
+            card_h = max(160, h - 2 * margin)
+            # The sidebar doesn't propagate its size, so measure its grid
+            # contents (+ bottom padding) for its natural height.
+            content_h = self._editor_side.grid_bbox()[3] + 16
+            side_h = min(max(100, h - 2 * margin), max(100, content_h))
+        else:
+            margin, gap = 10, 12
+            card_w = max(200, w - side_w - 2 * margin - gap)
+            card_x, card_h, side_h = margin, max(100, h - 2 * margin), max(100, h - margin)
+        ed.coords(self._editor_card_win, card_x, margin)
+        ed.itemconfigure(self._editor_card_win, width=card_w, height=card_h)
+        ed.coords(self._editor_side_win, w - margin - side_w if on else card_x + card_w + gap,
+                  margin)
+        ed.itemconfigure(self._editor_side_win, width=side_w, height=side_h)
         self._update_wall_items()
 
     # ------------------------------------------------------------------
@@ -3434,6 +3488,9 @@ class CaptionApp:
         self._wall_job = None
         self._editor_view.configure(bg=self.root.cget("bg"))
         self._layout_editor()
+        if getattr(self, "_builder_view", None) is not None:
+            self._builder_view.configure(bg=self.root.cget("bg"))
+            self._layout_builder()
         self._redraw_preview_bg()
         if self._wall is not None and self._wall.animated and self._wall_cfg["animate"]:
             self._wall_job = self.root.after(self._wall.durations[0], self._wall_tick)
@@ -3472,6 +3529,10 @@ class CaptionApp:
             photo = self._wall_photo((ed.winfo_width(), ed.winfo_height()))
             ed.itemconfigure(self._editor_wall_item, image=photo or "")
         else:
+            bv = getattr(self, "_builder_view", None)
+            if bv is not None:
+                bv.itemconfigure(self._builder_wall_item, image=self._wall_photo(
+                    (bv.winfo_width(), bv.winfo_height())) or "")
             # Size is 1x1 until the preview has been laid out; the canvas's
             # <Configure> redraw then calls back here at the real size.
             photo = self._wall_photo((self._canvas.winfo_width(), self._canvas.winfo_height()))
@@ -3605,8 +3666,7 @@ class CaptionApp:
         view = self._view_var.get()
         recent_store.set_setting("view", view)
         if view == "editor":
-            self._right_frame.pack_forget()
-            self._preview_frame.pack_forget()
+            self._builder_view.pack_forget()
             self._sync_caption_to_editor()
             self._editor_view.pack(side="top", fill="both", expand=True)
             self._editor_box.focus_set()
@@ -3615,9 +3675,8 @@ class CaptionApp:
         else:
             self._sync_editor_to_caption()
             self._editor_view.pack_forget()
-            self._right_frame.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
-            self._preview_frame.pack(side="left", fill="both", expand=True, padx=(4, 2),
-                                     pady=(0, 4))
+            self._builder_view.pack(side="top", fill="both", expand=True)
+            self.root.after_idle(self._layout_builder)
             self.root.after(50, self._redraw_preview_bg)  # once it's laid out
         self._schedule_spellcheck(50)
 

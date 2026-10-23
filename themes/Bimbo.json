@@ -1,6 +1,6 @@
 {
   "name": "Bimbo",
-  "version": 4,
+  "version": 5,
   "bg": "#ffd3ea",
   "panel": "#fff1f8",
   "input_bg": "#ffffff",
@@ -18,6 +18,6 @@
   "canvas_muted": "#b4558c",
   "background": "Bimbo_kisses.gif",
   "background_mode": "tile",
-  "background_dim": 0.1,
+  "background_dim": 0.0,
   "background_animate": true
 }
