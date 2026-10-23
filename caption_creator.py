@@ -619,11 +619,18 @@ def _fit_font_size(text: str, font_family: str, max_size: int,
     return best
 
 
-def _words_that_fit(text: str, raw: dict) -> int:
-    """How many of text's words fit the caption panel at a comfortably
-    readable size (~4.2% of the output height, at least 24px) — the target
-    for the AI assistant's "Shorten to fit". Returns len(words) when it
-    already fits."""
+# Smallest caption text, in pixels of the exported file, that counts as
+# readable. Exports are viewed at full resolution, so this is an absolute
+# size — not a share of the image height (a 1.5%-of-height, ~22px caption
+# on a 1402px-tall export reads fine). Adjustable in the Editor.
+_READABLE_MIN_PX = 20
+
+
+def _words_that_fit(text: str, raw: dict, min_px: Optional[float] = None) -> int:
+    """How many of text's words fit the caption panel with the text at
+    least min_px (default _READABLE_MIN_PX) tall in the exported image — the
+    Editor's "fits beside the image" check and the target for "Shorten to
+    fit". Returns len(words) when it already fits."""
     words = text.split()
     if not words or raw.get("frame_size") is None:
         return len(words)
@@ -638,7 +645,7 @@ def _words_that_fit(text: str, raw: dict) -> int:
     area_w, area_h = (new_w, s_cap) if layout == "vertical" else (s_cap, new_h)
     pad = round(raw["pad"] * scale)
     stroke = round(raw["stroke_w"] * scale)
-    size = max(24, round(new_h * 0.042))
+    size = float(min_px or _READABLE_MIN_PX)
     font = _pil_font(raw["font_family"], size, raw["bold"])
     line_h = int(size * 1.3)
     draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
@@ -2760,7 +2767,7 @@ class CaptionApp:
         raw = self._gather_raw_params()
         shorten = n
         if raw is not None:
-            fit = _words_that_fit(full, raw)
+            fit = _words_that_fit(full, raw, self._min_text_px())
             overflow = len(full.split()) - fit
             shorten = max(10, int((n - overflow) * 0.9)) if overflow > 0 else max(10, int(n * 0.8))
         return {"smooth": max(1, n), "shorten": shorten,
@@ -3345,6 +3352,18 @@ class CaptionApp:
         ttk.Button(pv, text="Continue in Caption Builder  →", style="Accent.TButton",
                    command=lambda: (self._view_var.set("builder"), self._apply_view())).grid(
             row=2, column=0, sticky="ew", pady=(8, 0))
+        # Smallest caption text (px in the exported file) that still counts
+        # as readable — drives "fits beside the image" and Shorten to fit.
+        size_row = ttk.Frame(pv, style="Card.TFrame")
+        size_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(size_row, text="Readable text size:", style="Card.TLabel").pack(side="left")
+        self._min_text_var = tk.IntVar(
+            value=int(recent_store.get_setting("min_text_px", _READABLE_MIN_PX)))
+        tooltip(ttk.Spinbox(size_row, from_=10, to=80, width=4, textvariable=self._min_text_var),
+                "Smallest caption text, in pixels of the exported image, you consider readable. "
+                "The word-count check and Shorten to fit use it.").pack(side="left", padx=6)
+        ttk.Label(size_row, text="px", style="CardMuted.TLabel").pack(side="left")
+        self._min_text_var.trace_add("write", lambda *_: self._on_min_text_change())
         self._editor_placeholder = Placeholder(
             self._editor_box,
             "Start writing your caption story here…\n\n"
@@ -3640,6 +3659,20 @@ class CaptionApp:
             self.root.after_cancel(self._editor_sync_job)
         self._editor_sync_job = self.root.after(delay_ms, self._sync_editor_to_caption)
 
+    def _min_text_px(self) -> int:
+        try:
+            return max(10, min(80, int(self._min_text_var.get())))
+        except (tk.TclError, ValueError, AttributeError):
+            return _READABLE_MIN_PX
+
+    def _on_min_text_change(self) -> None:
+        try:
+            value = int(self._min_text_var.get())
+        except (tk.TclError, ValueError):
+            return  # mid-typing
+        recent_store.set_setting("min_text_px", max(10, min(80, value)))
+        self._update_editor_stats()
+
     def _update_editor_stats(self) -> None:
         for ph in (getattr(self, "_editor_placeholder", None),
                    getattr(self, "_caption_placeholder", None)):
@@ -3655,7 +3688,7 @@ class CaptionApp:
             parts.append("Text Message format uses chat bubbles — edit them in Caption Builder")
             color = "#888"
         elif raw is not None and words:
-            fit = _words_that_fit(text, raw)
+            fit = _words_that_fit(text, raw, self._min_text_px())
             if fit >= words:
                 parts.append("✓ fits beside the image at a readable size")
                 color = "#2e8b57"

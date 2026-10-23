@@ -75,6 +75,19 @@ class AssistantHelperTests(unittest.TestCase):
         long_text = "word " * 400
         fit = cc._words_that_fit(long_text, raw)
         self.assertTrue(10 < fit < 400, fit)
+        # A bigger minimum size fits fewer words.
+        self.assertLess(cc._words_that_fit(long_text, raw, 40), fit)
+
+    def test_long_caption_on_a_big_image_counts_as_fitting(self):
+        """Regression: ~1,300 words beside a 1122x1402 image export at ~22px
+        and read fine; the old height-based rule wanted ~59px text and
+        claimed only a fraction fit."""
+        text = ("I used to think hypnosis was a load of nonsense back in 2021. " * 120)
+        text = " ".join(text.split()[:1334])
+        raw = dict(frame_size=(1122, 1402), layout="horizontal", width=1402, pad=5,
+                   stroke_w=0, output_override=False, output_size_pct=0.0,
+                   font_family="Arial", bold=False)
+        self.assertEqual(cc._words_that_fit(text, raw), 1334)
 
 
 if __name__ == "__main__":
