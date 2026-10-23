@@ -49,7 +49,7 @@ DEFAULT_THEME = "Dark"
 # .gitignore). Any other themes/*.json you drop in is personal, same as
 # formats/. "Basic" ships as a JSON too, but only for reference — see the
 # name.lower() == "basic" skip in _load_palettes_from_disk.
-_CORE_THEME_NAMES = {"Basic", "Dark", "Bimbo", "Sissy", "Hypno", "Latex", "Pink Pill",
+_CORE_THEME_NAMES = {"Basic", "Dark", "Bimbo", "Sissy", "Hypno", "Pink Pill",
                      "Goth", "French Maid"}
 
 # "Bimbo" was called "Bubblegum" before 0.1.8 — the old built-in file is

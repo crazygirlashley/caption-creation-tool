@@ -20,17 +20,8 @@ changed and redistributed freely; credit is given here anyway.
 - Source: "MagicSpiral.gif" by Edo 555, Wikimedia Commons —
   <https://commons.wikimedia.org/wiki/File:MagicSpiral.gif>
 - License: public domain (released by the author)
-- Changes: cropped to the spiral, enlarged, recolored to violet and electric
-  teal, darkened toward the edges.
-
-## Latex — `Latex_gloss.jpg`
-
-- Source: "Black leather texture background", rawpixel (via Openverse) —
-  <https://www.rawpixel.com/> (free image, CC0)
-- License: CC0 1.0 Public Domain —
-  <https://creativecommons.org/publicdomain/zero/1.0/>
-- Changes: the folds were isolated and contrast-boosted into a wet-look
-  sheen, tinted cherry red on black, and made into a seamless tile.
+- Changes: cropped to the spiral, enlarged, recolored to hot pink and cyan,
+  darkened toward the edges.
 
 ## Pink Pill — `Pink_Pill_pills.gif`
 
@@ -51,11 +42,14 @@ changed and redistributed freely; credit is given here anyway.
 - License: public domain
 - Changes: trimmed and recolored to an oxblood damask on near-black.
 
-## French Maid — `French_Maid_stripes.jpg`
+## French Maid — `French_Maid_bows.gif`
 
-- Source: "Sidewall (France), 1875–1900", Cooper Hewitt, Smithsonian Design
-  Museum, via Wikimedia Commons —
-  <https://commons.wikimedia.org/wiki/File:Sidewall_(France),_1875%E2%80%931900_(CH_18798347).jpg>
-- License: public domain
-- Changes: trimmed to two full repeats, recolored to black-and-white
-  stripes, and mirrored vertically into a seamless tile.
+- Sources (rawpixel, CC0 1.0 Public Domain —
+  <https://creativecommons.org/publicdomain/zero/1.0/>):
+  - "Bow png sticker illustration" — <https://www.rawpixel.com/image/6728656/png-sticker-public-domain>
+  - "Pink heart png sticker" — <https://www.rawpixel.com/image/6704157/png-sticker-heart>
+    and <https://www.rawpixel.com/image/7278337/png-frame-sticker-heart>
+- Changes: cut out of their preview backgrounds, recolored (black and hot
+  pink bows, pink hearts), given white sticker outlines, scattered into a
+  seamless tile over pastel-pink polka dots, and lightly animated (a gentle
+  wobble).
