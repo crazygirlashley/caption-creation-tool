@@ -3483,7 +3483,7 @@ class CaptionApp:
 
     def _load_wallpaper(self) -> None:
         self._wall_cfg = self._wall_settings() or dict(self._WALL_DEFAULTS, mode="off")
-        self._wall = (wallpaper.load(self._wall_cfg["path"], float(self._wall_cfg["scale"]))
+        self._wall = (wallpaper.load(self._wall_cfg["path"], float(self._wall_cfg["scale"] or 1.0))
                       if self._wall_cfg["mode"] != "off" else None)
         self._wall_idx = 0
         self._wall_cache = {}
@@ -3526,8 +3526,10 @@ class CaptionApp:
         return photo
 
     def _update_wall_items(self) -> None:
-        """Point the editor's and the preview's background items at the
-        current frame."""
+        """Point the Editor's / Caption Builder's background items at the
+        current frame. The preview window itself stays plain (its theme
+        backdrop color) so the image being captioned isn't competing with
+        a pattern — the background shows around the panels instead."""
         ed = self._editor_view
         if self._view_var.get() == "editor":
             photo = self._wall_photo((ed.winfo_width(), ed.winfo_height()))
@@ -3537,14 +3539,7 @@ class CaptionApp:
             if bv is not None:
                 bv.itemconfigure(self._builder_wall_item, image=self._wall_photo(
                     (bv.winfo_width(), bv.winfo_height())) or "")
-            # Size is 1x1 until the preview has been laid out; the canvas's
-            # <Configure> redraw then calls back here at the real size.
-            photo = self._wall_photo((self._canvas.winfo_width(), self._canvas.winfo_height()))
-            if self._canvas.find_withtag("wall"):
-                self._canvas.itemconfigure("wall", image=photo or "")
-            elif photo is not None:
-                self._canvas.create_image(0, 0, anchor="nw", image=photo, tags=("wall",))
-                self._canvas.tag_lower("wall")
+            self._canvas.delete("wall")
 
     def _redraw_preview_bg(self) -> None:
         if self._cache:
@@ -3578,6 +3573,7 @@ class CaptionApp:
         path_var = tk.StringVar(value=cfg["path"])
         mode_var = tk.StringVar(value=cfg["mode"])
         dim_var = tk.DoubleVar(value=float(cfg["dim"]))
+        scale_var = tk.DoubleVar(value=float(cfg.get("scale", 1.0)))
         anim_var = tk.BooleanVar(value=bool(cfg["animate"]))
 
         ttk.Label(body, text="App background", style="Heading.TLabel").grid(
@@ -3634,8 +3630,17 @@ class CaptionApp:
                                       _schedule_apply())).pack(side="left", fill="x", expand=True)
         dim_lbl.config(text=f"{dim_var.get():.0%}")
         dim_lbl.pack(side="left", padx=(6, 0))
+        ttk.Label(own, text="Size:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        size_row = ttk.Frame(own)
+        size_row.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
+        size_lbl = ttk.Label(size_row, width=5)
+        ttk.Scale(size_row, from_=0.2, to=2.0, variable=scale_var, orient="horizontal",
+                  command=lambda _v: (size_lbl.config(text=f"{scale_var.get():.0%}"),
+                                      _schedule_apply())).pack(side="left", fill="x", expand=True)
+        size_lbl.config(text=f"{scale_var.get():.0%}")
+        size_lbl.pack(side="left", padx=(6, 0))
         ttk.Checkbutton(own, text="Animate GIFs", variable=anim_var,
-                        command=lambda: _apply()).grid(row=3, column=1, columnspan=2, sticky="w",
+                        command=lambda: _apply()).grid(row=4, column=1, columnspan=2, sticky="w",
                                                        padx=6, pady=(8, 0))
 
         ttk.Radiobutton(body, text="No background", value="off", variable=source_var,
@@ -3662,7 +3667,8 @@ class CaptionApp:
             per_theme = dict(recent_store.get_setting("backgrounds", {}) or {})
             per_theme[self._theme_name] = {
                 "source": source_var.get(), "path": p, "mode": mode_var.get(),
-                "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get())}
+                "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get()),
+                "scale": round(float(scale_var.get()), 2)}
             recent_store.set_setting("backgrounds", per_theme)
             self._load_wallpaper()
 
