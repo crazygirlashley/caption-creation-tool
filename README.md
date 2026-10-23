@@ -4,11 +4,13 @@
 
 A Windows desktop app for creating X-Change-style captioned images, animated GIFs, and MP4 videos. Place a styled text panel beside any image, overlay title and tagline text, apply pill color presets, and send the finished output directly to DeviantArt.
 
+> **🔞 Adults only (18+).** Caption Creator is made for adult (NSFW) caption art and is intended for a mature audience: **Find Online** searches adult websites and can show explicit images, and the **AI writer** can produce sexually explicit text. The app asks you to confirm you're 18 or older the first time it starts. Only use it where viewing adult content is legal for you.
+
 ---
 
 ## Features
 
-- **App background** — **⚙ Settings → Background…** puts an image or animated GIF behind the Editor (around its writing and sidebar cards) and the Caption Builder's preview, **fit to the window** or **tiled** as a repeating pattern, with a **dim** slider so text stays readable (it dims toward the current theme's color) and an option to pause GIF animation. The picture is copied into `backgrounds/` so it keeps working if the original moves; works with every theme
+- **App background** — an image or animated GIF behind the Editor (around its writing and sidebar cards) and the Caption Builder's preview, **fit to the window** or **tiled** as a repeating pattern. Themes can bring their own (Bimbo: animated lipstick kisses; Sissy: vintage lace), and **⚙ Settings → Background…** lets you use the theme's background, **your own picture or GIF** (with a **dim** slider and an option to pause animation; copied into `backgrounds/` so it keeps working if the original moves), or none
 - **Editor and Caption Builder views** — the toolbar's **✍ Editor / 🖼 Caption Builder** toggle switches between a focused writing view and the image builder. The Editor is a full-width writing space for the caption story with the AI tools as one-click buttons (write from a prompt, Smooth & polish, Shorten to fit, Add more detail, Fix spelling & grammar, custom instruction), spell check, a live word count that says whether the text fits beside the image at a readable size, and a small live preview of the caption on the image. Both views edit the same caption; the app reopens in whichever you used last
 - **Standard format** — image on the left, styled text panel on the right
 - **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
@@ -32,15 +34,14 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Emoji** — emoji in pasted captions, titles, taglines and Text Message bubbles (e.g. `Megan ❤️: ... 💕`) render in full color using Windows' Segoe UI Emoji font, sized and aligned to the text. Multi-part emoji (skin tones, combined ones like 👩🏼‍🦰) show as their base emoji (👩), since joining them needs a text-shaping library Pillow isn't built with here
 - **Trim & speed** — for GIF/MP4 sources, **Frames … to …** keeps just part of the animation and **Speed** (0.25×–3×, or type any value) plays it faster or slower; the preview, size estimate, Fit under 80 MB and export all use the trimmed, retimed version, and the row shows the resulting frame count and length
 - **Projects & recent files** — **File → Save Project…** (Ctrl+Shift+S) saves everything about the current caption to a `.ccproj` file — source file, format settings, caption/chat text, title and tagline, sizes, compression, watermark, trim and speed — and **Open Project…** (Ctrl+Shift+O) puts it all back, ideal for multi-part series. Images picked from Find Online are copied next to the project (their temp download is cleaned up otherwise). If a project's settings differ from the saved format it used, they load as "<format> (project)" so your real format is untouched. **Recent Files** / **Recent Projects** are in the same menu, and Find Online's search box remembers recent searches
-- **Batch export** — **File → Batch Export…** (or drop several files on the window) applies the current caption and format to many files at once; each one gets its own Auto-fit, dynamic panel size and auto watermark, stills save as PNG, GIFs as GIF and MP4s as MP4 (`<name>_captioned`) in the folder you pick, with per-file progress and a clear note for any file that fails
-- **Drag and drop** — drop an image, GIF, MP4 or `.ccproj` project onto the window to open it; drag an image straight from a web browser and it's downloaded and opened; drop several files to batch-export them
+- **Drag and drop** — drop an image, GIF, MP4 or `.ccproj` project onto the window to open it; drag an image straight from a web browser and it's downloaded and opened
 - **Spell check & grammar hints** — the caption box underlines misspellings in red (a 370k-word dictionary plus common names; contractions, curly apostrophes and emoji are understood) and likely grammar slips in blue (repeated words, lowercase "i", sentence capitals, a/an, "could of", "alot", spacing around punctuation). Right-click a word for suggestions, **Add to dictionary** (`user_dictionary.txt`) or **Ignore**, or a grammar fix; the same menu has Undo/Redo, Cut/Copy/Paste, **Fix spelling & grammar with AI**, and a toggle to turn checking off
 - **Keyboard shortcuts** — Ctrl+O opens a file, Ctrl+S saves the output, Ctrl+Shift+O / Ctrl+Shift+S open / save a project, Ctrl+Z / Ctrl+Y undo / redo caption edits (including a whole AI writer run)
 - **Detached export console** — GIF/MP4 exports (Save and Send to DA) run in a separate console window showing live per-frame progress, instead of on the app's main thread; the main window stays fully responsive during long exports, and the console closes on its own once the export finishes
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
 - **Find Online…** — search [Barnorama](https://www.barnorama.com), [AcidCow](https://acidcow.com) and [sex.com](https://www.sex.com) (pictures and GIFs, grouped into one result each; male search terms search its male section) from inside the app for source images/GIFs. The query defaults to physical-description keywords (hair color, gender, body type, age, clothing) pulled from your current caption text, and results are ranked by how well their titles match it (hair color first). Posts about real celebrities are filtered out. Results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed Built for finding photos of one attractive person: both sites are searched at once and results appear as each answers, multi-word queries also search their most distinctive word ("brunette woman" no longer collapses to a handful of off-topic posts), person galleries rank above memes and listicles, anything framed around children or teens is never shown, and a **Single person only** filter (on by default) uses on-device face detection (OpenCV YuNet) to hide group shots, memes and screenshots — previews are small, cached, and tagged **GIF** when animated. Each result group has a **More like this** button that searches for similar galleries using that post's descriptive words
 - **DeviantArt integration** — save finished output to Sta.sh (DeviantArt's private storage area) with one click; publish to gallery when ready
-- **UI themes** — Dark (default), Bimbo (pastel and hot pink), or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files. The UI uses a clean Segoe UI font, roomy buttons, an accent color for the main actions (Save, the selected view, "Write a story"), hover tooltips on toolbar and AI buttons (with keyboard shortcuts), helpful placeholder text in empty caption boxes, and a "drop an image here" prompt in the empty Caption Builder
+- **UI themes** — Dark (default), Bimbo (pastel and hot pink, animated kiss-print background), Sissy (lilac and pastel pink, vintage lace background), or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files. The UI uses a clean Segoe UI font, roomy buttons, an accent color for the main actions (Save, the selected view, "Write a story"), hover tooltips on toolbar and AI buttons (with keyboard shortcuts), helpful placeholder text in empty caption boxes, and a "drop an image here" prompt in the empty Caption Builder
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
 ---
@@ -269,7 +270,9 @@ A theme can also set an optional `font` key to a font family name (Bimbo uses `"
 
 Your theme choice is saved to `ui_settings.json` (gitignored).
 
-Optional keys: `accent`, `accent_fg` and `accent_hover` color the highlighted buttons (Save, the selected view, the main AI action) and selected tabs; `version` lets an updated built-in theme replace an older installed copy. See `themes/Dark.json` and `themes/Bimbo.json` for examples. A file missing any of these keys is skipped rather than crashing the app.
+Optional keys: `accent`, `accent_fg` and `accent_hover` color the highlighted buttons (Save, the selected view, the main AI action) and selected tabs; `version` lets an updated built-in theme replace an older installed copy.
+
+A theme can also have its own **background image or GIF**: `background` (a file name next to the theme JSON, or a full path), `background_mode` (`"fit"` to fill the window or `"tile"` to repeat it), `background_dim` (0–0.85, fades it toward the theme color), `background_animate` (`false` keeps a GIF still), and for patterns `background_scale`, `background_gap` (px between tiles) and `background_stagger` (offset every other row). Transparent areas show the theme's own color. See `themes/Dark.json`, `themes/Bimbo.json` and `themes/Sissy.json` for examples; artwork credits for the built-in backgrounds are in `themes/CREDITS.md`. A file missing any of these keys is skipped rather than crashing the app.
 
 ---
 
@@ -331,7 +334,9 @@ caption-creation-tool/
 │   └── X-Change (Vertical).json
 ├── themes/                   # UI theme definitions (JSON) — add your own here
 │   ├── Basic.json            # Reference only, never loaded
-│   ├── Bimbo.json
+│   ├── Bimbo.json / Bimbo_kisses.gif
+│   ├── Sissy.json / Sissy_lace.png
+│   ├── CREDITS.md            # Sources/licenses of the built-in theme backgrounds
 │   └── Dark.json
 ├── packaging/                # PyInstaller build (see "Building a Release")
 │   ├── build.spec            # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe

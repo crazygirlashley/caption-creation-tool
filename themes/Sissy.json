@@ -1,0 +1,22 @@
+{
+  "name": "Sissy",
+  "version": 1,
+  "bg": "#ecd9f2",
+  "panel": "#fbf3fd",
+  "input_bg": "#ffffff",
+  "hover": "#f4e4f9",
+  "border": "#c9a3d9",
+  "fg": "#4b2560",
+  "muted_fg": "#8d6a9e",
+  "select_bg": "#e0bff0",
+  "accent": "#b05cc9",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#c277d8",
+  "canvas": "#dcc4e6",
+  "canvas_fg": "#4b2560",
+  "canvas_muted": "#8d6a9e",
+  "background": "Sissy_lace.png",
+  "background_mode": "fit",
+  "background_dim": 0.0,
+  "background_animate": true
+}

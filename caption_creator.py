@@ -2,7 +2,6 @@
 """Caption Creator — add styled caption panels beside images and GIFs."""
 
 import collections
-import contextlib
 import ctypes
 import functools
 import io
@@ -1809,7 +1808,7 @@ class CaptionApp:
         tooltip(ttk.Button(bar, text="💾  Save…", style="Accent.TButton", command=self._save),
                 "Export the captioned image, GIF or MP4  (Ctrl+S)").pack(side="left", padx=4)
         file_btn = ttk.Menubutton(bar, text="File")
-        tooltip(file_btn, "Recent files, projects (Ctrl+Shift+S / Ctrl+Shift+O) and batch export")
+        tooltip(file_btn, "Recent files and projects (Ctrl+Shift+S / Ctrl+Shift+O)")
         self._file_menu = tk.Menu(file_btn, tearoff=False, postcommand=self._fill_file_menu)
         file_btn.config(menu=self._file_menu)
         file_btn.pack(side="left", padx=4)
@@ -3377,14 +3376,37 @@ class CaptionApp:
     # App background image / GIF (wallpaper.py)
     # ------------------------------------------------------------------
 
-    def _wall_settings(self) -> dict:
-        defaults = {"path": "", "mode": "off", "dim": 0.35, "animate": True}
-        saved = recent_store.get_setting("background", {}) or {}
-        return {**defaults, **{k: v for k, v in saved.items() if k in defaults}}
+    _WALL_DEFAULTS = {"source": "theme", "path": "", "mode": "fit", "dim": 0.35,
+                      "animate": True, "scale": 1.0, "gap": 0, "stagger": False}
+
+    def _saved_background(self) -> dict:
+        """The user's Background choice. "source" is "theme" (the current
+        theme's own background, if it has one — the default), "custom" (a
+        picture they picked) or "off"."""
+        saved = dict(recent_store.get_setting("background", {}) or {})
+        if "source" not in saved:  # settings from before themes had backgrounds
+            saved["source"] = ("custom" if saved.get("path") and saved.get("mode") not in
+                               (None, "off") else "theme")
+        cfg = {**self._WALL_DEFAULTS, **{k: v for k, v in saved.items()
+                                          if k in self._WALL_DEFAULTS}}
+        if cfg["mode"] not in ("fit", "tile"):
+            cfg["mode"] = "fit"
+        return cfg
+
+    def _wall_settings(self) -> Optional[dict]:
+        """The background actually shown right now, or None."""
+        saved = self._saved_background()
+        if saved["source"] == "custom" and saved["path"]:
+            return saved
+        if saved["source"] == "theme":
+            theme_bg = themes.theme_background(self._theme_name)
+            if theme_bg:
+                return {**self._WALL_DEFAULTS, **theme_bg, "source": "theme"}
+        return None
 
     def _load_wallpaper(self) -> None:
-        self._wall_cfg = self._wall_settings()
-        self._wall = (wallpaper.load(self._wall_cfg["path"])
+        self._wall_cfg = self._wall_settings() or dict(self._WALL_DEFAULTS, mode="off")
+        self._wall = (wallpaper.load(self._wall_cfg["path"], float(self._wall_cfg["scale"]))
                       if self._wall_cfg["mode"] != "off" else None)
         self._wall_idx = 0
         self._wall_cache = {}
@@ -3410,13 +3432,15 @@ class CaptionApp:
         if not self._wall_active() or size[0] <= 1 or size[1] <= 1:
             return None
         cfg = self._wall_cfg
-        key = (size, self._wall_idx, cfg["mode"], cfg["dim"], self.root.cget("bg"))
+        key = (size, self._wall_idx, cfg["mode"], cfg["dim"], cfg["gap"], cfg["stagger"],
+               self.root.cget("bg"))
         photo = self._wall_cache.get(key)
         if photo is None:
             if len(self._wall_cache) > 2 * wallpaper.MAX_FRAMES + 4:
                 self._wall_cache.clear()
             img = self._wall.render(self._wall_idx, size, cfg["mode"], float(cfg["dim"]),
-                                    self._wall_dim_color())
+                                    self._wall_dim_color(), gap=int(cfg["gap"]),
+                                    stagger=bool(cfg["stagger"]))
             photo = ImageTk.PhotoImage(img)
             self._wall_cache[key] = photo
         return photo
@@ -3456,26 +3480,42 @@ class CaptionApp:
         self._wall_job = self.root.after(delay, self._wall_tick)
 
     def _background_dialog(self) -> None:
-        cfg = self._wall_settings()
+        cfg = self._saved_background()
+        theme_bg = themes.theme_background(self._theme_name)
         dlg = tk.Toplevel(self.root)
         dlg.title("App Background")
         dlg.transient(self.root)
         dlg.resizable(False, False)
-        body = ttk.Frame(dlg, padding=14)
+        body = ttk.Frame(dlg, padding=16)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
 
+        source_var = tk.StringVar(value=cfg["source"])
         path_var = tk.StringVar(value=cfg["path"])
-        mode_var = tk.StringVar(value=cfg["mode"] if cfg["path"] else "off")
+        mode_var = tk.StringVar(value=cfg["mode"])
         dim_var = tk.DoubleVar(value=float(cfg["dim"]))
         anim_var = tk.BooleanVar(value=bool(cfg["animate"]))
 
-        ttk.Label(body, text="Image or GIF shown behind the Editor and the Caption "
-                             "Builder's preview.", foreground="#888", wraplength=380).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        ttk.Label(body, text="Picture:").grid(row=1, column=0, sticky="w")
-        name_lbl = ttk.Label(body, text=os.path.basename(cfg["path"]) or "(none)", width=34)
-        name_lbl.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(body, text="App background", style="Heading.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="Shown behind the Editor and the Caption Builder's preview.",
+                  style="Muted.TLabel", wraplength=400).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(2, 12))
+
+        theme_label = (f"Use the {self._theme_name} theme's background"
+                       + ("" if theme_bg else "  (this theme has none)"))
+        ttk.Radiobutton(body, text=theme_label, value="theme", variable=source_var,
+                        command=lambda: _apply()).grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(body, text="My own picture or GIF", value="custom", variable=source_var,
+                        command=lambda: _apply()).grid(row=3, column=0, columnspan=3,
+                                                       sticky="w", pady=(4, 0))
+
+        own = ttk.Frame(body, padding=(22, 6, 0, 0))
+        own.grid(row=4, column=0, columnspan=3, sticky="ew")
+        own.columnconfigure(1, weight=1)
+        ttk.Label(own, text="Picture:").grid(row=0, column=0, sticky="w")
+        name_lbl = ttk.Label(own, text=os.path.basename(cfg["path"]) or "(none chosen)", width=30)
+        name_lbl.grid(row=0, column=1, sticky="w", padx=6)
 
         def _choose() -> None:
             p = filedialog.askopenfilename(
@@ -3490,31 +3530,32 @@ class CaptionApp:
                 return
             path_var.set(p)
             name_lbl.config(text=os.path.basename(p))
-            if mode_var.get() == "off":
-                mode_var.set("fit")
+            source_var.set("custom")
             _apply()
 
-        ttk.Button(body, text="Choose…", command=_choose).grid(row=1, column=2)
-
-        ttk.Label(body, text="Layout:").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        modes = ttk.Frame(body)
-        modes.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(10, 0))
-        for label, value in (("Fit to window", "fit"), ("Tile pattern", "tile"), ("Off", "off")):
+        ttk.Button(own, text="Choose…", style="Small.TButton", command=_choose).grid(row=0, column=2)
+        ttk.Label(own, text="Layout:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        modes = ttk.Frame(own)
+        modes.grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=(8, 0))
+        for label, value in (("Fit to window", "fit"), ("Tile pattern", "tile")):
             ttk.Radiobutton(modes, text=label, value=value, variable=mode_var,
-                            command=lambda: _apply()).pack(side="left", padx=(0, 10))
-
-        ttk.Label(body, text="Dim:").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        dim_row = ttk.Frame(body)
-        dim_row.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=(10, 0))
+                            command=lambda: _apply()).pack(side="left", padx=(0, 12))
+        ttk.Label(own, text="Dim:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        dim_row = ttk.Frame(own)
+        dim_row.grid(row=2, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
         dim_lbl = ttk.Label(dim_row, width=5)
         ttk.Scale(dim_row, from_=0, to=0.85, variable=dim_var, orient="horizontal",
                   command=lambda _v: (dim_lbl.config(text=f"{dim_var.get():.0%}"),
                                       _schedule_apply())).pack(side="left", fill="x", expand=True)
         dim_lbl.config(text=f"{dim_var.get():.0%}")
         dim_lbl.pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(body, text="Animate GIF backgrounds", variable=anim_var,
-                        command=lambda: _apply()).grid(row=4, column=1, columnspan=2, sticky="w",
+        ttk.Checkbutton(own, text="Animate GIFs", variable=anim_var,
+                        command=lambda: _apply()).grid(row=3, column=1, columnspan=2, sticky="w",
                                                        padx=6, pady=(8, 0))
+
+        ttk.Radiobutton(body, text="No background", value="off", variable=source_var,
+                        command=lambda: _apply()).grid(row=5, column=0, columnspan=3,
+                                                       sticky="w", pady=(8, 0))
         job = {"id": None}
 
         def _schedule_apply() -> None:
@@ -3525,21 +3566,21 @@ class CaptionApp:
         def _apply() -> None:
             job["id"] = None
             p = path_var.get()
-            stored = p
-            if p and mode_var.get() != "off" and os.path.isfile(p):
+            if source_var.get() == "custom" and p and os.path.isfile(p):
                 try:
-                    stored = wallpaper.store_copy(p)
+                    p = wallpaper.store_copy(p)
                 except OSError:
-                    stored = p
-                path_var.set(stored)
+                    pass
+                path_var.set(p)
+            if source_var.get() == "custom" and not p:
+                return  # wait for a picture to be chosen
             recent_store.set_setting("background", {
-                "path": stored, "mode": mode_var.get() if stored else "off",
+                "source": source_var.get(), "path": p, "mode": mode_var.get(),
                 "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get())})
             self._load_wallpaper()
 
-        btns = ttk.Frame(body)
-        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
-        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side="right")
+        ttk.Button(body, text="Done", style="Accent.TButton", command=dlg.destroy).grid(
+            row=6, column=0, columnspan=3, sticky="e", pady=(16, 0))
 
     def _apply_view(self) -> None:
         view = self._view_var.get()
@@ -3695,13 +3736,6 @@ class CaptionApp:
         if not openable:
             messagebox.showinfo("Open", "Drop an image, GIF, MP4 or .ccproj project.")
             return
-        if len(openable) > 1 and hasattr(self, "_batch_export"):
-            if messagebox.askyesno(
-                    "Several files dropped",
-                    f"{len(openable)} files were dropped.\n\nBatch-export all of them "
-                    "with the current caption and format? (No opens just the first.)"):
-                self._batch_export(openable)
-                return
         self._load_source(openable[0])
 
     def _open_dropped_url(self, url: str) -> None:
@@ -4365,6 +4399,9 @@ class CaptionApp:
                                justify="left")
         status_lbl.pack(side="top", anchor="w")
         self._wl_status_lbl = status_lbl
+        ttk.Label(win, text="🔞 Results come from adult websites and may be explicit.",
+                  style="Muted.TLabel", padding=(8, 0)).pack(side="top", anchor="w",
+                                                             before=status_lbl)
 
         nav_row = ttk.Frame(win, padding=8)
         nav_row.pack(side="bottom", fill="x")
@@ -6059,158 +6096,7 @@ class CaptionApp:
         menu.add_cascade(label="Recent Projects", menu=recent_proj)
         menu.add_command(label="Save Project…", accelerator="Ctrl+Shift+S",
                          command=self._save_project)
-        menu.add_separator()
-        menu.add_command(label="Batch Export…", command=self._batch_export)
 
-    # ------------------------------------------------------------------
-    # Batch export
-    # ------------------------------------------------------------------
-
-    def _batch_export(self, paths: Optional[list] = None) -> None:
-        """Apply the current caption and format to several files. Each file
-        gets its own Auto-fit, dynamic panel size and auto watermark (they
-        depend on its size); stills save as PNG, GIFs as GIF, MP4s as MP4,
-        named "<file>_captioned" in the chosen folder."""
-        if self._batch_running():
-            self._batch_win.lift()
-            return
-        if not paths:
-            paths = list(filedialog.askopenfilenames(
-                title="Batch Export — choose files",
-                filetypes=[("Images, GIFs & Video", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp4"),
-                           ("All files", "*.*")]))
-            if not paths:
-                return
-        raw = self._gather_raw_params()
-        if raw is None:
-            messagebox.showerror("Batch Export", "Fix the invalid number fields first.")
-            return
-        out_dir = filedialog.askdirectory(title="Batch Export — save captioned files to…",
-                                          initialdir=os.path.dirname(paths[0]))
-        if not out_dir:
-            return
-        layout = raw["layout"]
-        dynamic = self._dynamic_width_var.get()
-        auto_wm = self._wm_auto_var.get() and not raw["footer_enabled"]
-
-        win = tk.Toplevel(self.root)
-        self._batch_win = win
-        win.title(f"Batch Export — {len(paths)} file(s)")
-        win.geometry("560x380")
-        win.transient(self.root)
-        body = ttk.Frame(win, padding=10)
-        body.pack(fill="both", expand=True)
-        listbox = tk.Listbox(body, height=12, activestyle="none")
-        listbox.pack(fill="both", expand=True)
-        for path in paths:
-            listbox.insert("end", f"⏳  {os.path.basename(path)}")
-        bar = ttk.Progressbar(body, maximum=len(paths))
-        bar.pack(fill="x", pady=(8, 4))
-        status = ttk.Label(body, text="Starting…", foreground="#888")
-        status.pack(anchor="w")
-        btns = ttk.Frame(body)
-        btns.pack(anchor="e", pady=(8, 0))
-        cancel = threading.Event()
-        cancel_btn = ttk.Button(btns, text="Cancel", command=cancel.set)
-        cancel_btn.pack(side="right")
-        open_btn = ttk.Button(btns, text="Open Folder",
-                              command=lambda: os.startfile(out_dir))
-
-        def _mark(i: int, icon: str, note: str = "") -> None:
-            if not win.winfo_exists():
-                return
-            listbox.delete(i)
-            listbox.insert(i, f"{icon}  {os.path.basename(paths[i])}{'  — ' + note if note else ''}")
-
-        def _one(i: int, path: str) -> str:
-            name, ext = os.path.splitext(os.path.basename(path))
-            ext = ext.lower()
-            is_video = ext == ".mp4"
-            if is_video:
-                reader = imageio.get_reader(path, "ffmpeg")
-                try:
-                    meta = reader.get_meta_data()
-                    fps = float(meta.get("fps") or 25)
-                    size = tuple(meta.get("size") or reader.get_data(0).shape[1::-1])
-                    total = int((meta.get("duration") or 0) * fps) or reader.count_frames()
-                finally:
-                    reader.close()
-                animated = True
-            else:
-                with Image.open(path) as img:
-                    size = img.size
-                    total = getattr(img, "n_frames", 1)
-                animated = total > 1
-            file_raw = dict(raw, frame_size=size, source_is_gif=ext == ".gif",
-                            output_override=raw["output_override"])
-            if dynamic:
-                file_raw["width"] = int(round((size[1] if layout == "vertical" else size[0])
-                                              * 1.25))
-            if auto_wm:
-                file_raw["watermark_height"] = _auto_watermark_height(size)
-            kwargs, _ = _resolve_composite_kwargs(file_raw)
-            if not animated:
-                with Image.open(path) as img:
-                    out = build_composite(img.convert("RGBA"), **kwargs)
-                out_path = os.path.join(out_dir, f"{name}_captioned.png")
-                out.save(out_path)
-                return out_path
-            out_ext = ".mp4" if is_video else ".gif"
-            out_path = os.path.join(out_dir, f"{name}_captioned{out_ext}")
-            job = {"source_path": path, "kind": "mp4" if is_video else "gif",
-                   "output_path": out_path, "as_mp4": is_video, "params": kwargs,
-                   "fps": fps if is_video else 10.0, "total_frames": total,
-                   "durations": None, "gif_colors": _resolve_gif_colors(file_raw)}
-            job_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
-                                                   encoding="utf-8")
-            json.dump(job, job_file)
-            job_file.close()
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    _export_worker_main(job_file.name)
-            finally:
-                os.unlink(job_file.name)
-            return out_path
-
-        def _work() -> None:
-            done = failed = 0
-            for i, path in enumerate(paths):
-                if cancel.is_set():
-                    break
-                self.root.after(0, lambda i=i: (_mark(i, "▶"),
-                                                status.config(text=f"Exporting {i + 1} of "
-                                                                   f"{len(paths)}…")))
-                try:
-                    out_path = _one(i, path)
-                    done += 1
-                    size_note = _human_size(os.path.getsize(out_path))
-                    self.root.after(0, lambda i=i, n=size_note: _mark(i, "✓", n))
-                except Exception as e:
-                    failed += 1
-                    log.exception("BATCH_EXPORT_ERROR  %s", path)
-                    self.root.after(0, lambda i=i, e=e: _mark(i, "✗", str(e)[:80]))
-                self.root.after(0, lambda v=i + 1: bar.config(value=v))
-            log.info("BATCH_EXPORT_DONE  ok=%d failed=%d cancelled=%s", done, failed,
-                     cancel.is_set())
-            self.root.after(0, lambda: _finish(done, failed))
-
-        def _finish(done: int, failed: int) -> None:
-            if not win.winfo_exists():
-                return
-            parts = [f"{done} exported"]
-            if failed:
-                parts.append(f"{failed} failed (see the list)")
-            if cancel.is_set():
-                parts.append("cancelled")
-            status.config(text=" · ".join(parts) + f" → {out_dir}")
-            cancel_btn.config(text="Close", command=win.destroy)
-            open_btn.pack(side="right", padx=(0, 6))
-
-        threading.Thread(target=_work, daemon=True).start()
-
-    def _batch_running(self) -> bool:
-        win = getattr(self, "_batch_win", None)
-        return bool(win) and win.winfo_exists()
 
     def _project_dict(self, project_path: str) -> Optional[dict]:
         fmt = self._format_var.get()
@@ -6573,6 +6459,55 @@ class CaptionApp:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _confirm_adult(root: tk.Tk) -> bool:
+    """One-time adults-only (18+) notice, shown before the main window is
+    built so nothing else pops up over it. Returns True to continue."""
+    if recent_store.get_setting("adult_confirmed", False):
+        return True
+    dlg = tk.Toplevel(root)
+    dlg.title("Caption Creator — Adults only")
+    dlg.resizable(False, False)
+    body = ttk.Frame(dlg, padding=22)
+    body.pack(fill="both", expand=True)
+    # Plain UI font regardless of theme (Bimbo's display font makes "18+"
+    # read like "18k") — this notice has to be unmistakable.
+    plain = themes.UI_FONT_FAMILY
+    ttk.Label(body, text="🔞  Adults only (18+)", font=(plain, 14, "bold")).pack(anchor="w")
+    ttk.Label(body, wraplength=440, justify="left", font=(plain, 10), text=(
+        "Caption Creator is made for adult (NSFW) caption art and is intended for a "
+        "mature audience.\n\n"
+        "• Find Online searches adult websites and can show explicit images.\n"
+        "• The AI writer and assistant can write sexually explicit stories.\n\n"
+        "Please continue only if you are 18 or older (or the age of majority where you "
+        "live) and viewing adult content is legal for you."
+    )).pack(anchor="w", pady=(10, 16))
+    result = [False]
+
+    def _answer(ok: bool) -> None:
+        result[0] = ok
+        dlg.destroy()
+
+    btns = ttk.Frame(body)
+    btns.pack(anchor="e")
+    ttk.Button(btns, text="Exit", command=lambda: _answer(False)).pack(side="right")
+    ok_btn = ttk.Button(btns, text="I'm 18 or older — continue", style="Accent.TButton",
+                        command=lambda: _answer(True))
+    ok_btn.pack(side="right", padx=(0, 8))
+    dlg.protocol("WM_DELETE_WINDOW", lambda: _answer(False))
+    dlg.update_idletasks()
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    dlg.geometry(f"+{(sw - dlg.winfo_width()) // 2}+{(sh - dlg.winfo_height()) // 3}")
+    dlg.lift()
+    dlg.focus_force()
+    ok_btn.focus_set()
+    dlg.grab_set()
+    root.wait_window(dlg)
+    if result[0]:
+        recent_store.set_setting("adult_confirmed", True)
+        log.info("ADULT_CONFIRMED")
+    return result[0]
+
+
 def main() -> None:
     # TkinterDnD.Tk is a tk.Tk with the tkdnd extension loaded — needed for
     # dropping files onto the window (see CaptionApp._setup_drop_target).
@@ -6597,7 +6532,14 @@ def main() -> None:
         except Exception:
             log.warning("LOGO_LOAD_ERROR", exc_info=True)
 
+    # Adults only: ask once, before the main window is built or shown.
+    root.withdraw()
+    themes.apply(root, ttk.Style(root), themes.load_theme())
+    if not _confirm_adult(root):
+        root.destroy()
+        return
     CaptionApp(root)
+    root.deiconify()
     root.mainloop()
 
 

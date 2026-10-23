@@ -4,7 +4,8 @@ The app shows it behind the Editor's cards and the Caption Builder's
 preview, either covering the area ("fit": scaled to fill, center-cropped)
 or repeated as a pattern ("tile"), optionally dimmed toward the theme's
 background color so text on top stays readable. Animated GIFs/WebPs keep
-their frames and timing (capped — see MAX_FRAMES).
+their frames and timing (capped — see MAX_FRAMES). Transparent pixels
+show the theme's background color.
 """
 
 import os
@@ -23,12 +24,16 @@ STORE_DIR = os.path.join(app_paths.BASE_DIR, "backgrounds")
 
 
 class Wallpaper:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, scale: float = 1.0) -> None:
         self.path = path
         frames, durations = [], []
         with Image.open(path) as img:
             for frm in ImageSequence.Iterator(img):
-                frames.append(frm.convert("RGB"))
+                frame = frm.convert("RGBA")
+                if scale and scale != 1.0:
+                    frame = frame.resize((max(1, round(frame.width * scale)),
+                                          max(1, round(frame.height * scale))), Image.LANCZOS)
+                frames.append(frame)
                 durations.append(max(20, int(frm.info.get("duration", 100) or 100)))
         if not frames:
             raise ValueError("no frames")
@@ -46,24 +51,30 @@ class Wallpaper:
         return len(self.frames) > 1
 
     def render(self, index: int, size: tuple, mode: str = "fit", dim: float = 0.0,
-               dim_color: tuple = (0, 0, 0)) -> Image.Image:
-        """Frame `index` laid out over an area of `size` (w, h)."""
+               dim_color: tuple = (0, 0, 0), gap: int = 0, stagger: bool = False) -> Image.Image:
+        """Frame `index` laid out over an area of `size` (w, h), on
+        `dim_color` wherever the image is transparent. Tiles can be spaced
+        `gap` px apart, with every other row shifted half a tile (`stagger`)."""
         w, h = max(1, int(size[0])), max(1, int(size[1]))
         frame = self.frames[index % len(self.frames)]
+        out = Image.new("RGBA", (w, h), tuple(dim_color) + (255,))
         if mode == "tile":
-            out = Image.new("RGB", (w, h))
-            fw, fh = frame.size
-            for y in range(0, h, fh):
-                for x in range(0, w, fw):
-                    out.paste(frame, (x, y))
+            step_x, step_y = frame.width + gap, frame.height + gap
+            for row, y in enumerate(range(-step_y if stagger else 0, h, step_y)):
+                shift = (step_x // 2) if stagger and row % 2 else 0
+                for x in range(-shift, w, step_x):
+                    # A masked paste blends transparency like alpha_composite
+                    # but also accepts tiles hanging off the top/left edge.
+                    out.paste(frame, (x, y), frame)
         else:  # fit = cover the area, keep aspect, crop the overflow
             scale = max(w / frame.width, h / frame.height)
             rw, rh = max(1, round(frame.width * scale)), max(1, round(frame.height * scale))
             resized = frame.resize((rw, rh), Image.BILINEAR if self.animated else Image.LANCZOS)
             left, top = (rw - w) // 2, (rh - h) // 2
-            out = resized.crop((left, top, left + w, top + h))
+            out.alpha_composite(resized.crop((left, top, left + w, top + h)))
+        out = out.convert("RGB")
         if dim > 0:
-            out = Image.blend(out, Image.new("RGB", out.size, dim_color), min(0.95, dim))
+            out = Image.blend(out, Image.new("RGB", out.size, tuple(dim_color)), min(0.95, dim))
         return out
 
 
@@ -77,10 +88,10 @@ def store_copy(path: str) -> str:
     return dest
 
 
-def load(path: Optional[str]) -> Optional[Wallpaper]:
+def load(path: Optional[str], scale: float = 1.0) -> Optional[Wallpaper]:
     if not path or not os.path.isfile(path):
         return None
     try:
-        return Wallpaper(path)
+        return Wallpaper(path, scale)
     except (OSError, ValueError):
         return None

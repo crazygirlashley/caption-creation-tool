@@ -49,7 +49,7 @@ DEFAULT_THEME = "Dark"
 # .gitignore). Any other themes/*.json you drop in is personal, same as
 # formats/. "Basic" ships as a JSON too, but only for reference — see the
 # name.lower() == "basic" skip in _load_palettes_from_disk.
-_CORE_THEME_NAMES = {"Basic", "Dark", "Bimbo"}
+_CORE_THEME_NAMES = {"Basic", "Dark", "Bimbo", "Sissy"}
 
 # "Bimbo" was called "Bubblegum" before 0.1.8 — the old built-in file is
 # replaced by Bimbo.json (unless it was customized) and a saved choice of
@@ -158,6 +158,9 @@ def _load_palettes_from_disk() -> dict:
                 palette[key] = data.get(key, default)
             if data.get("font"):
                 palette["font"] = data["font"]
+            bg = _theme_background_from(data)
+            if bg:
+                palette["background"] = bg
             result[name] = palette
         except Exception:
             continue
@@ -221,6 +224,49 @@ def apply(root: tk.Tk, style: ttk.Style, name: str) -> None:
         _apply_options(root, None)
         _set_ui_font(root, None)
     _apply_layout_styles(style, palettes.get(name))
+
+
+_BACKGROUND_MODES = ("fit", "tile")
+
+
+def _theme_background_from(data: dict) -> Optional[dict]:
+    """A theme's optional background image or GIF:
+        "background": file name (next to the theme JSON) or full path
+        "background_mode": "fit" (fill the area, cropping) or "tile" (repeat)
+        "background_dim": 0-0.85, fades it toward the theme's bg color
+        "background_animate": false to keep a GIF still
+        "background_scale": resize the image first (e.g. 0.5 for a pattern)
+        "background_gap": px of theme color between tiles
+        "background_stagger": shift every other row of tiles half a tile
+    Returns None when unset or the file is missing."""
+    ref = data.get("background")
+    if not ref or not isinstance(ref, str):
+        return None
+    path = ref if os.path.isabs(ref) else os.path.join(_THEMES_DIR, ref)
+    if not os.path.isfile(path):
+        return None
+    mode = data.get("background_mode", "fit")
+    try:
+        dim = max(0.0, min(0.85, float(data.get("background_dim", 0.0))))
+    except (TypeError, ValueError):
+        dim = 0.0
+    def _num(key: str, default: float, lo: float, hi: float) -> float:
+        try:
+            return max(lo, min(hi, float(data.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    return {"path": path, "mode": mode if mode in _BACKGROUND_MODES else "fit",
+            "dim": dim, "animate": bool(data.get("background_animate", True)),
+            "scale": _num("background_scale", 1.0, 0.05, 4.0),
+            "gap": int(_num("background_gap", 0, 0, 400)),
+            "stagger": bool(data.get("background_stagger", False))}
+
+
+def theme_background(name: str) -> Optional[dict]:
+    """{"path", "mode", "dim", "animate"} for the theme's own background,
+    or None if it has none."""
+    return get_palettes().get(name, {}).get("background")
 
 
 def accent(name: str) -> dict:

@@ -33,6 +33,7 @@ formats/*.json
 themes/*.json
 !themes/Dark.json
 !themes/Bimbo.json
+!themes/Sissy.json
 !themes/Basic.json
 
 # Local AI writer settings (server address, model, optional API key)

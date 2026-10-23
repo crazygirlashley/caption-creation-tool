@@ -1,6 +1,6 @@
 {
   "name": "Bimbo",
-  "version": 2,
+  "version": 4,
   "bg": "#ffd3ea",
   "panel": "#fff1f8",
   "input_bg": "#ffffff",
@@ -15,5 +15,9 @@
   "font": "Aardvark Cafe",
   "canvas": "#f9c2df",
   "canvas_fg": "#7d1450",
-  "canvas_muted": "#b4558c"
+  "canvas_muted": "#b4558c",
+  "background": "Bimbo_kisses.gif",
+  "background_mode": "tile",
+  "background_dim": 0.1,
+  "background_animate": true
 }
