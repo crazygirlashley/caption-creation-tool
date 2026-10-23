@@ -25,7 +25,8 @@ import webbrowser
 
 import imageio.v2 as imageio
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageTk
+from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageStat,
+                 ImageTk)
 
 try:  # drag-and-drop support (optional: the app works without it)
     from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
@@ -437,6 +438,13 @@ def _pad_to_macro_block(arr: np.ndarray, block: int = 16) -> np.ndarray:
     return np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
 
 
+# Watermark corners: (label, build_composite watermark_pos code).
+_WM_POSITIONS = (("Bottom left", "bl"), ("Bottom right", "br"),
+                 ("Top left", "tl"), ("Top right", "tr"))
+_WM_POS_CODE = dict(_WM_POSITIONS)
+_WM_POS_LABEL = {code: label for label, code in _WM_POSITIONS}
+
+
 def _hex_to_rgb(color: str) -> tuple:
     h = color.lstrip("#")
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -601,9 +609,216 @@ def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Inline styling
+#
+# In the caption, *word* is drawn in italics and **word** in bold (the
+# markers themselves aren't drawn), and "dialogue in quotes" can be drawn in
+# its own color — what caption artists otherwise do by hand. Text without
+# any markers goes through the plain _wrap_lines path exactly as before.
+# ---------------------------------------------------------------------------
+
+_STYLE_BOLD, _STYLE_ITALIC, _STYLE_QUOTE = 1, 2, 4
+_MARKUP_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*|\*(?=[^\s*])(.+?)(?<=[^\s*])\*", re.S)
+_QUOTE_RE = re.compile('"[^"\n]+"|\u201c[^\u201d\n]+\u201d')
+# Lean of a synthesized italic (for fonts without an italic file).
+_ITALIC_SLANT = 0.2
+
+
+def _has_markup(text: str) -> bool:
+    return _MARKUP_RE.search(text) is not None
+
+
+def _styled_chars(text: str, markup: bool = True, quotes: bool = False) -> tuple:
+    """(plain, flags): text with the * / ** markers removed, and a style flag
+    (_STYLE_*) for each remaining character. Markers can nest
+    ("**bold with *italic* inside**")."""
+    parts: list = []
+    flags: list = []
+
+    def walk(sub: str, base: int) -> None:
+        pos = 0
+        for m in (_MARKUP_RE.finditer(sub) if markup else ()):
+            parts.append(sub[pos:m.start()])
+            flags.extend([base] * (m.start() - pos))
+            if m.group(1) is not None:
+                walk(m.group(1), base | _STYLE_BOLD)
+            else:
+                walk(m.group(2), base | _STYLE_ITALIC)
+            pos = m.end()
+        parts.append(sub[pos:])
+        flags.extend([base] * (len(sub) - pos))
+
+    walk(text, 0)
+    plain = "".join(parts)
+    if quotes:
+        for m in _QUOTE_RE.finditer(plain):
+            for i in range(m.start(), m.end()):
+                flags[i] |= _STYLE_QUOTE
+    return plain, flags
+
+
+@functools.lru_cache(maxsize=256)
+def _style_font(family: str, size: float, bold: bool, italic: bool) -> tuple:
+    """(font, synthetic_italic) for a styled run. Uses the family's own
+    italic file when installed; otherwise the upright font, which the
+    caller then slants (see _draw_slanted)."""
+    if italic:
+        fonts = _scan_all_fonts()
+        names = ((f"{family} Bold Italic", f"{family} Bold Oblique") if bold
+                 else (f"{family} Italic", f"{family} Oblique"))
+        for name in names:
+            path = fonts.get(name)
+            if path:
+                try:
+                    return ImageFont.truetype(path, size), False
+                except Exception:
+                    pass
+    return _pil_font(family, size, bold), italic
+
+
+def _seg_len(seg: str, font: ImageFont.FreeTypeFont) -> float:
+    """Advance width of a run — what the next run starts after."""
+    if _has_emoji(seg):
+        efont = _emoji_font_for(font)
+        if efont is not None:
+            return sum((efont if e else font).getlength(t) for t, e in _rich_segments(seg))
+    return font.getlength(seg)
+
+
+def _needs_styling(text: str, markup: bool, quotes: bool) -> bool:
+    return (markup and _has_markup(text)) or (quotes and _QUOTE_RE.search(text) is not None)
+
+
+def _styled_lines(text: str, family: str, size: float, bold: bool, max_px: float,
+                  markup: bool = True, quotes: bool = False) -> list:
+    """Word-wrap styled text into lines of [(segment, flags)] runs — each
+    word measured in its own (bold/italic) font, so styled text wraps the
+    same way it's drawn."""
+    plain, flags = _styled_chars(text, markup, quotes)
+
+    def font_for(fl: int) -> ImageFont.FreeTypeFont:
+        return _style_font(family, size, bold or bool(fl & _STYLE_BOLD),
+                           bool(fl & _STYLE_ITALIC))[0]
+
+    def runs_of(a: int, b: int) -> list:
+        runs, i = [], a
+        while i < b:
+            j = i
+            while j < b and flags[j] == flags[i]:
+                j += 1
+            runs.append((plain[i:j], flags[i]))
+            i = j
+        return runs
+
+    def width(runs: list) -> float:
+        return sum(_seg_len(seg, font_for(fl)) for seg, fl in runs)
+
+    space_w = font_for(0).getlength(" ")
+    lines: list = []
+    offset = 0
+    for para in plain.split("\n"):
+        start = offset
+        offset += len(para) + 1
+        words = [(m.start() + start, m.end() + start) for m in re.finditer(r"\S+", para)]
+        if not words:
+            lines.append([])
+            continue
+        pieces = []
+        for a, b in words:  # break words wider than the panel (see _split_long_words)
+            if b - a > 1 and width(runs_of(a, b)) > max_px:
+                c = a
+                for k in range(a + 1, b + 1):
+                    if k - c > 1 and width(runs_of(c, k)) > max_px:
+                        pieces.append((c, k - 1))
+                        c = k - 1
+                pieces.append((c, b))
+            else:
+                pieces.append((a, b))
+        cur: list = []
+        cur_w = 0.0
+        for a, b in pieces:
+            runs = runs_of(a, b)
+            w = width(runs)
+            if cur and cur_w + space_w + w > max_px:
+                lines.append(cur)
+                cur, cur_w = list(runs), w
+            else:
+                if cur:
+                    cur.append((" ", flags[a - 1] if plain[a - 1] == " " else 0))
+                    cur_w += space_w
+                cur.extend(runs)
+                cur_w += w
+        lines.append(cur)
+    # Merge neighbouring runs of the same style (fewer draw calls).
+    merged = []
+    for line in lines:
+        out: list = []
+        for seg, fl in line:
+            if out and out[-1][1] == fl:
+                out[-1] = (out[-1][0] + seg, fl)
+            else:
+                out.append((seg, fl))
+        merged.append(out)
+    return merged
+
+
+def _count_lines(text: str, family: str, size: float, bold: bool, max_px: float,
+                 draw: ImageDraw.ImageDraw, markup: bool = False) -> int:
+    """Wrapped line count, styled or plain — what Auto-fit measures."""
+    if _needs_styling(text, markup, False):
+        return len(_styled_lines(text, family, size, bold, max_px, markup))
+    return len(_wrap_lines(text, _pil_font(family, size, bold), max_px, draw))
+
+
+def _draw_slanted(draw: ImageDraw.ImageDraw, xy: tuple, seg: str,
+                  font: ImageFont.FreeTypeFont, fill, stroke_width: int,
+                  stroke_fill, emoji_color: bool) -> None:
+    """Draw a run in faux italics: render it upright onto its own layer,
+    shear that, and composite it onto the draw's image."""
+    target = getattr(draw, "_image", None)
+    if target is None:
+        _draw_rich(draw, xy, seg, font, fill, stroke_width, stroke_fill, emoji_color)
+        return
+    asc, desc = font.getmetrics()
+    pad = stroke_width + 2
+    h = asc + desc + pad * 2
+    lean = int(h * _ITALIC_SLANT) + 1
+    w = int(_seg_len(seg, font)) + pad * 2 + lean
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    _draw_rich(ImageDraw.Draw(layer), (pad, pad), seg, font, fill, stroke_width, stroke_fill,
+               emoji_color)
+    layer = layer.transform(layer.size, Image.AFFINE,
+                            (1, _ITALIC_SLANT, -_ITALIC_SLANT * h, 0, 1, 0), Image.BICUBIC)
+    dx, dy = round(xy[0]) - pad, round(xy[1]) - pad
+    sx, sy = max(0, -dx), max(0, -dy)
+    if sx < layer.width and sy < layer.height:
+        target.alpha_composite(layer, (max(0, dx), max(0, dy)), (sx, sy))
+
+
+def _runs_w(runs: list, family: str, size: float, bold: bool) -> float:
+    return sum(_seg_len(seg, _style_font(family, size, bold or bool(fl & _STYLE_BOLD),
+                                         bool(fl & _STYLE_ITALIC))[0]) for seg, fl in runs)
+
+
+def _draw_runs(draw: ImageDraw.ImageDraw, xy: tuple, runs: list, family: str, size: float,
+               bold: bool, fill, quote_fill, stroke_width: int = 0, stroke_fill=None,
+               emoji_color: bool = True) -> None:
+    x, y = xy
+    for seg, fl in runs:
+        font, synth = _style_font(family, size, bold or bool(fl & _STYLE_BOLD),
+                                  bool(fl & _STYLE_ITALIC))
+        color = quote_fill if (fl & _STYLE_QUOTE and quote_fill is not None) else fill
+        if synth and seg.strip():
+            _draw_slanted(draw, (x, y), seg, font, color, stroke_width, stroke_fill, emoji_color)
+        else:
+            _draw_rich(draw, (x, y), seg, font, color, stroke_width, stroke_fill, emoji_color)
+        x += _seg_len(seg, font)
+
+
 def _fit_font_size(text: str, font_family: str, max_size: int,
                    area_w: int, area_h: int, padding: int,
-                   stroke_width: int = 0, bold: bool = False) -> int:
+                   stroke_width: int = 0, bold: bool = False, markup: bool = False) -> int:
     """Binary-search for the largest font size where wrapped text fits in area_w×area_h."""
     if not text.strip():
         return max_size
@@ -611,9 +826,9 @@ def _fit_font_size(text: str, font_family: str, max_size: int,
     lo, hi, best = 6, max_size, 6
     while lo <= hi:
         mid = (lo + hi) // 2
-        font = _pil_font(font_family, mid, bold)
-        lines = _wrap_lines(text, font, area_w - padding * 2 - stroke_width * 2, tmp_draw)
-        total_h = len(lines) * int(mid * 1.3) + padding * 2
+        n_lines = _count_lines(text, font_family, mid, bold,
+                               area_w - padding * 2 - stroke_width * 2, tmp_draw, markup)
+        total_h = n_lines * int(mid * 1.3) + padding * 2
         if total_h <= area_h:
             best = mid
             lo = mid + 1
@@ -649,13 +864,13 @@ def _words_that_fit(text: str, raw: dict, min_px: Optional[float] = None) -> int
     pad = round(raw["pad"] * scale)
     stroke = round(raw["stroke_w"] * scale)
     size = float(min_px or _READABLE_MIN_PX)
-    font = _pil_font(raw["font_family"], size, raw["bold"])
     line_h = int(size * 1.3)
     draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
     def fits(n: int) -> bool:
-        lines = _wrap_lines(" ".join(words[:n]), font, area_w - pad * 2 - stroke * 2, draw)
-        return len(lines) * line_h + pad * 2 <= area_h
+        n_lines = _count_lines(" ".join(words[:n]), raw["font_family"], size, raw["bold"],
+                               area_w - pad * 2 - stroke * 2, draw, raw.get("markup", False))
+        return n_lines * line_h + pad * 2 <= area_h
 
     if fits(len(words)):
         return len(words)
@@ -706,7 +921,8 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
                                          max_size, area_w, area_h, s_pad, bold)
         else:
             fitted = _fit_font_size(text, raw["font_family"], max_size,
-                                    area_w, area_h, s_pad, s_stroke, bold)
+                                    area_w, area_h, s_pad, s_stroke, bold,
+                                    raw.get("markup", False))
         # Back to the Font Size field's units, rounded down to a quarter
         # point so the drawn size (this x scale) never exceeds what fit.
         size = max(0.25, int(fitted / scale * 4) / 4)
@@ -755,6 +971,13 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         # the dither into fresh colors, roughly tripling the exported GIF's
         # size for no visible gain. Nearest keeps the source's own pixels.
         upscale_filter="nearest" if raw.get("source_is_gif") else "lanczos",
+        inline_markup=raw.get("markup", False),
+        dialogue_color=raw.get("dialogue_color", ""),
+        zoom=raw.get("zoom", 1.0),
+        pan_x=raw.get("pan_x", 0.0),
+        pan_y=raw.get("pan_y", 0.0),
+        watermark_pos=raw.get("watermark_pos", "bl"),
+        watermark_opacity=raw.get("watermark_opacity", 1.0),
     )
 
     if raw["header_enabled"]:
@@ -764,7 +987,67 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
             header_size=raw["header_size"] * overlay_k,
         )
 
+    # Auto-contrast: outline the title/tagline when the picture behind them
+    # is busy or close to the text color (only when there's no outline set).
+    luma = raw.get("overlay_luma") if raw.get("auto_contrast") else None
+    if luma and not stroke_w:
+        if raw["header_enabled"]:
+            kwargs["header_outline"] = _auto_outline(luma.get("header"), raw["font_color"],
+                                                     kwargs["header_size"])
+        if raw["footer_enabled"]:
+            kwargs["footer_outline"] = _auto_outline(luma.get("footer"), raw["font_color"],
+                                                     footer_size)
+
     return kwargs, size
+
+
+# A title/tagline is outlined automatically when the image region behind it
+# differs from the text by less than this much luminance (0-255)...
+_CONTRAST_MIN_DIFF = 100
+# ...or is busier (luminance standard deviation) than this.
+_CONTRAST_MAX_BUSY = 45
+
+
+def _overlay_luma(frame: Image.Image) -> dict:
+    """Mean and spread of the image's brightness where the title (top-left)
+    and the tagline (along the bottom) sit — see _auto_outline."""
+    g = frame.convert("L")
+    fw, fh = g.size
+
+    def stat(box: tuple) -> list:
+        st = ImageStat.Stat(g.crop(box).resize((96, 24)))
+        return [round(st.mean[0], 1), round(st.stddev[0], 1)]
+
+    return {"header": stat((0, 0, max(1, int(fw * 0.6)), max(1, int(fh * 0.14)))),
+            "footer": stat((0, min(fh - 1, int(fh * 0.86)), fw, fh))}
+
+
+def _auto_outline(luma: Optional[list], text_color: str, size: float) -> Optional[list]:
+    """[width, color] of an outline that keeps overlaid text readable over
+    this region, or None when it already stands out."""
+    if not luma:
+        return None
+    mean, spread = luma
+    r, g, b = _hex_to_rgb(text_color)
+    lt = 0.299 * r + 0.587 * g + 0.114 * b
+    if abs(lt - mean) >= _CONTRAST_MIN_DIFF and spread <= _CONTRAST_MAX_BUSY:
+        return None
+    return [max(1, round(size * 0.08)), "#000000" if lt >= 128 else "#ffffff"]
+
+
+def _apply_zoom(frame: Image.Image, zoom: float, pan_x: float, pan_y: float,
+                resample=Image.LANCZOS) -> Image.Image:
+    """Zoom into the picture inside its own frame (same output size): crop a
+    1/zoom-sized window, panned by pan_x/pan_y (-1..1, 0 = centered), and
+    scale it back up."""
+    if zoom <= 1.001:
+        return frame
+    fw, fh = frame.size
+    cw, ch = fw / zoom, fh / zoom
+    cx = fw / 2 + max(-1.0, min(1.0, pan_x)) * (fw - cw) / 2
+    cy = fh / 2 + max(-1.0, min(1.0, pan_y)) * (fh - ch) / 2
+    box = (cx - cw / 2, cy - ch / 2, cx + cw / 2, cy + ch / 2)
+    return frame.resize((fw, fh), resample, box=box)
 
 
 def _text_x(draw: ImageDraw.ImageDraw, line: str, font: ImageFont.FreeTypeFont,
@@ -790,9 +1073,16 @@ def _draw_text_block(draw: ImageDraw.ImageDraw,
                       bold: bool = False,
                       shadow_draw: Optional[ImageDraw.ImageDraw] = None,
                       shadow_offset: tuple = (2, 3),
-                      align: str = "center") -> None:
+                      align: str = "center", markup: bool = False,
+                      dialogue_color: str = "") -> None:
     font = _pil_font(font_family, font_size, bold)
-    lines = _wrap_lines(text, font, w - padding * 2 - stroke_width * 2, draw)
+    max_px = w - padding * 2 - stroke_width * 2
+    if _needs_styling(text, markup, bool(dialogue_color)):
+        _draw_styled_block(draw, x, y, w, h, text, font_family, font_size, font_color,
+                           padding, stroke_width, stroke_color, bold, shadow_draw,
+                           shadow_offset, align, markup, dialogue_color)
+        return
+    lines = _wrap_lines(text, font, max_px, draw)
     line_h = int(font_size * 1.3)
     block_h = len(lines) * line_h
     ty_start = y + max(padding, (h - block_h) // 2)
@@ -810,6 +1100,42 @@ def _draw_text_block(draw: ImageDraw.ImageDraw,
     for line in lines:
         tx = _text_x(draw, line, font, x, w, padding, stroke_width, align)
         _draw_rich(draw, (tx, ty), line, font, fc, stroke_width, sc)
+        ty += line_h
+
+
+def _draw_styled_block(draw, x, y, w, h, text, font_family, font_size, font_color, padding,
+                       stroke_width, stroke_color, bold, shadow_draw, shadow_offset, align,
+                       markup, dialogue_color) -> None:
+    """_draw_text_block for text with *italic* / **bold** / "dialogue"."""
+    lines = _styled_lines(text, font_family, font_size, bold,
+                          w - padding * 2 - stroke_width * 2, markup, bool(dialogue_color))
+    line_h = int(font_size * 1.3)
+    ty_start = y + max(padding, (h - len(lines) * line_h) // 2)
+    fc = _hex_to_rgb(font_color)
+    qc = _hex_to_rgb(dialogue_color) if dialogue_color else None
+    sc = _hex_to_rgb(stroke_color) if stroke_width > 0 else None
+    inner_w = w - padding * 2
+
+    def left(runs: list) -> float:
+        lw = _runs_w(runs, font_family, font_size, bold) + stroke_width
+        if align == "left":
+            return x + padding
+        if align == "right":
+            return x + w - padding - lw
+        return x + padding + max(0, (inner_w - lw) // 2)
+
+    if shadow_draw is not None:
+        ox, oy = shadow_offset
+        ty = ty_start
+        for runs in lines:
+            _draw_runs(shadow_draw, (left(runs) + ox, ty + oy), runs, font_family, font_size,
+                       bold, (0, 0, 0, 180), None, stroke_width, (0, 0, 0, 180),
+                       emoji_color=False)
+            ty += line_h
+    ty = ty_start
+    for runs in lines:
+        _draw_runs(draw, (left(runs), ty), runs, font_family, font_size, bold, fc, qc,
+                   stroke_width, sc)
         ty += line_h
 
 
@@ -1041,9 +1367,21 @@ def build_composite(
     chat_messages: Optional[list] = None,
     bubble_color: str = "blue",
     upscale_filter: str = "lanczos",
+    inline_markup: bool = False,
+    dialogue_color: str = "",
+    zoom: float = 1.0,
+    pan_x: float = 0.0,
+    pan_y: float = 0.0,
+    watermark_pos: str = "bl",
+    watermark_opacity: float = 1.0,
+    header_outline: Optional[list] = None,
+    footer_outline: Optional[list] = None,
     _px_scale: float = 1.0,
 ) -> Image.Image:
     frame = frame.convert("RGBA")
+    if zoom > 1.001:
+        frame = _apply_zoom(frame, zoom, pan_x, pan_y,
+                            Image.NEAREST if upscale_filter == "nearest" else Image.LANCZOS)
     fw, fh = frame.size
     total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
 
@@ -1079,6 +1417,10 @@ def build_composite(
             footer_font=footer_font, footer_size=_s(footer_size),
             watermark_path=watermark_path, watermark_height=_s(watermark_height),
             chat_messages=chat_messages, bubble_color=bubble_color,
+            inline_markup=inline_markup, dialogue_color=dialogue_color,
+            watermark_pos=watermark_pos, watermark_opacity=watermark_opacity,
+            header_outline=header_outline and [_s(header_outline[0]), header_outline[1]],
+            footer_outline=footer_outline and [_s(footer_outline[0]), footer_outline[1]],
             _px_scale=_px_scale * scale,
         )
 
@@ -1131,26 +1473,44 @@ def build_composite(
             _draw_text_block(txt_draw, panel_x, panel_y, panel_w, panel_h,
                              text, font_family, font_size, font_color, padding,
                              stroke_width, stroke_color, bold, shd_draw_ctx,
-                             shadow_offset=shadow_offset, align=align)
+                             shadow_offset=shadow_offset, align=align,
+                             markup=inline_markup, dialogue_color=dialogue_color)
 
-        # Watermark — bottom-left of image; track right edge for footer placement
-        wm_right = image_x + margin
+        # Watermark — in a corner of the image (bottom-left by default). The
+        # footer runs beside it along the bottom, and the title beside it
+        # along the top, rather than on top of it.
+        wm_right = image_x + margin        # where the footer starts
+        footer_end = image_x + fw - margin  # ...and ends
+        header_x = image_x + margin
         if watermark_path and os.path.exists(watermark_path):
             try:
                 wm = Image.open(watermark_path).convert("RGBA")
                 wm_scale = watermark_height / wm.height
                 wm = wm.resize((max(1, int(wm.width * wm_scale)), watermark_height), Image.LANCZOS)
-                wy = fh - watermark_height - margin
-                if wy >= 0:
-                    out.alpha_composite(wm, (image_x + margin, wy))
-                    wm_right = image_x + margin + wm.width + _px(6)
+                if watermark_opacity < 0.999:
+                    k = max(0.0, watermark_opacity)
+                    wm.putalpha(wm.getchannel("A").point(lambda v: round(v * k)))
+                on_right = watermark_pos in ("br", "tr")
+                on_top = watermark_pos in ("tl", "tr")
+                wx = image_x + fw - margin - wm.width if on_right else image_x + margin
+                wy = margin if on_top else fh - watermark_height - margin
+                if wy >= 0 and wx >= image_x:
+                    out.alpha_composite(wm, (wx, wy))
+                    if watermark_pos == "bl":
+                        wm_right = wx + wm.width + _px(6)
+                    elif watermark_pos == "br":
+                        footer_end = wx - _px(6)
+                    elif watermark_pos == "tl":
+                        header_x = wx + wm.width + _px(6)
             except Exception:
                 pass
 
-        # Footer text — overlaid on bottom-left of image, to the right of watermark
+        # Footer text — overlaid along the bottom of the image, beside the watermark
         if footer_enabled and footer_text.strip():
             fnt = _pil_font(footer_font, footer_size)
-            avail_w = fw - (wm_right - image_x) - margin
+            f_sw, f_sc = ((footer_outline[0], footer_outline[1]) if footer_outline
+                          else (stroke_width, stroke_color))
+            avail_w = footer_end - wm_right
             if avail_w > _px(20):
                 lines = _wrap_lines(footer_text.strip(), fnt, avail_w, txt_draw)
                 line_h = txt_draw.textbbox((0, 0), "Ag", font=fnt)[3] + _px(2)
@@ -1161,16 +1521,16 @@ def build_composite(
                     ty = fy
                     for line in lines:
                         _draw_text_overlay(txt_draw, (fx, ty), line, fnt, font_color,
-                                           stroke_width, stroke_color, shd_draw_ctx,
-                                           shadow_offset)
+                                           f_sw, f_sc, shd_draw_ctx, shadow_offset)
                         ty += line_h
 
         # Title text overlaid at top-left corner of image
         if header_text.strip():
             fnt = _pil_font(header_font, header_size)
-            _draw_text_overlay(txt_draw, (image_x + margin, margin), header_text.strip(), fnt,
-                               font_color, stroke_width, stroke_color, shd_draw_ctx,
-                               shadow_offset)
+            h_sw, h_sc = ((header_outline[0], header_outline[1]) if header_outline
+                          else (stroke_width, stroke_color))
+            _draw_text_overlay(txt_draw, (header_x, margin), header_text.strip(), fnt,
+                               font_color, h_sw, h_sc, shd_draw_ctx, shadow_offset)
 
         # Composite shadow (single blur) then actual text on top
         if shadow and txt_img is not None and shd_img is not None:
@@ -1193,7 +1553,9 @@ def build_composite(
            padding, stroke_width, stroke_color, bold, shadow, align, layout,
            caption_side, header_text, header_font, header_size, footer_enabled,
            footer_text, footer_font, footer_size, watermark_path, wm_mtime,
-           watermark_height, json.dumps(chat_messages), bubble_color, _px_scale)
+           watermark_height, json.dumps(chat_messages), bubble_color, _px_scale,
+           inline_markup, dialogue_color, watermark_pos, watermark_opacity,
+           json.dumps(header_outline), json.dumps(footer_outline))
     with _OVERLAY_CACHE_LOCK:
         overlay = _OVERLAY_CACHE.get(key)
         if overlay is not None:
@@ -1731,6 +2093,21 @@ class CaptionApp:
         # Scale title/tagline (and the footer-linked watermark) with the
         # image's height instead of fixed pixel sizes — see _OVERLAY_REF_H.
         self._scale_overlays_var = tk.BooleanVar(value=False)
+        # Outline the title/tagline automatically over busy or similar-colored
+        # parts of the picture (see _auto_outline).
+        self._auto_contrast_var = tk.BooleanVar(value=True)
+
+        # Inline styling: *italic*, **bold**, and "dialogue" in its own color.
+        self._markup_var = tk.BooleanVar(value=True)
+        self._dialogue_on_var = tk.BooleanVar(value=False)
+        self._dialogue_color = "#e0457b"
+
+        # Framing: zoom/pan the picture inside its frame (see _apply_zoom).
+        self._zoom_var = tk.DoubleVar(value=1.0)
+        self._pan_x_var = tk.DoubleVar(value=0.0)
+        self._pan_y_var = tk.DoubleVar(value=0.0)
+        self._pan_drag: Optional[tuple] = None
+        self._luma_cache: Optional[tuple] = None
 
         # Watermark
         self._watermark_path = ""
@@ -1742,6 +2119,8 @@ class CaptionApp:
         self._watermark_height_var = tk.IntVar(value=120)
         self._wm_auto_var = tk.BooleanVar(value=True)
         self._updating_wm_display = False
+        self._wm_pos_var = tk.StringVar(value=_WM_POSITIONS[0][0])
+        self._wm_opacity_var = tk.IntVar(value=100)
 
         # Warn if Aardvark Cafe not installed (deferred to after window shows)
         self._warn_aardvark = not bool(_check_aardvark())
@@ -1757,6 +2136,11 @@ class CaptionApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        # Framing by hand: drag the picture, Ctrl+scroll to zoom. Bound to
+        # the image item, so the eyedropper's own canvas binding is untouched.
+        self._canvas.tag_bind("img", "<ButtonPress-1>", self._on_pan_press)
+        self._canvas.tag_bind("img", "<B1-Motion>", self._on_pan_drag)
+        self._canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self._build_editor_view()  # needs the builder's caption box to exist
         self._build_builder_view()
         self._load_wallpaper()
@@ -1969,6 +2353,11 @@ class CaptionApp:
         nb.add(wm_tab, text="Watermark")
         self._build_watermark_tab(wm_tab)
 
+        # Tab 5: Image framing
+        img_tab = ttk.Frame(nb, padding=10)
+        nb.add(img_tab, text="Image")
+        self._build_image_tab(img_tab)
+
         # Traces
         # Font StringVars (_font_var/_header_font_var/_footer_font_var) are
         # deliberately excluded here — they're also the font Comboboxes'
@@ -1979,7 +2368,9 @@ class CaptionApp:
                   self._stroke_width_var, self._auto_size_var, self._bold_var,
                   self._align_var, self._side_var, self._header_size_var,
                   self._footer_size_var, self._wm_auto_var, self._scale_overlays_var,
-                  self._output_pct_var, self._gif_colors_var):
+                  self._output_pct_var, self._gif_colors_var, self._auto_contrast_var,
+                  self._zoom_var, self._pan_x_var, self._pan_y_var, self._wm_pos_var,
+                  self._wm_opacity_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
         for v in (self._trim_start_var, self._trim_end_var, self._speed_var):
@@ -2108,6 +2499,20 @@ class CaptionApp:
                         command=self._safe_refresh).pack(side="left", padx=(12, 0))
         r += 1
 
+        style_row = ttk.Frame(f)
+        style_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        tooltip(ttk.Checkbutton(style_row, text="*Italic* / **bold**",
+                                variable=self._markup_var, command=self._safe_refresh),
+                "Draw *words* in italics and **words** in bold\n"
+                "(the asterisks aren't drawn)").pack(side="left")
+        tooltip(ttk.Checkbutton(style_row, text="Dialogue color",
+                                variable=self._dialogue_on_var, command=self._safe_refresh),
+                'Draw "speech in quotes" in its own color').pack(side="left", padx=(12, 4))
+        self._dialogue_btn = tk.Button(style_row, bg=self._dialogue_color, width=3,
+                                       relief="groove", command=self._pick_dialogue_color)
+        self._dialogue_btn.pack(side="left")
+        r += 1
+
         self._align_label = ttk.Label(f, text="Alignment:")
         self._align_label.grid(row=r, column=0, sticky="w", pady=4)
         self._align_row = ttk.Frame(f)
@@ -2183,6 +2588,15 @@ class CaptionApp:
         self._stroke_btn.pack(side="left")
         ttk.Button(self._stroke_color_row, text="Pick", width=5,
                    command=lambda: self._start_color_pick("stroke")).pack(side="left", padx=(4, 0))
+
+    def _pick_dialogue_color(self) -> None:
+        r = colorchooser.askcolor(color=self._dialogue_color, title="Dialogue Color",
+                                  parent=self.root)
+        if r[1]:
+            self._dialogue_color = r[1]
+            self._dialogue_btn.config(bg=r[1])
+            self._dialogue_on_var.set(True)
+            self._safe_refresh()
 
     def _build_chat_frame(self, frame: ttk.Frame) -> None:
         """Builder UI for chat_mode formats ("Text Message") — occupies the
@@ -2327,6 +2741,8 @@ class CaptionApp:
                         variable=self._scale_overlays_var).grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(2, 4))
         r += 1
+        self._auto_contrast_check(f, r)
+        r += 1
 
 
     def _build_footer_tab(self, f: ttk.Frame) -> None:
@@ -2362,6 +2778,16 @@ class CaptionApp:
                         variable=self._scale_overlays_var).grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(2, 4))
         r += 1
+        self._auto_contrast_check(f, r)
+        r += 1
+
+    def _auto_contrast_check(self, f: ttk.Frame, r: int) -> None:
+        tooltip(ttk.Checkbutton(f, text="Auto-contrast over busy images",
+                                variable=self._auto_contrast_var),
+                "Outline the title and tagline automatically where the picture\n"
+                "behind them is busy or close to the text color\n"
+                "(only when Stroke Width is 0)").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
 
     def _build_watermark_tab(self, f: ttk.Frame) -> None:
@@ -2394,6 +2820,93 @@ class CaptionApp:
                         variable=self._wm_auto_var).pack(side="left", padx=(6, 0))
         self._wm_height_spin.grid(row=r, column=1, sticky="w", padx=6, pady=(6, 4))
         r += 1
+
+        ttk.Label(f, text="Position:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self._wm_pos_var, state="readonly", width=14,
+                     values=[label for label, _code in _WM_POSITIONS]).grid(
+            row=r, column=1, sticky="w", padx=6)
+        r += 1
+        ttk.Label(f, text="Opacity:").grid(row=r, column=0, sticky="w", pady=4)
+        op_row = ttk.Frame(f)
+        op_row.grid(row=r, column=1, sticky="ew", padx=6)
+        op_lbl = ttk.Label(op_row, width=5, text=f"{self._wm_opacity_var.get()}%")
+        ttk.Scale(op_row, from_=10, to=100, orient="horizontal",
+                  variable=self._wm_opacity_var,
+                  command=lambda v: self._wm_opacity_var.set(int(float(v)))).pack(
+            side="left", fill="x", expand=True)
+        op_lbl.pack(side="left", padx=(6, 0))
+        self._wm_opacity_var.trace_add("write", lambda *_: op_lbl.config(
+            text=f"{int(self._safe_float(self._wm_opacity_var))}%"))
+        r += 1
+
+    def _build_image_tab(self, f: ttk.Frame) -> None:
+        """Framing: zoom into the picture and choose which part shows."""
+        f.columnconfigure(1, weight=1)
+        r = 0
+        rows = (("Zoom:", self._zoom_var, 1.0, 4.0, lambda v: f"{v:.0%}"),
+                ("Left / right:", self._pan_x_var, -1.0, 1.0, lambda v: f"{v:+.0%}"),
+                ("Up / down:", self._pan_y_var, -1.0, 1.0, lambda v: f"{v:+.0%}"))
+        for label, var, lo, hi, fmt in rows:
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            row = ttk.Frame(f)
+            row.grid(row=r, column=1, sticky="ew", padx=6)
+            lbl = ttk.Label(row, width=6, text=fmt(var.get()))
+            ttk.Scale(row, from_=lo, to=hi, orient="horizontal", variable=var).pack(
+                side="left", fill="x", expand=True)
+            lbl.pack(side="left", padx=(6, 0))
+            var.trace_add("write", lambda *_a, v=var, l=lbl, fm=fmt: l.config(
+                text=fm(self._safe_float(v))))
+            r += 1
+        ttk.Button(f, text="Reset framing", command=self._reset_framing).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        r += 1
+        ttk.Label(f, text="Tip: drag the picture in the preview to move it,\n"
+                          "Ctrl + scroll over it to zoom.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
+                                             pady=(4, 0))
+
+    @staticmethod
+    def _safe_float(var: tk.Variable) -> float:
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            return 0.0
+
+    def _reset_framing(self) -> None:
+        self._zoom_var.set(1.0)
+        self._pan_x_var.set(0.0)
+        self._pan_y_var.set(0.0)
+
+    def _on_pan_press(self, event) -> None:
+        if (getattr(self, "_color_pick_target", None) is not None
+                or self._safe_float(self._zoom_var) <= 1.001):
+            self._pan_drag = None
+            return
+        self._pan_drag = (event.x, event.y, self._safe_float(self._pan_x_var),
+                          self._safe_float(self._pan_y_var))
+
+    def _on_pan_drag(self, event) -> None:
+        """Drag the picture inside its frame. A drag of the shown picture's
+        own width moves the zoomed-in window by its full travel."""
+        d = self._pan_drag
+        disp = getattr(self, "_preview_pil_img", None)
+        if not d or not self._frames or disp is None:
+            return
+        zoom = self._safe_float(self._zoom_var)
+        fw, fh = self._frames[0].size
+        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        shown_w = disp.width if layout == "vertical" else disp.height * fw / fh
+        shown_h = shown_w * fh / fw
+        k = max(0.01, zoom - 1)
+        px = d[2] - 2 * (event.x - d[0]) / (shown_w * k)
+        py = d[3] - 2 * (event.y - d[1]) / (shown_h * k)
+        self._pan_x_var.set(round(max(-1.0, min(1.0, px)), 3))
+        self._pan_y_var.set(round(max(-1.0, min(1.0, py)), 3))
+
+    def _on_zoom_wheel(self, event) -> str:
+        z = self._safe_float(self._zoom_var) * (1.1 if event.delta > 0 else 1 / 1.1)
+        self._zoom_var.set(round(max(1.0, min(4.0, z)), 2))
+        return "break"
 
 
     # ------------------------------------------------------------------
@@ -5351,11 +5864,33 @@ class CaptionApp:
                 output_size_pct=self._output_pct_var.get(),
                 gif_compress=self._gif_compress_var.get(),
                 gif_colors=self._gif_colors_var.get(),
+                markup=self._markup_var.get(),
+                dialogue_color=self._dialogue_color if self._dialogue_on_var.get() else "",
+                zoom=max(1.0, float(self._zoom_var.get())),
+                pan_x=float(self._pan_x_var.get()),
+                pan_y=float(self._pan_y_var.get()),
+                watermark_pos=_WM_POS_CODE.get(self._wm_pos_var.get(), "bl"),
+                watermark_opacity=max(10, min(100, int(self._wm_opacity_var.get()))) / 100,
+                auto_contrast=self._auto_contrast_var.get(),
             )
-        except tk.TclError:
+        except (tk.TclError, ValueError):
             return None
+        if raw["auto_contrast"] and self._frames and (
+                raw.get("header_enabled") or raw.get("footer_enabled")):
+            raw["overlay_luma"] = self._overlay_luma(raw)
 
         return raw
+
+    def _overlay_luma(self, raw: dict) -> dict:
+        """_overlay_luma of the first frame as framed — measured once per
+        source/framing so every frame of a GIF gets the same outline choice
+        (no flicker)."""
+        frame = self._frames[0]
+        key = (id(frame), raw["zoom"], raw["pan_x"], raw["pan_y"])
+        if self._luma_cache is None or self._luma_cache[0] != key:
+            self._luma_cache = (key, _overlay_luma(
+                _apply_zoom(frame, raw["zoom"], raw["pan_x"], raw["pan_y"], Image.BILINEAR)))
+        return self._luma_cache[1]
 
     def _collect_render_params(self) -> Optional[dict]:
         """Read UI state and resolve it into build_composite kwargs, all on
@@ -6245,6 +6780,13 @@ class CaptionApp:
                 "watermark_height": self._watermark_height_var.get(),
                 "trim": [first + 1, last + 1] if self._is_anim else None,
                 "speed": self._speed() if self._is_anim else 1.0,
+                "inline_styling": self._markup_var.get(),
+                "dialogue_color": self._dialogue_color if self._dialogue_on_var.get() else None,
+                "auto_contrast": self._auto_contrast_var.get(),
+                "zoom": self._zoom_var.get(),
+                "pan": [self._pan_x_var.get(), self._pan_y_var.get()],
+                "watermark_pos": _WM_POS_CODE.get(self._wm_pos_var.get(), "bl"),
+                "watermark_opacity": self._wm_opacity_var.get(),
             }
         except tk.TclError:
             messagebox.showerror("Save Project", "Fix the invalid number fields first.")
@@ -6353,6 +6895,18 @@ class CaptionApp:
         self._set_output_override(data.get("output_size_pct"))
         self._set_gif_compress(data.get("gif_colors"))
         self._wm_auto_var.set(bool(data.get("watermark_auto", True)))
+        self._markup_var.set(bool(data.get("inline_styling", True)))
+        if data.get("dialogue_color"):
+            self._dialogue_color = data["dialogue_color"]
+            self._dialogue_btn.config(bg=self._dialogue_color)
+        self._dialogue_on_var.set(bool(data.get("dialogue_color")))
+        self._auto_contrast_var.set(bool(data.get("auto_contrast", True)))
+        pan = data.get("pan") or [0.0, 0.0]
+        self._zoom_var.set(float(data.get("zoom", 1.0)))
+        self._pan_x_var.set(float(pan[0]))
+        self._pan_y_var.set(float(pan[1]))
+        self._wm_pos_var.set(_WM_POS_LABEL.get(data.get("watermark_pos", "bl"), "Bottom left"))
+        self._wm_opacity_var.set(int(data.get("watermark_opacity", 100)))
         if not self._wm_auto_var.get() and data.get("watermark_height"):
             self._updating_wm_display = True
             try:
@@ -6533,7 +7087,8 @@ class CaptionApp:
         self._tk_img = ImageTk.PhotoImage(disp)
         self._canvas.delete("all")
         self._update_wall_items()  # app background (if any) underneath
-        self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._tk_img)
+        self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._tk_img,
+                                  tags=("img",))
 
     def _start_anim(self) -> None:
         self._anim_step()

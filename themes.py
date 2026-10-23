@@ -285,7 +285,7 @@ def _apply_layout_styles(style: ttk.Style, c: Optional[dict]) -> None:
     a = {**_ACCENT_DEFAULTS, **(c or {})}
     style.configure("TButton", padding=(12, 5))
     style.configure("TMenubutton", padding=(10, 5))
-    style.configure("TNotebook.Tab", padding=(12, 5))
+    style.configure("TNotebook.Tab", padding=(8, 5))  # five Builder tabs fit the 350px panel
     style.configure("TCombobox", padding=(4, 3))
     style.configure("TSpinbox", padding=(4, 3))
     style.configure("TEntry", padding=(4, 3))
