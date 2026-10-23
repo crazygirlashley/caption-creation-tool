@@ -57,7 +57,10 @@ for fname in ("Standard.json", "Standard (Vertical).json",
     if os.path.isfile(src):
         datas.append((src, "formats"))
 for fname in ("Dark.json", "Bimbo.json", "Sissy.json", "Basic.json",
-              "Bimbo_kisses.gif", "CREDITS.md"):
+              "Hypno.json", "Latex.json", "Pink Pill.json", "Goth.json", "French Maid.json",
+              "Bimbo_kisses.gif", "Hypno_spiral.gif", "Latex_gloss.jpg",
+              "Pink_Pill_pills.gif", "Goth_damask.jpg", "French_Maid_stripes.jpg",
+              "CREDITS.md"):
     src = os.path.join(THEMES_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "themes"))

@@ -1,0 +1,22 @@
+{
+  "name": "Hypno",
+  "version": 1,
+  "bg": "#0d0618",
+  "panel": "#170c29",
+  "input_bg": "#1d1033",
+  "hover": "#261543",
+  "border": "#3d2470",
+  "fg": "#ece4ff",
+  "muted_fg": "#9a8cc4",
+  "select_bg": "#3b2a7a",
+  "accent": "#19e6d4",
+  "accent_fg": "#0d0618",
+  "accent_hover": "#56f2e4",
+  "canvas": "#0a0514",
+  "canvas_fg": "#ece4ff",
+  "canvas_muted": "#9a8cc4",
+  "background": "Hypno_spiral.gif",
+  "background_mode": "fit",
+  "background_dim": 0.35,
+  "background_animate": true
+}

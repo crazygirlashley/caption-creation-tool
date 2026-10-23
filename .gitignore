@@ -34,6 +34,11 @@ themes/*.json
 !themes/Dark.json
 !themes/Bimbo.json
 !themes/Sissy.json
+!themes/Hypno.json
+!themes/Latex.json
+!themes/Pink Pill.json
+!themes/Goth.json
+!themes/French Maid.json
 !themes/Basic.json
 
 # Local AI writer settings (server address, model, optional API key)

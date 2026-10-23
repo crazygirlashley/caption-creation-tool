@@ -1,0 +1,23 @@
+{
+  "name": "Latex",
+  "version": 1,
+  "bg": "#0b0809",
+  "panel": "#151012",
+  "input_bg": "#1b1416",
+  "hover": "#261b1e",
+  "border": "#4a1420",
+  "fg": "#f6ecee",
+  "muted_fg": "#a8898f",
+  "select_bg": "#7a1228",
+  "accent": "#e0123c",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#ff3358",
+  "canvas": "#0e0a0b",
+  "canvas_fg": "#f6ecee",
+  "canvas_muted": "#a8898f",
+  "background": "Latex_gloss.jpg",
+  "background_mode": "tile",
+  "background_dim": 0.0,
+  "background_animate": false,
+  "background_scale": 1.6
+}

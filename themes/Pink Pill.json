@@ -1,0 +1,23 @@
+{
+  "name": "Pink Pill",
+  "version": 1,
+  "bg": "#ffd6ea",
+  "panel": "#fff5fa",
+  "input_bg": "#ffffff",
+  "hover": "#ffe6f2",
+  "border": "#f29cc6",
+  "fg": "#6a1846",
+  "muted_fg": "#a8588a",
+  "select_bg": "#b8ece8",
+  "accent": "#ff3d9a",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#ff66b0",
+  "canvas": "#f7c6de",
+  "canvas_fg": "#6a1846",
+  "canvas_muted": "#a8588a",
+  "background": "Pink_Pill_pills.gif",
+  "background_mode": "tile",
+  "background_dim": 0.1,
+  "background_animate": true,
+  "background_scale": 0.9
+}

@@ -1,0 +1,23 @@
+{
+  "name": "French Maid",
+  "version": 1,
+  "bg": "#f4eff2",
+  "panel": "#ffffff",
+  "input_bg": "#ffffff",
+  "hover": "#f3e9ee",
+  "border": "#2b2629",
+  "fg": "#141214",
+  "muted_fg": "#6e6469",
+  "select_bg": "#ffc6dc",
+  "accent": "#e2578f",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#ee6fa4",
+  "canvas": "#e9e2e6",
+  "canvas_fg": "#141214",
+  "canvas_muted": "#6e6469",
+  "background": "French_Maid_stripes.jpg",
+  "background_mode": "tile",
+  "background_dim": 0.2,
+  "background_animate": false,
+  "background_scale": 0.8
+}

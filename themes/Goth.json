@@ -1,0 +1,22 @@
+{
+  "name": "Goth",
+  "version": 1,
+  "bg": "#0e070c",
+  "panel": "#170c14",
+  "input_bg": "#1d1019",
+  "hover": "#271622",
+  "border": "#4d1f33",
+  "fg": "#ecdce3",
+  "muted_fg": "#9c7d8b",
+  "select_bg": "#5e1a33",
+  "accent": "#a3123a",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#c21d4a",
+  "canvas": "#0b0509",
+  "canvas_fg": "#ecdce3",
+  "canvas_muted": "#9c7d8b",
+  "background": "Goth_damask.jpg",
+  "background_mode": "fit",
+  "background_dim": 0.0,
+  "background_animate": false
+}

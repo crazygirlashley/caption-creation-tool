@@ -48,11 +48,12 @@ class ThemeUpgradeTests(unittest.TestCase):
                                   "fg": "#e0e0e0", "muted_fg": "#a3a3a3", "select_bg": "#565656"})
         self._write("Bubblegum.json", themes._LEGACY_BUBBLEGUM)
         palettes = themes.get_palettes(force_reload=True)
-        self.assertEqual(sorted(palettes), ["Bimbo", "Dark", "Sissy"])
+        self.assertEqual(sorted(palettes), ["Bimbo", "Dark", "French Maid", "Goth", "Hypno",
+                                            "Latex", "Pink Pill", "Sissy"])
         self.assertEqual(palettes["Dark"]["bg"], "#1f1c24")  # upgraded to version 2
         self.assertIn("accent", palettes["Bimbo"])
         # Theme background images arrive with their themes.
-        for name in ("Bimbo",):
+        for name in ("Bimbo", "Hypno", "Latex", "Pink Pill", "Goth", "French Maid"):
             bg = themes.theme_background(name)
             self.assertIsNotNone(bg, name)
             self.assertTrue(bg["path"].startswith(self.user))
