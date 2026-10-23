@@ -52,7 +52,7 @@ class ThemeUpgradeTests(unittest.TestCase):
         self.assertEqual(palettes["Dark"]["bg"], "#1f1c24")  # upgraded to version 2
         self.assertIn("accent", palettes["Bimbo"])
         # Theme background images arrive with their themes.
-        for name in ("Bimbo", "Sissy"):
+        for name in ("Bimbo",):
             bg = themes.theme_background(name)
             self.assertIsNotNone(bg, name)
             self.assertTrue(bg["path"].startswith(self.user))

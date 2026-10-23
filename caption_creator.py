@@ -3452,11 +3452,15 @@ class CaptionApp:
     _WALL_DEFAULTS = {"source": "theme", "path": "", "mode": "fit", "dim": 0.35,
                       "animate": True, "scale": 1.0, "gap": 0, "stagger": False}
 
-    def _saved_background(self) -> dict:
-        """The user's Background choice. "source" is "theme" (the current
+    def _saved_background(self, theme: Optional[str] = None) -> dict:
+        """The user's Background choice for a theme (default: the current
+        one) — each theme remembers its own. "source" is "theme" (the
         theme's own background, if it has one — the default), "custom" (a
-        picture they picked) or "off"."""
-        saved = dict(recent_store.get_setting("background", {}) or {})
+        picture they picked) or "off". Falls back to the single app-wide
+        setting older versions saved."""
+        theme = theme or self._theme_name
+        per_theme = recent_store.get_setting("backgrounds", {}) or {}
+        saved = dict(per_theme.get(theme) or recent_store.get_setting("background", {}) or {})
         if "source" not in saved:  # settings from before themes had backgrounds
             saved["source"] = ("custom" if saved.get("path") and saved.get("mode") not in
                                (None, "off") else "theme")
@@ -3578,7 +3582,8 @@ class CaptionApp:
 
         ttk.Label(body, text="App background", style="Heading.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(body, text="Shown behind the Editor and the Caption Builder's preview.",
+        ttk.Label(body, text=f"Shown behind the Editor and the Caption Builder. Each theme "
+                             f"remembers its own — this is for {self._theme_name}.",
                   style="Muted.TLabel", wraplength=400).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(2, 12))
 
@@ -3654,9 +3659,11 @@ class CaptionApp:
                 path_var.set(p)
             if source_var.get() == "custom" and not p:
                 return  # wait for a picture to be chosen
-            recent_store.set_setting("background", {
+            per_theme = dict(recent_store.get_setting("backgrounds", {}) or {})
+            per_theme[self._theme_name] = {
                 "source": source_var.get(), "path": p, "mode": mode_var.get(),
-                "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get())})
+                "dim": round(float(dim_var.get()), 2), "animate": bool(anim_var.get())}
+            recent_store.set_setting("backgrounds", per_theme)
             self._load_wallpaper()
 
         ttk.Button(body, text="Done", style="Accent.TButton", command=dlg.destroy).grid(
