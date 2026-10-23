@@ -1,0 +1,19 @@
+{
+  "name": "Bimbo",
+  "version": 2,
+  "bg": "#ffd3ea",
+  "panel": "#fff1f8",
+  "input_bg": "#ffffff",
+  "hover": "#ffe0f0",
+  "border": "#f58cc0",
+  "fg": "#7d1450",
+  "muted_fg": "#b4558c",
+  "select_bg": "#ff9fd0",
+  "accent": "#ff2e93",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#ff5aaa",
+  "font": "Aardvark Cafe",
+  "canvas": "#f9c2df",
+  "canvas_fg": "#7d1450",
+  "canvas_muted": "#b4558c"
+}

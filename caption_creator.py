@@ -38,6 +38,7 @@ import da_client
 import recent_store
 import spellcheck
 import wallpaper
+from ui_widgets import Placeholder, tooltip
 import themes
 import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
@@ -1606,7 +1607,7 @@ class CaptionApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Caption Creator")
-        self.root.minsize(800, 500)
+        self.root.minsize(980, 620)
 
         # Theme — applied before _build_ui() so every widget is created with
         # the right colors from the start; _apply_theme() handles a live
@@ -1786,18 +1787,29 @@ class CaptionApp:
         # Anchored to the far right regardless of how many left-packed
         # buttons precede it — DA Settings and the theme picker live here
         # now instead of as standalone toolbar buttons.
-        self._settings_btn = ttk.Button(bar, text="⚙ Settings", command=self._open_settings_menu)
+        self._settings_btn = tooltip(
+            ttk.Button(bar, text="⚙  Settings", command=self._open_settings_menu),
+            "Theme, app background, AI writer and DeviantArt settings")
         self._settings_btn.pack(side="right", padx=4)
         # Editor (write the caption) / Caption Builder (put it on the image).
         self._view_var = tk.StringVar(value=recent_store.get_setting("view", "editor"))
-        for label, value in (("✍ Editor", "editor"), ("🖼 Caption Builder", "builder")):
-            ttk.Radiobutton(bar, text=label, value=value, variable=self._view_var,
-                            style="Toolbutton", command=self._apply_view).pack(side="left", padx=(0, 2))
+        for label, value, tip in (
+                ("✍  Editor", "editor", "Write and polish the caption story"),
+                ("🖼  Caption Builder", "builder", "Put the caption on your image, style it and export")):
+            tooltip(ttk.Radiobutton(bar, text=label, value=value, variable=self._view_var,
+                                    style="View.Toolbutton", command=self._apply_view),
+                    tip).pack(side="left", padx=(0, 2))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
-        ttk.Button(bar, text="Open Image / GIF / MP4…", command=self._open).pack(side="left", padx=4)
-        ttk.Button(bar, text="Find Online…", command=self._web_lookup).pack(side="left", padx=4)
-        ttk.Button(bar, text="Save…", command=self._save).pack(side="left", padx=4)
+        tooltip(ttk.Button(bar, text="📂  Open…", command=self._open),
+                "Open an image, GIF or MP4  (Ctrl+O)\nTip: you can also drag files onto the window"
+                ).pack(side="left", padx=4)
+        tooltip(ttk.Button(bar, text="🔎  Find Online…", command=self._web_lookup),
+                "Search Barnorama, AcidCow and sex.com for a picture to caption"
+                ).pack(side="left", padx=4)
+        tooltip(ttk.Button(bar, text="💾  Save…", style="Accent.TButton", command=self._save),
+                "Export the captioned image, GIF or MP4  (Ctrl+S)").pack(side="left", padx=4)
         file_btn = ttk.Menubutton(bar, text="File")
+        tooltip(file_btn, "Recent files, projects (Ctrl+Shift+S / Ctrl+Shift+O) and batch export")
         self._file_menu = tk.Menu(file_btn, tearoff=False, postcommand=self._fill_file_menu)
         file_btn.config(menu=self._file_menu)
         file_btn.pack(side="left", padx=4)
@@ -1820,11 +1832,11 @@ class CaptionApp:
         status_bar.pack(side="bottom", fill="x")
         self._da_status_label = ttk.Label(status_bar, text="DA: not logged in", foreground="#999")
         self._da_status_label.pack(side="left", padx=(0, 2))
-        self._status = ttk.Label(status_bar, text="No file loaded", foreground="#888")
+        self._status = ttk.Label(status_bar, text="No file loaded", style="Muted.TLabel")
         self._status.pack(side="left", padx=12)
 
         # ---- Right control panel (fixed width, packed before preview) ----
-        right = tk.Frame(self.root, width=320, bg=self.root.cget("bg"))
+        right = tk.Frame(self.root, width=350, bg=self.root.cget("bg"))
         right.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
         right.pack_propagate(False)
         self._right_frame = right  # classic tk widget — recolored by hand on theme switch
@@ -1884,7 +1896,8 @@ class CaptionApp:
                                    command=self._fit_to_da_limit)
         self._fit_running = False
 
-        self._canvas = tk.Canvas(pf, bg="#2b2b2b", highlightthickness=0)
+        self._canvas = tk.Canvas(pf, bg=themes.accent(self._theme_name)["canvas"],
+                                 highlightthickness=0)
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda _: self._redraw())
         self._setup_drop_target()
@@ -1893,19 +1906,25 @@ class CaptionApp:
         fmt_bar = tk.Frame(right, bg=right.cget("bg"))
         fmt_bar.pack(fill="x", padx=8, pady=6)
         self._fmt_bar = fmt_bar  # classic tk widget — recolored by hand on theme switch
-        ttk.Label(fmt_bar, text="Format:").pack(side="left")
         self._fmt_combo = ttk.Combobox(fmt_bar, textvariable=self._format_var,
                                        values=list(self._formats.keys()),
-                                       width=12, state="readonly")
-        self._fmt_combo.pack(side="left", padx=6)
-        ttk.Button(fmt_bar, text="Apply",
-                   command=lambda: self._safe_refresh(debounce_ms=0)).pack(side="right")
-        ttk.Button(fmt_bar, text="↺", width=2,
-                   command=self._reload_formats).pack(side="right", padx=(0, 2))
-        ttk.Button(fmt_bar, text="Save As…",
-                   command=self._save_format_as).pack(side="right", padx=(0, 2))
-        ttk.Button(fmt_bar, text="Save",
-                   command=self._save_format).pack(side="right", padx=(0, 2))
+                                       width=14, state="readonly")
+        self._fmt_combo.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tooltip(self._fmt_combo, "Caption format — layout, fonts and colors")
+        # Compact buttons — the side panel is narrow.
+        tooltip(ttk.Button(fmt_bar, text="Apply", style="Small.TButton",
+                           command=lambda: self._safe_refresh(debounce_ms=0)),
+                "Re-render the preview now").pack(side="right")
+        tooltip(ttk.Button(fmt_bar, text="↺", width=2, style="Small.TButton",
+                           command=self._reload_formats),
+                "Reload formats from the formats/ folder").pack(side="right", padx=(0, 2))
+        fmt_save = ttk.Menubutton(fmt_bar, text="Save", style="Small.TMenubutton")
+        fmt_save_menu = tk.Menu(fmt_save, tearoff=False)
+        fmt_save_menu.add_command(label="Save into this format", command=self._save_format)
+        fmt_save_menu.add_command(label="Save as a new format…", command=self._save_format_as)
+        fmt_save.config(menu=fmt_save_menu)
+        tooltip(fmt_save, "Save these settings into this format, or as a new one").pack(
+            side="right", padx=(0, 2))
 
         # Pill preset bar — shown only for X-Change
         self._pill_frame = tk.Frame(right, bg=right.cget("bg"))
@@ -2031,20 +2050,22 @@ class CaptionApp:
                                  relief="solid", bd=1, padx=4, pady=4,
                                  undo=True, autoseparators=True, maxundo=-1)
         self._text_box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(2, 8))
-        self._text_box.insert("1.0", "Your caption here")
-        self._text_box.edit_reset()  # the placeholder isn't an undoable edit
+        self._caption_placeholder = Placeholder(
+            self._text_box, "Your caption…\n(or write it in ✍ Editor)")
         self._text_box.bind("<KeyRelease>", lambda _: self._on_text_keyrelease())
         # Row under the caption box: write a new story, or edit this one.
         # (self._ai_btn is the row — hidden with the caption box in chat mode.)
         self._ai_btn = ttk.Frame(f)
         self._ai_btn.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Button(self._ai_btn, text="✍ AI Write…",
-                   command=self._open_ai_writer).pack(side="left")
+        tooltip(ttk.Button(self._ai_btn, text="✍ AI Write…", command=self._open_ai_writer),
+                "Write a new caption story from a prompt with your local AI model").pack(side="left")
         self._ai_edit_btn = ttk.Menubutton(self._ai_btn, text="✨ AI Edit")
         self._ai_edit_menu = tk.Menu(self._ai_edit_btn, tearoff=False,
                                      postcommand=self._fill_ai_edit_menu)
         self._ai_edit_btn.config(menu=self._ai_edit_menu)
         self._ai_edit_btn.pack(side="left", padx=(6, 0))
+        tooltip(self._ai_edit_btn, "Polish, shorten, expand or fix the caption you have "
+                                   "(or just the selected part)")
         self._ai_edit_cancel: Optional[threading.Event] = None
         self._setup_spellcheck(self._text_box)
         self._chat_frame = ttk.Frame(f)
@@ -3128,7 +3149,12 @@ class CaptionApp:
         for rw in getattr(self, "_chat_row_widgets", []):
             rw["text"].configure(bg=colors["input_bg"], fg=colors["fg"], insertbackground=colors["fg"])
         if getattr(self, "_editor_preview", None) is not None:
-            self._editor_preview.configure(bg=colors["bg"])
+            self._editor_preview.configure(bg=self._card_bg())
+        for ph in (getattr(self, "_editor_placeholder", None),
+                   getattr(self, "_caption_placeholder", None)):
+            if ph is not None:
+                ph.update()
+        self._canvas.configure(bg=themes.accent(name)["canvas"])
         if getattr(self, "_editor_view", None) is not None:
             self._load_wallpaper()  # re-dim toward the new theme's background
 
@@ -3268,44 +3294,66 @@ class CaptionApp:
         ed.tag_lower("wall")
         ed.bind("<Configure>", lambda _e: self._layout_editor())
 
-        ai = ttk.LabelFrame(side, text="AI writing", padding=8)
-        ai.grid(row=0, column=0, sticky="ew")
+        ttk.Label(side, text="✨ AI writing", style="Heading.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        ai = ttk.Frame(side, style="Card.TFrame", padding=10)
+        ai.grid(row=1, column=0, sticky="ew")
         ai.columnconfigure(0, weight=1)
-        ttk.Button(ai, text="✍ Write a story from a prompt…",
-                   command=self._open_ai_writer).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        tooltip(ttk.Button(ai, text="✍  Write a story from a prompt…", style="Accent.TButton",
+                           command=self._open_ai_writer),
+                "Describe the story and your local AI model writes it here"
+                ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self._editor_ai_buttons = []
-        actions = [(key, label) for key, (label, _i) in ai_writer.EDIT_ACTIONS.items()]
-        actions.append(("custom", "Custom instruction…"))
+        icons = {"smooth": "✨", "shorten": "✂", "expand": "➕", "grammar": "✔"}
+        tips = {"smooth": "Improve flow and word choice, same length",
+                "shorten": "Cut it down to what fits beside the image at a readable size",
+                "expand": "Add sensory, physical and emotional detail",
+                "grammar": "Fix spelling, grammar and punctuation only",
+                "custom": "Tell the AI how to change it, e.g. \"more teasing\""}
+        actions = [(key, f"{icons.get(key, '')}  {label}")
+                   for key, (label, _i) in ai_writer.EDIT_ACTIONS.items()]
+        actions.append(("custom", "💬  Custom instruction…"))
         for i, (key, label) in enumerate(actions, start=1):
-            btn = ttk.Button(ai, text=label, command=lambda k=key: self._run_ai_edit(k))
-            btn.grid(row=i, column=0, sticky="ew", pady=1)
+            btn = tooltip(ttk.Button(ai, text=label, command=lambda k=key: self._run_ai_edit(k)),
+                          tips.get(key, ""))
+            btn.grid(row=i, column=0, sticky="ew", pady=2)
             self._editor_ai_buttons.append(btn)
-        self._editor_stop_btn = ttk.Button(ai, text="■ Stop", state="disabled",
+        self._editor_stop_btn = ttk.Button(ai, text="■  Stop", state="disabled",
                                            command=lambda: self._ai_edit_cancel and
                                            self._ai_edit_cancel.set())
-        self._editor_stop_btn.grid(row=len(actions) + 1, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(ai, text="Select text first to change only that part.",
-                  foreground="#888", wraplength=290).grid(row=len(actions) + 2, column=0,
-                                                         sticky="w", pady=(6, 0))
+        self._editor_stop_btn.grid(row=len(actions) + 1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(ai, text="Tip: select text first to change only that part. Ctrl+Z undoes "
+                           "any AI change.", style="CardMuted.TLabel", wraplength=290).grid(
+            row=len(actions) + 2, column=0, sticky="w", pady=(8, 0))
         ttk.Checkbutton(ai, text="Check spelling & grammar", variable=self._spell_var,
-                        command=self._run_spellcheck).grid(row=len(actions) + 3, column=0,
-                                                           sticky="w", pady=(4, 0))
+                        style="Card.TCheckbutton", command=self._run_spellcheck).grid(
+            row=len(actions) + 3, column=0, sticky="w", pady=(6, 0))
 
-        pv = ttk.LabelFrame(side, text="On the image", padding=8)
-        pv.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(side, text="🖼 On the image", style="Heading.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(14, 6))
+        pv = ttk.Frame(side, style="Card.TFrame", padding=10)
+        pv.grid(row=3, column=0, sticky="ew")
         pv.columnconfigure(0, weight=1)
-        self._editor_preview = tk.Label(pv, text="No image yet", foreground="#888",
-                                        bg=self.root.cget("bg"))
+        self._editor_preview = tk.Label(pv, text="No image yet — open one or find one online",
+                                        foreground="#888", bg=self.root.cget("bg"), pady=14)
         self._editor_preview.grid(row=0, column=0, sticky="ew")
-        row = ttk.Frame(pv)
+        row = ttk.Frame(pv, style="Card.TFrame")
         row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(row, text="Open image…", command=self._open).pack(side="left")
-        ttk.Button(row, text="Find online…", command=self._web_lookup).pack(side="left", padx=4)
-        ttk.Button(pv, text="Caption Builder →",
+        row.columnconfigure((0, 1), weight=1)
+        ttk.Button(row, text="📂 Open…", command=self._open).grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="🔎 Find online…", command=self._web_lookup).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(pv, text="Continue in Caption Builder  →", style="Accent.TButton",
                    command=lambda: (self._view_var.set("builder"), self._apply_view())).grid(
             row=2, column=0, sticky="ew", pady=(8, 0))
+        self._editor_placeholder = Placeholder(
+            self._editor_box,
+            "Start writing your caption story here…\n\n"
+            "Or let the AI write one: ✍ Write a story from a prompt (right).\n"
+            "Paste a story in, then use ✂ Shorten to fit to make it fit beside the image.")
         self._editor_preview_photo = None
         self._editor_sync_job = None
+        self._editor_preview.configure(bg=self._card_bg())
 
     def _layout_editor(self) -> None:
         """Place the writing card and sidebar card; with a background
@@ -3552,6 +3600,10 @@ class CaptionApp:
         self._editor_sync_job = self.root.after(delay_ms, self._sync_editor_to_caption)
 
     def _update_editor_stats(self) -> None:
+        for ph in (getattr(self, "_editor_placeholder", None),
+                   getattr(self, "_caption_placeholder", None)):
+            if ph is not None:
+                ph.update()
         text = self._editor_box.get("1.0", "end-1c")
         words = len(text.split())
         parts = [f"{words} words", f"{len(text)} characters",
@@ -4248,6 +4300,8 @@ class CaptionApp:
         log.info("FILE_OPEN  %s  %s  %dx%d", name, kind, w, h)
 
         self._source_path = path
+        self._project_path = None
+        self._update_title()
         if not is_temp_download:
             recent_store.add("files", path)
         self._single_frame_var.set(bool(self._deferred_path))
@@ -6226,6 +6280,7 @@ class CaptionApp:
             messagebox.showerror("Save Project", f"Couldn't save the project:\n{e}")
             return
         self._project_path = path
+        self._update_title()
         recent_store.add("projects", path)
         log.info("PROJECT_SAVE  %s", os.path.basename(path))
         self._status.config(text=f"Saved project {os.path.basename(path)}")
@@ -6264,6 +6319,7 @@ class CaptionApp:
         self._image_source_url = data.get("source_url")
         self._apply_project(data)
         self._project_path = path
+        self._update_title()
         recent_store.add("projects", path)
         log.info("PROJECT_OPEN  %s", os.path.basename(path))
 
@@ -6426,10 +6482,42 @@ class CaptionApp:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _card_bg(self) -> str:
+        bg = self._style.lookup("Card.TFrame", "background")
+        return bg or self.root.cget("bg")
+
+    def _draw_empty_preview(self) -> None:
+        """Friendly prompt in the empty Caption Builder preview."""
+        c = self._canvas
+        c.delete("empty")
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw <= 1 or self._cache:
+            return
+        colors = themes.accent(self._theme_name)
+        accent = colors["accent"]
+        c.create_text(cw // 2, ch // 2 - 40, text="🖼", font=(themes.UI_FONT_FAMILY, 40),
+                      fill=accent, tags=("empty",))
+        c.create_text(cw // 2, ch // 2 + 14, text="Drop an image, GIF or MP4 here",
+                      font=(themes.UI_FONT_FAMILY, 15, "bold"), fill=colors["canvas_fg"], tags=("empty",))
+        c.create_text(cw // 2, ch // 2 + 44,
+                      text="or use 📂 Open…  /  🔎 Find Online… in the toolbar",
+                      font=(themes.UI_FONT_FAMILY, 11), fill=colors["canvas_muted"], tags=("empty",))
+
+    def _update_title(self) -> None:
+        name = None
+        if getattr(self, "_project_path", None):
+            name = os.path.basename(self._project_path)
+        elif self._source_path and self._source_path != self._temp_source_path:
+            name = os.path.basename(self._source_path)
+        elif self._source_path:
+            name = "image from Find Online"
+        self.root.title(f"Caption Creator — {name}" if name else "Caption Creator")
+
     def _redraw(self) -> None:
         if not self._cache:
             if self._view_var.get() == "builder":
                 self._update_wall_items()  # background still fills an empty preview
+                self._draw_empty_preview()
             return
         if self._view_var.get() == "editor":
             if self._anim_idx == 0:
@@ -6489,7 +6577,10 @@ def main() -> None:
     # TkinterDnD.Tk is a tk.Tk with the tkdnd extension loaded — needed for
     # dropping files onto the window (see CaptionApp._setup_drop_target).
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
-    root.geometry("1100x680")
+    # Comfortable default size, centered (smaller screens get most of it).
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w, h = min(1320, sw - 60), min(820, sh - 100)
+    root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}")
 
     # logo.png is the window/taskbar icon shown top-left next to the title —
     # separate from assets/icon.png, which is only used for the .exe/shortcut

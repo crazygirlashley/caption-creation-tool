@@ -40,7 +40,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Single-Frame Preview toggle** — a toolbar checkbox, shown only for GIF/MP4 sources, to manually switch between a live full-animation preview and a lightweight single-frame preview at any time — useful on lower-end machines even for files too small to trigger the automatic large-file prompt
 - **Find Online…** — search [Barnorama](https://www.barnorama.com), [AcidCow](https://acidcow.com) and [sex.com](https://www.sex.com) (pictures and GIFs, grouped into one result each; male search terms search its male section) from inside the app for source images/GIFs. The query defaults to physical-description keywords (hair color, gender, body type, age, clothing) pulled from your current caption text, and results are ranked by how well their titles match it (hair color first). Posts about real celebrities are filtered out. Results group the actual images from each matching post under its title — click one to load it as the source, no manual download/re-open needed Built for finding photos of one attractive person: both sites are searched at once and results appear as each answers, multi-word queries also search their most distinctive word ("brunette woman" no longer collapses to a handful of off-topic posts), person galleries rank above memes and listicles, anything framed around children or teens is never shown, and a **Single person only** filter (on by default) uses on-device face detection (OpenCV YuNet) to hide group shots, memes and screenshots — previews are small, cached, and tagged **GIF** when animated. Each result group has a **More like this** button that searches for similar galleries using that post's descriptive words
 - **DeviantArt integration** — save finished output to Sta.sh (DeviantArt's private storage area) with one click; publish to gallery when ready
-- **UI themes** — Dark (default), Bubblegum, or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files
+- **UI themes** — Dark (default), Bimbo (pastel and hot pink), or Basic (native Windows look) via **⚙ Settings → Theme**; add your own as JSON files. The UI uses a clean Segoe UI font, roomy buttons, an accent color for the main actions (Save, the selected view, "Write a story"), hover tooltips on toolbar and AI buttons (with keyboard shortcuts), helpful placeholder text in empty caption boxes, and a "drop an image here" prompt in the empty Caption Builder
 - **Crash logging** — rotating log at `caption_creator_crash.log` with watchdog thread for hang detection
 
 ---
@@ -249,7 +249,7 @@ See `formats/Standard.json`, `formats/X-Change.json`, `formats/Text Message.json
 
 ## Custom Themes
 
-UI color themes work the same way as formats: JSON files in a `themes/` folder, picked up automatically. **Basic** (this app's original look) is always available — it's just the system's native theme with no color overrides. `themes/Basic.json` ships for reference only (typical Windows default colors, handy as a starting point for your own theme); the app never loads it. **Dark** and **Bubblegum** are the two built-in themes tracked in version control by default; drop your own `.json` file into `themes/` and it appears in **⚙ Settings → Theme** the next time you open that menu, no restart needed.
+UI color themes work the same way as formats: JSON files in a `themes/` folder, picked up automatically. **Basic** (this app's original look) is always available — it's just the system's native theme with no color overrides. `themes/Basic.json` ships for reference only (typical Windows default colors, handy as a starting point for your own theme); the app never loads it. **Dark** and **Bimbo** are the two built-in themes tracked in version control by default; drop your own `.json` file into `themes/` and it appears in **⚙ Settings → Theme** the next time you open that menu, no restart needed.
 
 Each theme file requires every one of these keys (all hex color strings):
 
@@ -265,11 +265,11 @@ Each theme file requires every one of these keys (all hex color strings):
 | `muted_fg` | Secondary/disabled text color |
 | `select_bg` | Selection highlight color |
 
-A theme can also set an optional `font` key to a font family name (Bubblegum uses `"Aardvark Cafe"`) to re-font the whole UI while it's active; if that font isn't installed, the normal UI font is used.
+A theme can also set an optional `font` key to a font family name (Bimbo uses `"Aardvark Cafe"`) to re-font the whole UI while it's active; if that font isn't installed, the normal UI font is used.
 
 Your theme choice is saved to `ui_settings.json` (gitignored).
 
-See `themes/Dark.json` and `themes/Bubblegum.json` for examples. A file missing any of these keys is skipped rather than crashing the app.
+Optional keys: `accent`, `accent_fg` and `accent_hover` color the highlighted buttons (Save, the selected view, the main AI action) and selected tabs; `version` lets an updated built-in theme replace an older installed copy. See `themes/Dark.json` and `themes/Bimbo.json` for examples. A file missing any of these keys is skipped rather than crashing the app.
 
 ---
 
@@ -313,6 +313,7 @@ caption-creation-tool/
 ├── ai_writer.py              # Local-LLM caption story writer (OpenAI-compatible API)
 ├── da_client.py              # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
 ├── wallpaper.py              # App background image/GIF rendering (fit / tile / dim)
+├── ui_widgets.py             # Tooltips and placeholder text helpers
 ├── web_lookup.py             # Barnorama/AcidCow search client (Find Online…)
 ├── themes.py                 # UI theme loader/applier (⚙ Settings → Theme)
 ├── assets/
@@ -330,7 +331,7 @@ caption-creation-tool/
 │   └── X-Change (Vertical).json
 ├── themes/                   # UI theme definitions (JSON) — add your own here
 │   ├── Basic.json            # Reference only, never loaded
-│   ├── Bubblegum.json
+│   ├── Bimbo.json
 │   └── Dark.json
 ├── packaging/                # PyInstaller build (see "Building a Release")
 │   ├── build.spec            # Builds CaptionCreator.exe + CaptionCreatorLauncher.exe

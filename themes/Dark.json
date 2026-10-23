@@ -1,11 +1,18 @@
 {
   "name": "Dark",
-  "bg": "#2e2e2e",
-  "panel": "#383838",
-  "input_bg": "#3f3f3f",
-  "hover": "#4a4a4a",
-  "border": "#4f4f4f",
-  "fg": "#e0e0e0",
-  "muted_fg": "#a3a3a3",
-  "select_bg": "#565656"
+  "version": 2,
+  "bg": "#1f1c24",
+  "panel": "#2a2631",
+  "input_bg": "#25212b",
+  "hover": "#383241",
+  "border": "#3d3746",
+  "fg": "#ece7f2",
+  "muted_fg": "#a59cb2",
+  "select_bg": "#5a3d63",
+  "accent": "#e0479e",
+  "accent_fg": "#ffffff",
+  "accent_hover": "#ee66b1",
+  "canvas": "#16141a",
+  "canvas_fg": "#ece7f2",
+  "canvas_muted": "#a59cb2"
 }

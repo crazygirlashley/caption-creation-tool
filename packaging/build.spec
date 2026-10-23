@@ -56,7 +56,7 @@ for fname in ("Standard.json", "Standard (Vertical).json",
     src = os.path.join(FORMATS_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "formats"))
-for fname in ("Dark.json", "Bubblegum.json", "Basic.json"):
+for fname in ("Dark.json", "Bimbo.json", "Basic.json"):
     src = os.path.join(THEMES_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "themes"))

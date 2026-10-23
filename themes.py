@@ -8,7 +8,7 @@ themes/Basic.json is the one exception: it ships for reference only (see
 the skip in _load_palettes_from_disk) and never appears as a selectable
 option, since "Basic" means the native theme, not a fixed palette.
 
-A palette can optionally set "font" to a font family name (e.g. Bubblegum
+A palette can optionally set "font" to a font family name (e.g. Bimbo
 uses "Aardvark Cafe") to also re-font the whole UI while that theme is
 active — falls back to the app's normal font if the requested one isn't
 installed.
@@ -49,13 +49,34 @@ DEFAULT_THEME = "Dark"
 # .gitignore). Any other themes/*.json you drop in is personal, same as
 # formats/. "Basic" ships as a JSON too, but only for reference — see the
 # name.lower() == "basic" skip in _load_palettes_from_disk.
-_CORE_THEME_NAMES = {"Basic", "Dark", "Bubblegum"}
+_CORE_THEME_NAMES = {"Basic", "Dark", "Bimbo"}
+
+# "Bimbo" was called "Bubblegum" before 0.1.8 — the old built-in file is
+# replaced by Bimbo.json (unless it was customized) and a saved choice of
+# "Bubblegum" now means "Bimbo".
+_RENAMED_THEMES = {"Bubblegum": "Bimbo"}
+_LEGACY_BUBBLEGUM = {
+    "name": "Bubblegum", "bg": "#f29ad8", "panel": "#ffffff", "input_bg": "#ffffff",
+    "hover": "#ffd1ea", "border": "#d6559e", "fg": "#7a1f56", "muted_fg": "#a8578b",
+    "select_bg": "#ff6fb8", "font": "Aardvark Cafe",
+}
 
 # Every custom palette JSON must define all of these — a value picked for
 # every color role used somewhere in the UI (see _apply_custom_ttk /
 # _apply_options). A file missing one is skipped rather than crashing the
 # app over a hand-edited typo.
 _REQUIRED_KEYS = ("bg", "panel", "input_bg", "hover", "border", "fg", "muted_fg", "select_bg")
+# Optional: the highlight color for primary actions and the selected view.
+# A palette without them falls back to these.
+_ACCENT_DEFAULTS = {"accent": "#c45ab3", "accent_fg": "#ffffff", "accent_hover": "#d877c6",
+                    # Backdrop behind the Caption Builder's preview, and the
+                    # text drawn on it when it's empty.
+                    "canvas": "#2b2b2b", "canvas_fg": "#e8e8e8", "canvas_muted": "#b8b8b8"}
+
+# Fonts for the whole UI (when installed): a clean sans at a comfortable
+# size, plus a larger weight for section headings.
+UI_FONT_FAMILY = "Segoe UI"
+UI_FONT_SIZE = 10
 
 # Classic (non-ttk) widget colors for "basic" — Windows symbolic system
 # color names, so it matches whatever the user's own OS theme/contrast
@@ -70,18 +91,42 @@ _native_ttk_theme = None
 _palettes_cache: Optional[dict] = None
 
 
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def _ensure_themes_seeded() -> None:
-    """On a fresh install, themes/ won't exist yet under BASE_DIR — seed it
-    from the read-only copy of the built-in themes bundled alongside the
-    frozen app (RESOURCE_DIR). No-op when running from source, where the two
-    dirs are the same and themes/ is already tracked in git."""
-    if os.path.isdir(_THEMES_DIR) and os.listdir(_THEMES_DIR):
-        return
+    """Keep themes/ (under BASE_DIR) supplied with the built-in themes
+    bundled alongside the frozen app (RESOURCE_DIR): copy any that are
+    missing, and replace an older copy of a built-in when the bundled one
+    has a higher "version" — that's how reworked built-in themes reach
+    existing installs. Also retires the pre-0.1.8 "Bubblegum" file (now
+    "Bimbo") when it's the unmodified original. No-op when running from
+    source, where the two dirs are the same."""
     os.makedirs(_THEMES_DIR, exist_ok=True)
     seed_dir = os.path.join(RESOURCE_DIR, "themes")
     if os.path.isdir(seed_dir) and os.path.abspath(seed_dir) != os.path.abspath(_THEMES_DIR):
         for fname in os.listdir(seed_dir):
-            shutil.copy(os.path.join(seed_dir, fname), os.path.join(_THEMES_DIR, fname))
+            src = os.path.join(seed_dir, fname)
+            dest = os.path.join(_THEMES_DIR, fname)
+            if not os.path.exists(dest):
+                shutil.copy(src, dest)
+                continue
+            bundled, installed = _read_json(src) or {}, _read_json(dest) or {}
+            if bundled.get("version", 1) > installed.get("version", 1):
+                shutil.copy(src, dest)
+    legacy = os.path.join(_THEMES_DIR, "Bubblegum.json")
+    if os.path.exists(legacy) and os.path.exists(os.path.join(_THEMES_DIR, "Bimbo.json")):
+        if _read_json(legacy) == _LEGACY_BUBBLEGUM:
+            try:
+                os.remove(legacy)
+            except OSError:
+                pass
 
 
 def _load_palettes_from_disk() -> dict:
@@ -109,6 +154,8 @@ def _load_palettes_from_disk() -> dict:
                 # that native look approximates in hex, not a loadable option.
                 continue
             palette = {k: data[k] for k in _REQUIRED_KEYS}
+            for key, default in _ACCENT_DEFAULTS.items():
+                palette[key] = data.get(key, default)
             if data.get("font"):
                 palette["font"] = data["font"]
             result[name] = palette
@@ -133,6 +180,8 @@ def load_theme() -> str:
             name = json.load(f).get("theme")
     except (FileNotFoundError, json.JSONDecodeError):
         return DEFAULT_THEME
+    if name not in get_palettes():
+        name = _RENAMED_THEMES.get(name, name)
     if name == "basic" or name in get_palettes():
         return name
     return DEFAULT_THEME
@@ -171,6 +220,78 @@ def apply(root: tk.Tk, style: ttk.Style, name: str) -> None:
         style.theme_use(_native_ttk_theme)
         _apply_options(root, None)
         _set_ui_font(root, None)
+    _apply_layout_styles(style, palettes.get(name))
+
+
+def accent(name: str) -> dict:
+    """The optional colors (accent, accent_fg, accent_hover, canvas,
+    canvas_fg, canvas_muted) for a theme, with defaults for Basic — for the
+    few classic widgets the app colors itself."""
+    return {k: get_palettes().get(name, {}).get(k, v) for k, v in _ACCENT_DEFAULTS.items()}
+
+
+def _apply_layout_styles(style: ttk.Style, c: Optional[dict]) -> None:
+    """Spacing, fonts and the named styles the app uses (Accent.TButton,
+    Heading.TLabel, Muted.TLabel, Card.TFrame, the view toggle) — applied
+    on every theme, including Basic, so all of them get the same roomier,
+    clearer layout."""
+    a = {**_ACCENT_DEFAULTS, **(c or {})}
+    style.configure("TButton", padding=(12, 5))
+    style.configure("TMenubutton", padding=(10, 5))
+    style.configure("TNotebook.Tab", padding=(12, 5))
+    style.configure("TCombobox", padding=(4, 3))
+    style.configure("TSpinbox", padding=(4, 3))
+    style.configure("TEntry", padding=(4, 3))
+
+    style.configure("Heading.TLabel", font=(_ui_family(), UI_FONT_SIZE + 2, "bold"))
+    style.configure("Muted.TLabel", foreground=(c or {}).get("muted_fg", "#6b6b6b"))
+    style.configure("Small.TButton", padding=(8, 3))
+    style.configure("Small.TMenubutton", padding=(6, 3))
+
+    # Primary action: filled with the accent color.
+    style.configure("Accent.TButton", padding=(14, 6), font=(_ui_family(), UI_FONT_SIZE, "bold"))
+    if c is not None:
+        style.configure("Accent.TButton", background=a["accent"], foreground=a["accent_fg"],
+                        bordercolor=a["accent"], lightcolor=a["accent"], darkcolor=a["accent"])
+        style.map("Accent.TButton",
+                  background=[("disabled", c["panel"]), ("pressed", a["accent"]),
+                              ("active", a["accent_hover"])],
+                  foreground=[("disabled", c["muted_fg"])])
+        # Editor / Caption Builder toggle: the selected view lights up.
+        style.configure("View.Toolbutton", padding=(14, 5), background=c["panel"],
+                        foreground=c["fg"], bordercolor=c["border"], relief="flat",
+                        font=(_ui_family(), UI_FONT_SIZE, "bold"))
+        style.map("View.Toolbutton",
+                  background=[("selected", a["accent"]), ("active", c["hover"])],
+                  foreground=[("selected", a["accent_fg"])])
+        style.configure("Card.TFrame", background=c["panel"])
+        style.configure("Card.TLabel", background=c["panel"], foreground=c["fg"])
+        style.configure("CardMuted.TLabel", background=c["panel"], foreground=c["muted_fg"])
+        style.configure("Card.TLabelframe", background=c["panel"], bordercolor=c["border"])
+        style.configure("Card.TLabelframe.Label", background=c["panel"], foreground=c["fg"],
+                        font=(_ui_family(), UI_FONT_SIZE, "bold"))
+        style.configure("Card.TCheckbutton", background=c["panel"], foreground=c["fg"])
+        style.map("Card.TCheckbutton", background=[("active", c["panel"])])
+        style.configure("TButton", focuscolor=c["border"], focusthickness=1)
+        style.configure("TProgressbar", background=a["accent"], troughcolor=c["input_bg"],
+                        bordercolor=c["border"], lightcolor=a["accent"], darkcolor=a["accent"])
+        style.map("TNotebook.Tab", foreground=[("selected", a["accent"]), ("active", c["fg"])],
+                  background=[("selected", c["bg"]), ("active", c["hover"])])
+        style.configure("TScrollbar", arrowsize=12, gripcount=0)
+    else:
+        style.configure("View.Toolbutton", padding=(14, 5), font=(_ui_family(), UI_FONT_SIZE, "bold"))
+        for name in ("Card.TFrame", "Card.TLabel", "CardMuted.TLabel", "Card.TLabelframe",
+                     "Card.TCheckbutton"):
+            style.configure(name, background="SystemButtonFace")
+        style.configure("Card.TLabelframe.Label", font=(_ui_family(), UI_FONT_SIZE, "bold"))
+        style.configure("CardMuted.TLabel", foreground="#6b6b6b")
+
+
+def _ui_family() -> str:
+    try:
+        return tkfont.nametofont("TkDefaultFont").cget("family")
+    except (tk.TclError, RuntimeError):
+        return UI_FONT_FAMILY
 
 
 # Every one of Tk's built-in named fonts — reconfiguring these re-fonts the
@@ -205,6 +326,10 @@ def _set_ui_font(root: tk.Tk, family: Optional[str]) -> None:
             available = ()
         if family in available:
             resolved = family
+    try:
+        has_ui_font = UI_FONT_FAMILY in tkfont.families(root)
+    except tk.TclError:
+        has_ui_font = False
     for fname in _NAMED_FONTS:
         try:
             f = tkfont.nametofont(fname, root=root)
@@ -212,7 +337,11 @@ def _set_ui_font(root: tk.Tk, family: Optional[str]) -> None:
             continue
         if fname not in _original_font_families:
             _original_font_families[fname] = f.cget("family")
-        f.configure(family=resolved or _original_font_families[fname])
+        fallback = (UI_FONT_FAMILY if has_ui_font and fname != "TkFixedFont"
+                    else _original_font_families[fname])
+        f.configure(family=resolved or fallback)
+        if fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            f.configure(size=UI_FONT_SIZE)
 
 
 def _apply_custom_ttk(style: ttk.Style, c: dict) -> None:

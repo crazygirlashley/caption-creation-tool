@@ -32,7 +32,7 @@ formats/*.json
 # (Basic.json ships too, but as reference only — see themes.py)
 themes/*.json
 !themes/Dark.json
-!themes/Bubblegum.json
+!themes/Bimbo.json
 !themes/Basic.json
 
 # Local AI writer settings (server address, model, optional API key)
