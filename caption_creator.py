@@ -25,8 +25,8 @@ import webbrowser
 
 import imageio.v2 as imageio
 import numpy as np
-from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageSequence, ImageStat,
-                 ImageTk)
+from PIL import (Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageSequence,
+                 ImageStat, ImageTk)
 
 try:  # drag-and-drop support (optional: the app works without it)
     from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
@@ -979,6 +979,10 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         watermark_pos=raw.get("watermark_pos", "bl"),
         watermark_opacity=raw.get("watermark_opacity", 1.0),
     )
+    if raw.get("before_path"):
+        kwargs.update(before_path=raw["before_path"], ba_layout=raw.get("ba_layout", "side"),
+                      ba_labels=tuple(raw.get("ba_labels") or ("", "")),
+                      ba_label_size=raw.get("ba_label_size", 28) * overlay_k)
 
     if raw["header_enabled"]:
         kwargs.update(
@@ -1048,6 +1052,115 @@ def _apply_zoom(frame: Image.Image, zoom: float, pan_x: float, pan_y: float,
     cy = fh / 2 + max(-1.0, min(1.0, pan_y)) * (fh - ch) / 2
     box = (cx - cw / 2, cy - ch / 2, cx + cw / 2, cy + ch / 2)
     return frame.resize((fw, fh), resample, box=box)
+
+
+# Before/After: a second, "before" picture beside (or above) the main one,
+# cropped to the same size, with a thin gap in the page color between them.
+_BA_FOCUS = (0.5, 0.4)   # crop the before picture a little above center (faces)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_before_image(path: str, mtime: float) -> Optional[Image.Image]:
+    try:
+        with Image.open(path) as img:
+            img.seek(0)   # a GIF's first frame
+            return img.convert("RGBA")
+    except Exception:
+        log.exception("BEFORE_IMAGE_ERROR  %s", path)
+        return None
+
+
+@functools.lru_cache(maxsize=8)
+def _fitted_before(path: str, mtime: float, size: tuple) -> Optional[Image.Image]:
+    img = _load_before_image(path, mtime)
+    if img is None:
+        return None
+    return ImageOps.fit(img, size, Image.LANCZOS, centering=_BA_FOCUS)
+
+
+def _before_mtime(path: str) -> Optional[float]:
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
+
+
+def _ba_frame_size(fw: int, fh: int, ba_layout: str) -> tuple:
+    """Size of the combined before + after picture for an after of fw x fh."""
+    gap = max(2, round(min(fw, fh) * 0.012))
+    return (fw, 2 * fh + gap) if ba_layout == "stacked" else (2 * fw + gap, fh)
+
+
+def _ba_combine(before_path: str, mtime: float, after: Image.Image, size: tuple,
+                ba_layout: str, gap_color: tuple, resample) -> tuple:
+    """(combined RGBA picture of exactly `size`, [before box, after box]).
+    The after keeps its own length along the split (squeezed to half if
+    needed); the gap takes up any rounding left over."""
+    W, H = size
+    aw, ah = after.size
+    if ba_layout == "stacked":
+        slot = (W, max(1, min(ah, H // 2)))
+        gap = H - 2 * slot[1]
+        boxes = [(0, 0, W, slot[1]), (0, slot[1] + gap, W, H)]
+    else:
+        slot = (max(1, min(aw, W // 2)), H)
+        gap = W - 2 * slot[0]
+        boxes = [(0, 0, slot[0], H), (slot[0] + gap, 0, W, H)]
+    if after.size != slot:
+        after = after.resize(slot, resample)
+    out = Image.new("RGBA", (W, H), gap_color + (255,))
+    before = _fitted_before(before_path, mtime, slot)
+    if before is not None:
+        out.paste(before, boxes[0][:2])
+    out.paste(after.convert("RGBA"), boxes[1][:2])
+    return out, boxes
+
+
+# Series: {"name": str, "part": int, "template": str, "title_in_header": bool}
+_SERIES_TEMPLATE = "{series} Part {n}"
+
+
+def _series_title(series: dict) -> str:
+    """The numbered title for a series part, e.g. "Pill Problems Part 7".
+    {series} and {n} are filled in; a broken template falls back to the
+    default one."""
+    name, n = series.get("name", "").strip(), int(series.get("part", 1))
+    try:
+        title = (series.get("template") or _SERIES_TEMPLATE).format(series=name, n=n)
+    except (KeyError, IndexError, ValueError):
+        title = _SERIES_TEMPLATE.format(series=name, n=n)
+    return " ".join(title.split())
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip(" .")
+    return name or "Untitled"
+
+
+def _find_series_part(name: str, part: int, folders: list,
+                      extra_paths: tuple = ()) -> Optional[str]:
+    """Path of a saved project that is part `part` of the series `name`,
+    looked for in folders (non-recursive) and among extra_paths (recent
+    projects). Newest file wins if there are several."""
+    want = name.strip().casefold()
+    candidates = set(p for p in extra_paths if p.lower().endswith(".ccproj"))
+    for folder in folders:
+        try:
+            candidates.update(os.path.join(folder, f) for f in os.listdir(folder)
+                              if f.lower().endswith(".ccproj"))
+        except OSError:
+            continue
+    found = []
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                s = json.load(fh).get("series") or {}
+            if (str(s.get("name", "")).strip().casefold() == want
+                    and int(s.get("part", 0)) == part):
+                found.append((os.path.getmtime(path), path))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return max(found)[1] if found else None
 
 
 def _text_x(draw: ImageDraw.ImageDraw, line: str, font: ImageFont.FreeTypeFont,
@@ -1376,12 +1489,27 @@ def build_composite(
     watermark_opacity: float = 1.0,
     header_outline: Optional[list] = None,
     footer_outline: Optional[list] = None,
+    before_path: str = "",
+    ba_layout: str = "side",
+    ba_labels: tuple = ("Before", "After"),
+    ba_label_size: float = 28,
+    _ba_size: Optional[tuple] = None,
     _px_scale: float = 1.0,
 ) -> Image.Image:
     frame = frame.convert("RGBA")
     if zoom > 1.001:
         frame = _apply_zoom(frame, zoom, pan_x, pan_y,
                             Image.NEAREST if upscale_filter == "nearest" else Image.LANCZOS)
+    # Before/After: put the before picture beside/above this one first, so
+    # the panel, title, tagline and watermark all lay out around the pair.
+    after = frame
+    ba_boxes = None
+    before_mtime = _before_mtime(before_path)
+    if before_mtime is not None and _load_before_image(before_path, before_mtime) is not None:
+        frame, ba_boxes = _ba_combine(
+            before_path, before_mtime, frame, _ba_size or _ba_frame_size(*frame.size, ba_layout),
+            ba_layout, _hex_to_rgb(page_bg),
+            Image.NEAREST if upscale_filter == "nearest" else Image.LANCZOS)
     fw, fh = frame.size
     total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
 
@@ -1405,8 +1533,22 @@ def build_composite(
             s_frame = (max(1, new_w - s_cap), new_h)
         resample = (Image.NEAREST if upscale_filter == "nearest" and scale > 1
                     else Image.LANCZOS)
+        ba_kw: dict = {}
+        if ba_boxes:
+            # Rebuild the pair at output size (the before picture is cropped
+            # from its full-resolution file, not blown up from the small one).
+            aw, ah = after.size
+            if ba_layout == "stacked":
+                a_size = (s_frame[0], max(1, round(ah * scale)))
+            else:
+                a_size = (max(1, round(aw * scale)), s_frame[1])
+            ba_kw = dict(before_path=before_path, ba_layout=ba_layout, ba_labels=ba_labels,
+                         ba_label_size=_s(ba_label_size), _ba_size=s_frame)
+            src, s_frame = after, a_size
+        else:
+            src = frame
         return build_composite(
-            frame.resize(s_frame, resample),
+            src.resize(s_frame, resample),
             text, s_cap, page_bg, font_family, font_size * scale,
             font_color, round(padding * scale),
             stroke_width=round(stroke_width * scale), stroke_color=stroke_color,
@@ -1422,6 +1564,7 @@ def build_composite(
             header_outline=header_outline and [_s(header_outline[0]), header_outline[1]],
             footer_outline=footer_outline and [_s(footer_outline[0]), footer_outline[1]],
             _px_scale=_px_scale * scale,
+            **ba_kw,
         )
 
     # Fixed pixel margins/offsets below were tuned at natural size; scale
@@ -1532,6 +1675,27 @@ def build_composite(
             _draw_text_overlay(txt_draw, (header_x, margin), header_text.strip(), fnt,
                                font_color, h_sw, h_sc, shd_draw_ctx, shadow_offset)
 
+        # Before/After labels — centered along the top of each picture,
+        # below the title when there is one.
+        if ba_boxes and ba_label_size > 0 and any(str(t).strip() for t in ba_labels):
+            fnt = _pil_font(header_font, ba_label_size)
+            top = margin
+            if header_text.strip():
+                top += txt_draw.textbbox((0, 0), header_text.strip(),
+                                         font=_pil_font(header_font, header_size))[3] + _px(4)
+            if stroke_width:
+                l_sw, l_sc = stroke_width, stroke_color
+            else:
+                r, g, b = _hex_to_rgb(font_color)
+                l_sw = max(1, round(ba_label_size * 0.08))
+                l_sc = "#000000" if 0.299 * r + 0.587 * g + 0.114 * b >= 128 else "#ffffff"
+            for (x0, y0, x1, _y1), label in zip(ba_boxes, ba_labels):
+                label = str(label).strip()
+                if label:
+                    lx = image_x + x0 + (x1 - x0 - _text_w(txt_draw, label, fnt)) / 2
+                    _draw_text_overlay(txt_draw, (round(lx), y0 + top), label, fnt,
+                                       font_color, l_sw, l_sc, shd_draw_ctx, shadow_offset)
+
         # Composite shadow (single blur) then actual text on top
         if shadow and txt_img is not None and shd_img is not None:
             out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3 * _px_scale)))
@@ -1555,7 +1719,8 @@ def build_composite(
            footer_text, footer_font, footer_size, watermark_path, wm_mtime,
            watermark_height, json.dumps(chat_messages), bubble_color, _px_scale,
            inline_markup, dialogue_color, watermark_pos, watermark_opacity,
-           json.dumps(header_outline), json.dumps(footer_outline))
+           json.dumps(header_outline), json.dumps(footer_outline),
+           json.dumps(ba_boxes), json.dumps(list(ba_labels)), ba_label_size)
     with _OVERLAY_CACHE_LOCK:
         overlay = _OVERLAY_CACHE.get(key)
         if overlay is not None:
@@ -2109,6 +2274,18 @@ class CaptionApp:
         self._pan_drag: Optional[tuple] = None
         self._luma_cache: Optional[tuple] = None
 
+        # Before/After: a second picture shown beside/above the main one.
+        self._ba_on_var = tk.BooleanVar(value=False)
+        self._before_path = ""
+        self._ba_layout_var = tk.StringVar(value="Side by side")
+        self._ba_before_label_var = tk.StringVar(value="Before")
+        self._ba_after_label_var = tk.StringVar(value="After")
+        self._ba_label_size_var = tk.IntVar(value=28)
+
+        # Series: name + part number; numbers the title and finds the
+        # neighbouring parts' projects (see _series_*).
+        self._series: Optional[dict] = None
+
         # Watermark
         self._watermark_path = ""
         # Only used when the footer is disabled — with the footer on,
@@ -2370,7 +2547,9 @@ class CaptionApp:
                   self._footer_size_var, self._wm_auto_var, self._scale_overlays_var,
                   self._output_pct_var, self._gif_colors_var, self._auto_contrast_var,
                   self._zoom_var, self._pan_x_var, self._pan_y_var, self._wm_pos_var,
-                  self._wm_opacity_var):
+                  self._wm_opacity_var, self._ba_on_var, self._ba_layout_var,
+                  self._ba_before_label_var, self._ba_after_label_var,
+                  self._ba_label_size_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
         for v in (self._trim_start_var, self._trim_end_var, self._speed_var):
@@ -2864,6 +3043,64 @@ class CaptionApp:
                           "Ctrl + scroll over it to zoom.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
                                              pady=(4, 0))
+        r += 1
+
+        # Before / After
+        ttk.Separator(f).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        r += 1
+        ttk.Checkbutton(f, text="Before & after", variable=self._ba_on_var,
+                        command=self._on_ba_toggle).grid(row=r, column=0, columnspan=2,
+                                                         sticky="w")
+        r += 1
+        pick = ttk.Frame(f)
+        pick.grid(row=r, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(pick, text="Before image…", command=self._pick_before_image).pack(side="left")
+        self._before_name_lbl = ttk.Label(pick, text="(none)", style="Muted.TLabel")
+        self._before_name_lbl.pack(side="left", padx=6)
+        tooltip(pick, "The picture shown first. The image you opened is the \"after\".")
+        r += 1
+        ttk.Label(f, text="Arrange:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self._ba_layout_var, state="readonly", width=14,
+                     values=("Side by side", "Stacked")).grid(row=r, column=1, sticky="w",
+                                                             padx=6)
+        r += 1
+        ttk.Label(f, text="Labels:").grid(row=r, column=0, sticky="w", pady=4)
+        lab = ttk.Frame(f)
+        lab.grid(row=r, column=1, sticky="ew", padx=6)
+        ttk.Entry(lab, textvariable=self._ba_before_label_var, width=10).pack(side="left")
+        ttk.Entry(lab, textvariable=self._ba_after_label_var, width=10).pack(side="left",
+                                                                            padx=(4, 0))
+        tooltip(lab, "Leave a label empty to hide it.")
+        r += 1
+        ttk.Label(f, text="Label size:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Spinbox(f, from_=0, to=200, increment=1, width=6,
+                    textvariable=self._ba_label_size_var).grid(row=r, column=1, sticky="w",
+                                                               padx=6)
+
+    def _pick_before_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose the before image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.gif *.bmp"), ("All files", "*.*")])
+        if path:
+            self._set_before_image(path)
+
+    def _set_before_image(self, path: str) -> None:
+        if path and _load_before_image(path, _before_mtime(path) or 0) is None:
+            messagebox.showerror("Before image", f"Couldn't open that image:\n{path}")
+            return
+        self._before_path = path
+        self._before_name_lbl.config(text=_short_path(os.path.basename(path), 28)
+                                     if path else "(none)")
+        if path and not self._ba_on_var.get():
+            self._ba_on_var.set(True)   # its trace refreshes
+        else:
+            self._safe_refresh(debounce_ms=0)
+
+    def _on_ba_toggle(self) -> None:
+        if self._ba_on_var.get() and not self._before_path:
+            self._pick_before_image()
+            if not self._before_path:
+                self._ba_on_var.set(False)
 
     @staticmethod
     def _safe_float(var: tk.Variable) -> float:
@@ -2894,9 +3131,13 @@ class CaptionApp:
             return
         zoom = self._safe_float(self._zoom_var)
         fw, fh = self._frames[0].size
+        cw, ch = fw, fh   # the whole picture area (both halves of a before & after)
+        if self._ba_on_var.get() and self._before_path:
+            cw, ch = _ba_frame_size(fw, fh, "stacked" if self._ba_layout_var.get() == "Stacked"
+                                    else "side")
         layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
-        shown_w = disp.width if layout == "vertical" else disp.height * fw / fh
-        shown_h = shown_w * fh / fw
+        k_disp = (disp.width if layout == "vertical" else disp.height * cw / ch) / cw
+        shown_w, shown_h = fw * k_disp, fh * k_disp
         k = max(0.01, zoom - 1)
         px = d[2] - 2 * (event.x - d[0]) / (shown_w * k)
         py = d[3] - 2 * (event.y - d[1]) / (shown_h * k)
@@ -4387,7 +4628,8 @@ class CaptionApp:
         # With Shift held, Tk reports the capital letter: Ctrl+Shift+O/S open
         # and save a project.
         bindings = (("<Control-o>", self._open), ("<Control-O>", self._open_project),
-                    ("<Control-s>", self._save), ("<Control-S>", self._save_project))
+                    ("<Control-s>", self._save), ("<Control-S>", self._save_project),
+                    ("<Control-N>", self._series_next_part))
         for key, action in bindings:
             self.root.bind_all(key, lambda _e, a=action: a())
             self.root.bind_class("Text", key, lambda _e, a=action: (a(), "break")[1])
@@ -4435,7 +4677,7 @@ class CaptionApp:
         raw = self._gather_raw_params()
         if raw is None:
             return
-        fw, fh = self._frames[0].size
+        fw, fh = raw["frame_size"]
 
         def _build() -> None:
             try:
@@ -5488,7 +5730,8 @@ class CaptionApp:
                 default_ext = ".gif"
                 filetypes = [("Animated GIF", "*.gif"), ("MP4 Video", "*.mp4")]
             path = filedialog.asksaveasfilename(
-                defaultextension=default_ext, filetypes=filetypes)
+                defaultextension=default_ext, filetypes=filetypes,
+                initialfile=self._series_filename(""))
             if not path:
                 return
 
@@ -5540,7 +5783,7 @@ class CaptionApp:
             return
 
         path = filedialog.asksaveasfilename(
-            defaultextension=".png",
+            defaultextension=".png", initialfile=self._series_filename(""),
             filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("BMP", "*.bmp")],
         )
         if not path:
@@ -5875,6 +6118,21 @@ class CaptionApp:
             )
         except (tk.TclError, ValueError):
             return None
+        if self._ba_on_var.get() and self._before_path:
+            try:
+                label_size = max(0.0, float(self._ba_label_size_var.get()))
+            except (tk.TclError, ValueError):
+                return None
+            raw.update(
+                before_path=self._before_path,
+                ba_layout="stacked" if self._ba_layout_var.get() == "Stacked" else "side",
+                ba_labels=[self._ba_before_label_var.get(), self._ba_after_label_var.get()],
+                ba_label_size=label_size,
+            )
+            if raw["frame_size"]:
+                # Everything sized from the picture (Auto-fit, output size)
+                # sees the pair as one picture.
+                raw["frame_size"] = _ba_frame_size(*raw["frame_size"], raw["ba_layout"])
         if raw["auto_contrast"] and self._frames and (
                 raw.get("header_enabled") or raw.get("footer_enabled")):
             raw["overlay_luma"] = self._overlay_luma(raw)
@@ -5886,10 +6144,16 @@ class CaptionApp:
         source/framing so every frame of a GIF gets the same outline choice
         (no flicker)."""
         frame = self._frames[0]
-        key = (id(frame), raw["zoom"], raw["pan_x"], raw["pan_y"])
+        before = raw.get("before_path", "")
+        key = (id(frame), raw["zoom"], raw["pan_x"], raw["pan_y"], before,
+               raw.get("ba_layout"), _before_mtime(before))
         if self._luma_cache is None or self._luma_cache[0] != key:
-            self._luma_cache = (key, _overlay_luma(
-                _apply_zoom(frame, raw["zoom"], raw["pan_x"], raw["pan_y"], Image.BILINEAR)))
+            framed = _apply_zoom(frame, raw["zoom"], raw["pan_x"], raw["pan_y"], Image.BILINEAR)
+            if before and key[-1] is not None:
+                framed = _ba_combine(before, key[-1], framed,
+                                     _ba_frame_size(*framed.size, raw["ba_layout"]),
+                                     raw["ba_layout"], (0, 0, 0), Image.BILINEAR)[0]
+            self._luma_cache = (key, _overlay_luma(framed))
         return self._luma_cache[1]
 
     def _collect_render_params(self) -> Optional[dict]:
@@ -6462,7 +6726,8 @@ class CaptionApp:
         raw_text = self._get_caption_text().strip()
         if self._image_source_url:
             raw_text = f"Image Source: {self._image_source_url}\n\n{raw_text}"
-        prompt = self._da_send_prompt("", raw_text, offer_mp4=self._is_video)
+        prompt = self._da_send_prompt(_series_title(self._series) if self._series else "",
+                                      raw_text, offer_mp4=self._is_video)
         if prompt is None:
             return
         title, description, upload_format = prompt
@@ -6736,6 +7001,231 @@ class CaptionApp:
         menu.add_cascade(label="Recent Projects", menu=recent_proj)
         menu.add_command(label="Save Project…", accelerator="Ctrl+Shift+S",
                          command=self._save_project)
+        menu.add_separator()
+        series = tk.Menu(menu, tearoff=False)
+        s = self._series
+        if s:
+            series.add_command(label=f"{s['name']} — Part {s['part']}", state="disabled")
+            series.add_separator()
+        series.add_command(label="Series Settings…" if s else "Start a Series…",
+                           command=self._series_dialog)
+        state = "normal" if s else "disabled"
+        series.add_command(label="Next Part…", accelerator="Ctrl+Shift+N",
+                           command=self._series_next_part, state=state)
+        series.add_command(label="Open Previous Part", state=state,
+                           command=lambda: self._series_open_part(-1))
+        series.add_command(label="Open Next Part", state=state,
+                           command=lambda: self._series_open_part(1))
+        series.add_command(label="Read Previous Part's Caption…", state=state,
+                           command=self._series_show_previous)
+        series.add_separator()
+        series.add_command(label="Leave Series", state=state,
+                           command=lambda: self._set_series(None))
+        menu.add_cascade(label="Series", menu=series)
+
+    # ------------------------------------------------------------------
+    # Series — numbered parts that share a look
+    # ------------------------------------------------------------------
+
+    def _set_series(self, series: Optional[dict], retitle: bool = True) -> None:
+        """Make `series` the current one (None leaves it). With retitle,
+        the numbered title goes in the Header text when that's switched on."""
+        if series and not str(series.get("name", "")).strip():
+            series = None
+        self._series = dict(series) if series else None
+        if self._series:
+            self._series["part"] = max(1, int(self._series.get("part", 1)))
+            recent_store.set_setting("last_series", self._series)
+            if retitle and self._series.get("title_in_header", True):
+                box = self._header_text_box
+                box.delete("1.0", "end")
+                box.insert("1.0", _series_title(self._series))
+                self._safe_refresh(debounce_ms=0)
+        self._update_title()
+
+    def _series_dialog(self) -> None:
+        cur = self._series or recent_store.get_setting("last_series") or {}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Series")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        name_var = tk.StringVar(value=cur.get("name", ""))
+        part_var = tk.IntVar(value=int(cur.get("part", 1)) if self._series else
+                             int(cur.get("part", 0)) + 1 if cur else 1)
+        tmpl_var = tk.StringVar(value=cur.get("template") or _SERIES_TEMPLATE)
+        header_var = tk.BooleanVar(value=cur.get("title_in_header", True))
+        ttk.Label(body, text="Series name:").grid(row=0, column=0, sticky="w", pady=4)
+        name_entry = ttk.Entry(body, textvariable=name_var, width=30)
+        name_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(body, text="This is part:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Spinbox(body, from_=1, to=999, width=6, textvariable=part_var).grid(
+            row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="Title:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=tmpl_var, width=30).grid(row=2, column=1, sticky="ew",
+                                                              padx=(8, 0))
+        preview = ttk.Label(body, style="Muted.TLabel")
+        preview.grid(row=3, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="{series} = the name, {n} = the part number",
+                  style="Muted.TLabel").grid(row=4, column=1, sticky="w", padx=(8, 0))
+        ttk.Checkbutton(body, text="Put the title in the Header (title text)",
+                        variable=header_var).grid(row=5, column=0, columnspan=2, sticky="w",
+                                                  pady=(8, 0))
+        ttk.Label(body, text="The title is also suggested as the file name when you save,\n"
+                             "and as the DeviantArt title.",
+                  style="Muted.TLabel").grid(row=6, column=0, columnspan=2, sticky="w",
+                                             pady=(4, 0))
+
+        def values() -> Optional[dict]:
+            try:
+                part = int(part_var.get())
+            except (tk.TclError, ValueError):
+                return None
+            return {"name": name_var.get().strip(), "part": max(1, part),
+                    "template": tmpl_var.get().strip() or _SERIES_TEMPLATE,
+                    "title_in_header": header_var.get()}
+
+        def update_preview(*_a) -> None:
+            v = values()
+            preview.config(text=f"→ {_series_title(v)}" if v and v["name"] else "")
+
+        for var in (name_var, part_var, tmpl_var):
+            var.trace_add("write", update_preview)
+        update_preview()
+
+        def ok() -> None:
+            v = values()
+            if not v or not v["name"]:
+                messagebox.showwarning("Series", "Give the series a name.", parent=dlg)
+                return
+            dlg.destroy()
+            self._set_series(v)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", style="Accent.TButton", command=ok).pack(
+            side="right", padx=(0, 6))
+        dlg.bind("<Return>", lambda _e: ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        name_entry.focus_set()
+        dlg.wait_window()
+
+    def _series_part_path(self, part: int) -> Optional[str]:
+        s = self._series
+        if not s:
+            return None
+        folders = []
+        if getattr(self, "_project_path", None):
+            folders.append(os.path.dirname(os.path.abspath(self._project_path)))
+        if self._source_path and self._source_path != self._temp_source_path:
+            folders.append(os.path.dirname(os.path.abspath(self._source_path)))
+        return _find_series_part(s["name"], part, folders,
+                                 tuple(recent_store.get("projects")))
+
+    def _series_open_part(self, delta: int) -> None:
+        part = self._series["part"] + delta
+        path = self._series_part_path(part) if part >= 1 else None
+        if path:
+            self._open_project(path)
+            return
+        if messagebox.askyesno(
+                "Series", f"Couldn't find a saved project for {self._series['name']} "
+                          f"Part {part}.\n\nLook for it yourself?"):
+            self._open_project()
+
+    def _series_show_previous(self) -> None:
+        """Read-only view of the previous part's caption, to keep the story
+        straight while writing this one."""
+        part = self._series["part"] - 1
+        path = self._series_part_path(part) if part >= 1 else None
+        if not path:
+            messagebox.showinfo("Series", f"Couldn't find a saved project for "
+                                          f"{self._series['name']} Part {max(part, 1)}.")
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                caption = json.load(fh).get("caption", "")
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Series", f"Couldn't read that project:\n{e}")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"{self._series['name']} — Part {part}")
+        win.geometry("560x520")
+        box = tk.Text(win, wrap="word", padx=12, pady=10, font=("Segoe UI", 12))
+        sb = ttk.Scrollbar(win, command=box.yview)
+        box.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", caption or "(This part has no caption.)")
+        box.config(state="disabled")
+
+    def _series_next_part(self) -> None:
+        """Save this part, then start the next one with the same format and
+        settings: part number + 1, new title, empty caption, new picture."""
+        if not self._series:
+            self._series_dialog()
+            if not self._series:
+                return
+        s = self._series
+        if self._source_path:
+            choice = messagebox.askyesnocancel(
+                "Next Part", f"Save Part {s['part']} as a project before starting "
+                             f"Part {s['part'] + 1}?")
+            if choice is None:
+                return
+            if choice and not self._series_save_current():
+                return
+        self._set_series(dict(s, part=s["part"] + 1))
+        self._text_box.delete("1.0", "end")
+        self._text_box.edit_reset()
+        if self._view_var.get() == "editor":
+            self._sync_caption_to_editor()
+        self._chat_messages = []
+        self._rebuild_chat_rows()
+        self._reset_framing()
+        self._ba_on_var.set(False)
+        self._before_path = ""
+        self._before_name_lbl.config(text="(none)")
+        self._project_path = None
+        self._update_title()
+        self._status.config(text=f"Started {_series_title(self._series)} — open its picture")
+        self._open()
+
+    def _series_filename(self, ext: str) -> str:
+        """The series part's title as a file name ("" outside a series)."""
+        return _safe_filename(_series_title(self._series)) + ext if self._series else ""
+
+    def _series_save_current(self) -> bool:
+        """Save the current part to its project file (asking where, the
+        first time). True if it was saved."""
+        path = getattr(self, "_project_path", None)
+        if not path:
+            folder = (os.path.dirname(os.path.abspath(self._source_path))
+                      if self._source_path and self._source_path != self._temp_source_path
+                      else None)
+            path = filedialog.asksaveasfilename(
+                title="Save Project", defaultextension=".ccproj", initialdir=folder,
+                initialfile=_safe_filename(_series_title(self._series)) + ".ccproj",
+                filetypes=[("Caption Creator project", "*.ccproj")])
+            if not path:
+                return False
+        try:
+            data = self._project_dict(path)
+            if data is None:
+                return False
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            messagebox.showerror("Save Project", f"Couldn't save the project:\n{e}")
+            return False
+        self._project_path = path
+        recent_store.add("projects", path)
+        log.info("PROJECT_SAVE  %s", os.path.basename(path))
+        return True
 
 
     def _project_dict(self, project_path: str) -> Optional[dict]:
@@ -6758,8 +7248,22 @@ class CaptionApp:
         except ValueError:  # different drive
             rel = ""
         first, last = self._trim_range() if self._is_anim else (0, 0)
+        before = self._before_path
+        try:
+            before_rel = os.path.relpath(before, project_dir) if before else ""
+        except ValueError:
+            before_rel = ""
         try:
             return {
+                "before_after": {
+                    "on": self._ba_on_var.get(),
+                    "path": os.path.abspath(before) if before else "",
+                    "path_rel": before_rel,
+                    "layout": self._ba_layout_var.get(),
+                    "labels": [self._ba_before_label_var.get(), self._ba_after_label_var.get()],
+                    "label_size": self._ba_label_size_var.get(),
+                },
+                "series": dict(self._series) if self._series else None,
                 "app": "Caption Creator project",
                 "version": 1,
                 "source": os.path.abspath(source) if source else "",
@@ -6799,7 +7303,7 @@ class CaptionApp:
         path = filedialog.asksaveasfilename(
             title="Save Project", defaultextension=".ccproj",
             initialfile=getattr(self, "_project_path", None) and
-            os.path.basename(self._project_path) or "",
+            os.path.basename(self._project_path) or self._series_filename(".ccproj"),
             filetypes=[("Caption Creator project", "*.ccproj")])
         if not path:
             return
@@ -6850,7 +7354,14 @@ class CaptionApp:
         if self._source_path != source:
             return  # load failed or was cancelled; it already said why
         self._image_source_url = data.get("source_url")
+        ba = data.get("before_after") or {}
+        before = ba.get("path") or ""
+        if before and not os.path.isfile(before):
+            rel = os.path.join(project_dir, ba.get("path_rel") or "")
+            before = rel if ba.get("path_rel") and os.path.isfile(rel) else ""
+        self._project_before = before
         self._apply_project(data)
+        self._project_before = ""
         self._project_path = path
         self._update_title()
         recent_store.add("projects", path)
@@ -6907,6 +7418,18 @@ class CaptionApp:
         self._pan_y_var.set(float(pan[1]))
         self._wm_pos_var.set(_WM_POS_LABEL.get(data.get("watermark_pos", "bl"), "Bottom left"))
         self._wm_opacity_var.set(int(data.get("watermark_opacity", 100)))
+        ba = data.get("before_after") or {}
+        before = getattr(self, "_project_before", "") or ""
+        self._before_path = before
+        self._before_name_lbl.config(text=_short_path(os.path.basename(before), 28)
+                                     if before else "(none)")
+        self._ba_layout_var.set(ba.get("layout") or "Side by side")
+        labels = ba.get("labels") or ["Before", "After"]
+        self._ba_before_label_var.set(labels[0])
+        self._ba_after_label_var.set(labels[1] if len(labels) > 1 else "")
+        self._ba_label_size_var.set(round(float(ba.get("label_size", 28))))
+        self._ba_on_var.set(bool(ba.get("on")) and bool(before))
+        self._set_series(data.get("series"), retitle=False)
         if not self._wm_auto_var.get() and data.get("watermark_height"):
             self._updating_wm_display = True
             try:
@@ -6950,7 +7473,7 @@ class CaptionApp:
                   else self._frames[first:last + 1][:_GIF_SIZE_SAMPLE_FRAMES])
         durations = None if deferred_path else self._effective_durations()
         fps = self._export_fps() * speed
-        fw, fh = self._frames[0].size
+        fw, fh = raw["frame_size"]
         current_pct = raw["output_size_pct"] if raw["output_override"] else None
         target = _DA_MAX_UPLOAD_BYTES * 0.95  # headroom for sampling error
 
@@ -7056,6 +7579,8 @@ class CaptionApp:
             name = os.path.basename(self._source_path)
         elif self._source_path:
             name = "image from Find Online"
+        if self._series:
+            name = f"{_series_title(self._series)}" + (f" ({name})" if name else "")
         self.root.title(f"Caption Creator — {name}" if name else "Caption Creator")
 
     def _redraw(self) -> None:
