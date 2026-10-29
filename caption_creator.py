@@ -181,23 +181,37 @@ _FORMATS_DIR = os.path.join(BASE_DIR, "formats")
 # Formats shipped with the app — overwriting one of these locally is fine,
 # but only these are pushed/committed to the repo by default.
 _CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)",
-                      "Text Message", "Text Message (Vertical)"}
+                      "Text Message", "Text Message (Vertical)", "Text Boxes"}
+# Built-in formats added after the first release: copied into an existing
+# install's formats/ once (so deleting one later sticks).
+_LATER_CORE_FORMATS = ("Text Boxes",)
 
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
 
 def _ensure_formats_seeded() -> None:
     """On a fresh install, formats/ won't exist yet under BASE_DIR — seed it
-    from the read-only copy of the 4 built-in formats bundled alongside the
-    frozen app (RESOURCE_DIR). No-op when running from source, where the two
-    dirs are the same and formats/ is already tracked in git."""
-    if os.path.isdir(_FORMATS_DIR) and os.listdir(_FORMATS_DIR):
+    from the read-only copy of the built-in formats bundled alongside the
+    frozen app (RESOURCE_DIR); later built-ins are added to an existing
+    install once. No-op when running from source, where the two dirs are the
+    same and formats/ is already tracked in git."""
+    seed_dir = os.path.join(RESOURCE_DIR, "formats")
+    if (not os.path.isdir(seed_dir)
+            or os.path.abspath(seed_dir) == os.path.abspath(_FORMATS_DIR)):
         return
     os.makedirs(_FORMATS_DIR, exist_ok=True)
-    seed_dir = os.path.join(RESOURCE_DIR, "formats")
-    if os.path.isdir(seed_dir) and os.path.abspath(seed_dir) != os.path.abspath(_FORMATS_DIR):
+    if not os.listdir(_FORMATS_DIR):
         for fname in os.listdir(seed_dir):
             shutil.copy(os.path.join(seed_dir, fname), os.path.join(_FORMATS_DIR, fname))
+    seeded = list(recent_store.get_setting("seeded_formats", []) or [])
+    new = [n for n in _LATER_CORE_FORMATS
+           if n not in seeded and os.path.isfile(os.path.join(seed_dir, f"{n}.json"))]
+    for name in new:
+        dst = os.path.join(_FORMATS_DIR, f"{name}.json")
+        if not os.path.exists(dst):
+            shutil.copy(os.path.join(seed_dir, f"{name}.json"), dst)
+    if new:
+        recent_store.set_setting("seeded_formats", seeded + new)
 
 
 def _load_formats() -> dict:
@@ -872,7 +886,7 @@ def _words_that_fit(text: str, raw: dict, min_px: Optional[float] = None) -> int
     Editor's "fits beside the image" check and the target for "Shorten to
     fit". Returns len(words) when it already fits."""
     words = text.split()
-    if not words or raw.get("frame_size") is None:
+    if not words or raw.get("frame_size") is None or raw.get("layout") == "overlay":
         return len(words)
     fw, fh = raw["frame_size"]
     layout = raw["layout"]
@@ -992,7 +1006,7 @@ def _image_text(raw: dict) -> str:
     mode your own short version or else the opening that fits."""
     text = raw["text"]
     if (not raw.get("story_mode") or raw.get("chat_messages") is not None
-            or raw.get("frame_size") is None):
+            or raw.get("frame_size") is None or raw.get("layout") == "overlay"):
         return text
     if (raw.get("story_image_text") or "").strip():
         return raw["story_image_text"]
@@ -1112,7 +1126,9 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
     bold = raw["bold"]
     layout = raw["layout"]
 
-    if raw["auto_size"] and raw["frame_size"] is not None:
+    if layout == "overlay":
+        text = ""   # no caption panel: the text is in the text boxes
+    if raw["auto_size"] and raw["frame_size"] is not None and layout != "overlay":
         fw, fh = raw["frame_size"]
         # Fit against the panel exactly as build_composite will draw it —
         # at output resolution, with padding/stroke scaled the same way —
@@ -1193,6 +1209,8 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         watermark_pos=raw.get("watermark_pos", "bl"),
         watermark_opacity=raw.get("watermark_opacity", 1.0),
     )
+    if layout == "overlay":
+        kwargs["text_boxes"] = raw.get("text_boxes") or []
     if raw.get("before_path"):
         kwargs.update(before_path=raw["before_path"], ba_layout=raw.get("ba_layout", "side"),
                       ba_labels=tuple(raw.get("ba_labels") or ("", "")),
@@ -1615,9 +1633,83 @@ def _panel_total_size(fw: int, fh: int, cap_width: int, layout: str) -> tuple:
     scaling — shared by build_composite and the Output Size Override
     slider's default-position calculation
     (CaptionApp._compute_default_output_pct_async)."""
+    if layout == "overlay":
+        return fw, fh            # text boxes sit on the picture; no panel
     if layout == "vertical":
         return fw, fh + cap_width
     return fw + cap_width, fh
+
+
+# ---------------------------------------------------------------------------
+# Text boxes ("Text Boxes" format, layout "overlay"): Photoshop-style boxes
+# placed on top of the picture instead of a caption panel beside it. x, y
+# and w are fractions of the picture (top-left corner and box width), so a
+# box keeps its place at any output size; size, padding and outline are
+# pixels at the picture's natural size, scaled with it like the caption.
+# ---------------------------------------------------------------------------
+
+_TB_DEFAULT = {
+    "text": "Your text here", "x": 0.08, "y": 0.72, "w": 0.84,
+    "font": "Arial", "size": 28.0, "bold": False, "color": "#ffffff", "align": "center",
+    "outline": 2, "outline_color": "#000000",
+    "bg": "", "bg_opacity": 0.85, "padding": 8, "radius": 8, "shadow": False,
+}
+
+
+def _tb(box: dict) -> dict:
+    """A text box with every field filled in."""
+    return {**_TB_DEFAULT, **box}
+
+
+def _tb_layout(box: dict, fw: int, fh: int, k: float, markup: bool = False,
+               draw: Optional[ImageDraw.ImageDraw] = None) -> dict:
+    """Where a text box lands on a fw x fh picture drawn at k output px per
+    natural px: x, y, w, h (the box, padding included), size, pad, stroke."""
+    b = _tb(box)
+    size = max(1.0, float(b["size"]) * k)
+    pad = round(float(b["padding"]) * k)
+    stroke = max(1, round(float(b["outline"]) * k)) if float(b["outline"] or 0) > 0 else 0
+    w = max(round(size) + pad * 2 + stroke * 2, round(float(b["w"]) * fw))
+    n = _count_lines(b["text"] or " ", b["font"], size, b["bold"], w - pad * 2 - stroke * 2,
+                     draw or ImageDraw.Draw(Image.new("RGBA", (1, 1))), markup)
+    h = n * int(size * 1.3) + pad * 2
+    return {"x": round(float(b["x"]) * fw), "y": round(float(b["y"]) * fh), "w": w, "h": h,
+            "size": size, "pad": pad, "stroke": stroke}
+
+
+def _draw_text_boxes(out: Image.Image, boxes: list, origin: tuple, fw: int, fh: int, k: float,
+                     markup: bool = False, dialogue_color: str = "") -> None:
+    """Draw text boxes (first = bottom) onto out, over the fw x fh picture
+    whose top-left corner is at origin."""
+    ox, oy = origin
+    for box in boxes:
+        b = _tb(box)
+        if not str(b["text"]).strip() and not b["bg"]:
+            continue
+        g = _tb_layout(b, fw, fh, k, markup)
+        margin = g["stroke"] + round(8 * k) + 4    # room for the outline and shadow
+        layer = Image.new("RGBA", (g["w"] + margin * 2, g["h"] + margin * 2), (0, 0, 0, 0))
+        if b["bg"]:
+            alpha = round(255 * max(0.0, min(1.0, float(b["bg_opacity"]))))
+            ImageDraw.Draw(layer).rounded_rectangle(
+                (margin, margin, margin + g["w"] - 1, margin + g["h"] - 1),
+                radius=round(float(b["radius"]) * k), fill=_hex_to_rgb(b["bg"]) + (alpha,))
+        shadow_draw = None
+        if b["shadow"]:
+            shadow = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow)
+        text_layer = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        _draw_text_block(ImageDraw.Draw(text_layer), margin, margin, g["w"], g["h"],
+                         str(b["text"]), b["font"], g["size"], b["color"], g["pad"],
+                         g["stroke"], b["outline_color"], b["bold"], shadow_draw,
+                         shadow_offset=(max(1, round(2 * k)), max(1, round(3 * k))),
+                         align=b["align"], markup=markup, dialogue_color=dialogue_color)
+        if shadow_draw is not None:
+            layer.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(3 * k)))
+        layer.alpha_composite(text_layer)
+        placed = Image.new("RGBA", out.size, (0, 0, 0, 0))
+        placed.paste(layer, (ox + g["x"] - margin, oy + g["y"] - margin))
+        out.alpha_composite(placed)
 
 
 def _output_scale_bounds(total_w: int, total_h: int) -> tuple:
@@ -1708,8 +1800,11 @@ def build_composite(
     ba_labels: tuple = ("Before", "After"),
     ba_label_size: float = 28,
     _ba_size: Optional[tuple] = None,
+    text_boxes: Optional[list] = None,
     _px_scale: float = 1.0,
 ) -> Image.Image:
+    if layout == "overlay":
+        cap_width = 0
     frame = frame.convert("RGBA")
     if zoom > 1.001:
         frame = _apply_zoom(frame, zoom, pan_x, pan_y,
@@ -1740,7 +1835,7 @@ def build_composite(
         # lands at default_scale == 1 and doesn't resize again.
         def _s(v: float) -> int:
             return max(1, round(v * scale))
-        s_cap = _s(cap_width)
+        s_cap = _s(cap_width) if cap_width else 0
         if layout == "vertical":
             s_frame = (new_w, max(1, new_h - s_cap))
         else:
@@ -1778,6 +1873,7 @@ def build_composite(
             header_outline=header_outline and [_s(header_outline[0]), header_outline[1]],
             footer_outline=footer_outline and [_s(footer_outline[0]), footer_outline[1]],
             _px_scale=_px_scale * scale,
+            text_boxes=text_boxes,
             **ba_kw,
         )
 
@@ -1805,9 +1901,11 @@ def build_composite(
     def _render_overlay() -> Image.Image:
         out = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(out)
+        has_panel = layout != "overlay" and panel_w > 0 and panel_h > 0
 
-        out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
-                  (panel_x, panel_y))
+        if has_panel:
+            out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
+                      (panel_x, panel_y))
 
         # When shadow is on, accumulate all text into two layers then composite once.
         # This cuts GaussianBlur calls from N-per-text-element down to one per frame.
@@ -1821,7 +1919,9 @@ def build_composite(
             txt_draw = draw
             shd_draw_ctx = None
 
-        if chat_messages is not None:
+        if not has_panel:
+            pass
+        elif chat_messages is not None:
             _draw_chat_panel(txt_draw, panel_x, panel_y, panel_w, panel_h,
                              chat_messages, font_family, font_size, padding,
                              bold, bubble_color, shd_draw_ctx,
@@ -1915,6 +2015,11 @@ def build_composite(
             out.alpha_composite(shd_img.filter(ImageFilter.GaussianBlur(3 * _px_scale)))
             out.alpha_composite(txt_img)
 
+        # Text boxes go on top of everything.
+        if layout == "overlay" and text_boxes:
+            _draw_text_boxes(out, text_boxes, (image_x, 0), fw, fh, _px_scale,
+                             inline_markup, dialogue_color)
+
         return out
 
     # Everything except the frame itself — panel, caption, shadow,
@@ -1934,7 +2039,8 @@ def build_composite(
            watermark_height, json.dumps(chat_messages), bubble_color, _px_scale,
            inline_markup, dialogue_color, watermark_pos, watermark_opacity,
            json.dumps(header_outline), json.dumps(footer_outline),
-           json.dumps(ba_boxes), json.dumps(list(ba_labels)), ba_label_size)
+           json.dumps(ba_boxes), json.dumps(list(ba_labels)), ba_label_size,
+           json.dumps(text_boxes, sort_keys=True) if layout == "overlay" else None)
     with _OVERLAY_CACHE_LOCK:
         overlay = _OVERLAY_CACHE.get(key)
         if overlay is not None:
@@ -2506,6 +2612,12 @@ class CaptionApp:
         self._ba_after_label_var = tk.StringVar(value="After")
         self._ba_label_size_var = tk.IntVar(value=28)
 
+        # Text boxes on the picture ("Text Boxes" format; see _TB_DEFAULT).
+        self._text_boxes: list = []
+        self._tb_sel: Optional[int] = None
+        self._tb_drag: Optional[dict] = None
+        self._tb_loading = False
+
         # Series: name + part number; numbers the title and finds the
         # neighbouring parts' projects (see _series_*).
         self._series: Optional[dict] = None
@@ -2539,8 +2651,14 @@ class CaptionApp:
         self._build_ui()
         # Framing by hand: drag the picture, Ctrl+scroll to zoom. Bound to
         # the image item, so the eyedropper's own canvas binding is untouched.
-        self._canvas.tag_bind("img", "<ButtonPress-1>", self._on_pan_press)
-        self._canvas.tag_bind("img", "<B1-Motion>", self._on_pan_drag)
+        # Text boxes (Text Boxes format) are dragged the same way; their
+        # selection outline/handles ("tbsel") pass clicks on to the same code.
+        for tag in ("img", "tbsel"):
+            self._canvas.tag_bind(tag, "<ButtonPress-1>", self._on_pan_press)
+            self._canvas.tag_bind(tag, "<B1-Motion>", self._on_pan_drag)
+            self._canvas.tag_bind(tag, "<Double-Button-1>", self._tb_double_click)
+        self._canvas.bind("<ButtonRelease-1>", self._tb_release, add="+")
+        self._canvas.bind("<Key>", self._tb_key)
         self._canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self._build_editor_view()  # needs the builder's caption box to exist
         self._build_builder_view()
@@ -2588,12 +2706,16 @@ class CaptionApp:
         self._settings_btn.pack(side="right", padx=4)
         # Editor (write the caption) / Caption Builder (put it on the image).
         self._view_var = tk.StringVar(value=recent_store.get_setting("view", "editor"))
+        self._view_btns: dict = {}
+        self._view_before_overlay: Optional[str] = None
         for label, value, tip in (
                 ("✍  Editor", "editor", "Write and polish the caption story"),
                 ("🖼  Caption Builder", "builder", "Put the caption on your image, style it and export")):
-            tooltip(ttk.Radiobutton(bar, text=label, value=value, variable=self._view_var,
-                                    style="View.Toolbutton", command=self._apply_view),
-                    tip).pack(side="left", padx=(0, 2))
+            btn = tooltip(ttk.Radiobutton(bar, text=label, value=value, variable=self._view_var,
+                                          style="View.Toolbutton", command=self._apply_view),
+                          tip)
+            btn.pack(side="left", padx=(0, 2))
+            self._view_btns[value] = btn
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
         tooltip(ttk.Button(bar, text="📂  Open…", command=self._open),
                 "Open an image, GIF or MP4  (Ctrl+O)\nTip: you can also drag files onto the window"
@@ -2744,10 +2866,16 @@ class CaptionApp:
         self._nb = nb = ttk.Notebook(right)
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # Tab 1: Caption
+        # Tab 1: Caption — or, in the Text Boxes format, Text (the two swap;
+        # see _update_overlay_mode)
         cap_tab = ttk.Frame(nb, padding=10)
         nb.add(cap_tab, text="Caption")
         self._build_caption_tab(cap_tab)
+        self._cap_tab = cap_tab
+        self._tb_tab = ttk.Frame(nb, padding=10)
+        nb.insert(0, self._tb_tab, text="Text")
+        self._build_text_boxes_tab(self._tb_tab)
+        nb.hide(self._tb_tab)
 
         # Tab 2: X-Change Header
         xc_tab = ttk.Frame(nb, padding=10)
@@ -3386,6 +3514,505 @@ class CaptionApp:
             text=f"{int(self._safe_float(self._wm_opacity_var))}%"))
         r += 1
 
+    # ------------------------------------------------------------------
+    # Text boxes — Photoshop-style text placed on the picture
+    # ------------------------------------------------------------------
+
+    def _build_text_boxes_tab(self, f: ttk.Frame) -> None:
+        f.columnconfigure(1, weight=1)
+        top = ttk.Frame(f)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        self._tb_list = tk.Listbox(top, height=4, exportselection=False, activestyle="none")
+        self._tb_list.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        self._tb_list.bind("<<ListboxSelect>>", lambda _e: self._tb_on_list_select())
+        btns = ttk.Frame(top)
+        btns.grid(row=0, column=1, sticky="n", padx=(6, 0))
+        for i, (label, cmd, tip) in enumerate((
+                ("＋ Add", self._tb_add, "Add a text box (or double-click the picture)"),
+                ("Duplicate", self._tb_duplicate, "Copy the selected box"),
+                ("Delete", self._tb_delete, "Delete the selected box (Delete key)"))):
+            tooltip(ttk.Button(btns, text=label, width=10, command=cmd), tip).grid(
+                row=i, column=0, sticky="ew", pady=1)
+        order = ttk.Frame(btns)
+        order.grid(row=3, column=0, sticky="ew", pady=1)
+        tooltip(ttk.Button(order, text="▲", width=4, command=lambda: self._tb_reorder(1)),
+                "Bring forward").pack(side="left", expand=True, fill="x")
+        tooltip(ttk.Button(order, text="▼", width=4, command=lambda: self._tb_reorder(-1)),
+                "Send backward").pack(side="left", expand=True, fill="x")
+
+        self._tb_text = tk.Text(f, height=4, width=22, wrap="word", relief="solid", bd=1,
+                                padx=4, pady=4, undo=True)
+        self._tb_text.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 6))
+        self._tb_text.bind("<KeyRelease>", lambda _e: self._tb_set(
+            "text", self._tb_text.get("1.0", "end-1c"), debounce_ms=250))
+        self._tb_placeholder = Placeholder(self._tb_text, "Select or add a text box…")
+
+        self._tb_vars: dict = {
+            "font": tk.StringVar(value="Arial"), "size": tk.DoubleVar(value=28),
+            "bold": tk.BooleanVar(value=False), "align": tk.StringVar(value="center"),
+            "outline": tk.DoubleVar(value=2), "bg_on": tk.BooleanVar(value=False),
+            "bg_opacity": tk.IntVar(value=85), "padding": tk.IntVar(value=8),
+            "shadow": tk.BooleanVar(value=False), "w": tk.IntVar(value=84),
+        }
+        v = self._tb_vars
+        r = 2
+        ttk.Label(f, text="Font:").grid(row=r, column=0, sticky="w", pady=3)
+        font_combo = ttk.Combobox(f, textvariable=v["font"], values=_font_list(), width=18)
+        font_combo.grid(row=r, column=1, sticky="ew", padx=6)
+        for ev in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            font_combo.bind(ev, lambda _e: self._tb_set("font", v["font"].get()))
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(row, text="Size:").pack(side="left")
+        ttk.Spinbox(row, from_=4, to=400, increment=1, width=5,
+                    textvariable=v["size"]).pack(side="left", padx=(4, 10))
+        ttk.Checkbutton(row, text="Bold", variable=v["bold"]).pack(side="left")
+        ttk.Label(row, text="Color:").pack(side="left", padx=(10, 4))
+        self._tb_color_btn = tk.Button(row, width=3, relief="groove",
+                                       command=lambda: self._tb_pick_color("color"))
+        self._tb_color_btn.pack(side="left")
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(row, text="Align:").pack(side="left")
+        for label, value in (("←", "left"), ("↔", "center"), ("→", "right")):
+            ttk.Radiobutton(row, text=label, variable=v["align"], value=value).pack(
+                side="left", padx=2)
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(row, text="Outline:").pack(side="left")
+        ttk.Spinbox(row, from_=0, to=40, increment=1, width=4,
+                    textvariable=v["outline"]).pack(side="left", padx=(4, 4))
+        self._tb_outline_btn = tk.Button(row, width=3, relief="groove",
+                                         command=lambda: self._tb_pick_color("outline_color"))
+        self._tb_outline_btn.pack(side="left")
+        ttk.Checkbutton(row, text="Shadow", variable=v["shadow"]).pack(side="left", padx=(10, 0))
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Checkbutton(row, text="Box behind text", variable=v["bg_on"]).pack(side="left")
+        self._tb_bg_btn = tk.Button(row, width=3, relief="groove",
+                                    command=lambda: self._tb_pick_color("bg"))
+        self._tb_bg_btn.pack(side="left", padx=(4, 6))
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(row, text="Box opacity:").pack(side="left")
+        tooltip(ttk.Scale(row, from_=5, to=100, orient="horizontal", variable=v["bg_opacity"],
+                          command=lambda _v: v["bg_opacity"].set(round(float(_v)))),
+                "How solid the box behind the text is — lower lets the picture show through"
+                ).pack(side="left", fill="x", expand=True, padx=4)
+        opacity_lbl = ttk.Label(row, width=5, text="85%")
+        opacity_lbl.pack(side="left")
+        v["bg_opacity"].trace_add("write", lambda *_a: opacity_lbl.config(
+            text=f"{self._safe_float(v['bg_opacity']):.0f}%"))
+        r += 1
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(row, text="Width:").pack(side="left")
+        ttk.Scale(row, from_=5, to=100, orient="horizontal", variable=v["w"]).pack(
+            side="left", fill="x", expand=True, padx=4)
+        ttk.Label(row, text="Padding:").pack(side="left", padx=(6, 0))
+        ttk.Spinbox(row, from_=0, to=100, width=4, textvariable=v["padding"]).pack(
+            side="left", padx=(4, 0))
+        r += 1
+        ttk.Label(f, text="On the preview: drag a box to move it, drag its right edge\n"
+                          "to change the width, drag the corner to resize the text.\n"
+                          "Double-click the picture to add a box; Delete removes it.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
+                                             pady=(8, 0))
+        self._tb_default_bg: Optional[str] = None   # the last box color picked
+        for key in ("size", "bold", "align", "outline", "bg_on", "bg_opacity", "padding",
+                    "shadow", "w"):
+            v[key].trace_add("write", lambda *_a, k=key: self._tb_on_var(k))
+        self._tb_refresh_panel()
+
+    def _tb_on_var(self, key: str) -> None:
+        if self._tb_loading or self._tb_sel is None:
+            return
+        try:
+            value = self._tb_vars[key].get()
+        except (tk.TclError, ValueError):
+            return   # mid-typing
+        box = self._text_boxes[self._tb_sel]
+        if key == "bg_on":
+            if value:
+                bg = box.get("bg") or self._tb_default_bg
+                if bg is None:   # nothing picked yet: contrast with the text
+                    r, g, b = _hex_to_rgb(_tb(box)["color"])
+                    bg = "#000000" if 0.299 * r + 0.587 * g + 0.114 * b >= 128 else "#ffffff"
+                self._tb_set("bg", bg)
+            else:
+                self._tb_set("bg", "")
+            self._tb_refresh_panel()
+            return
+        if key == "bg_opacity":
+            value = max(0.05, min(1.0, float(value) / 100))
+        elif key == "w":
+            value = max(0.05, min(1.0, float(value) / 100))
+        self._tb_set(key, value)
+
+    def _tb_set(self, key: str, value, debounce_ms: int = 0) -> None:
+        """Change the selected box and redraw."""
+        if self._tb_loading or self._tb_sel is None or self._tb_sel >= len(self._text_boxes):
+            return
+        box = self._text_boxes[self._tb_sel]
+        if box.get(key) == value:
+            return
+        box[key] = value
+        if key == "bg" and value:
+            self._tb_default_bg = value
+        if key == "text":
+            self._tb_update_list()
+        self._safe_refresh(debounce_ms=debounce_ms)
+
+    def _tb_pick_color(self, key: str) -> None:
+        if self._tb_sel is None:
+            return
+        box = _tb(self._text_boxes[self._tb_sel])
+        current = box[key] or self._tb_default_bg or "#ffffff"
+        picked = colorchooser.askcolor(color=current, title="Choose a color")[1]
+        if not picked:
+            return
+        self._tb_set(key, picked)
+        if key == "bg":
+            self._tb_loading = True
+            self._tb_vars["bg_on"].set(True)
+            self._tb_loading = False
+        self._tb_refresh_panel()
+
+    def _tb_update_list(self) -> None:
+        lb = self._tb_list
+        lb.delete(0, "end")
+        for i, b in enumerate(self._text_boxes):
+            first = (str(b.get("text", "")).strip().splitlines() or ["(empty)"])[0]
+            lb.insert("end", f"{i + 1}.  {first[:40]}")
+        if self._tb_sel is not None and self._tb_sel < len(self._text_boxes):
+            lb.selection_set(self._tb_sel)
+            lb.see(self._tb_sel)
+
+    def _tb_refresh_panel(self) -> None:
+        """Show the selected box's settings in the Text tab."""
+        self._tb_update_list()
+        sel = self._tb_sel
+        has = sel is not None and sel < len(self._text_boxes)
+        b = _tb(self._text_boxes[sel]) if has else _tb({})
+        self._tb_loading = True
+        try:
+            if self._tb_text.get("1.0", "end-1c") != (b["text"] if has else ""):
+                self._tb_text.delete("1.0", "end")
+                if has:
+                    self._tb_text.insert("1.0", b["text"])
+                self._tb_text.edit_reset()
+            v = self._tb_vars
+            v["font"].set(b["font"])
+            v["size"].set(round(float(b["size"]), 2))
+            v["bold"].set(bool(b["bold"]))
+            v["align"].set(b["align"])
+            v["outline"].set(float(b["outline"]))
+            v["bg_on"].set(bool(b["bg"]))
+            v["bg_opacity"].set(round(float(b["bg_opacity"]) * 100))
+            v["padding"].set(int(b["padding"]))
+            v["shadow"].set(bool(b["shadow"]))
+            v["w"].set(round(float(b["w"]) * 100))
+        finally:
+            self._tb_loading = False
+        self._tb_color_btn.config(bg=b["color"])
+        self._tb_outline_btn.config(bg=b["outline_color"])
+        self._tb_bg_btn.config(bg=b["bg"] or self._tb_default_bg or "#000000")
+        self._tb_placeholder.update()
+
+    def _tb_select(self, idx: Optional[int]) -> None:
+        self._tb_sel = idx if idx is not None and 0 <= idx < len(self._text_boxes) else None
+        self._tb_refresh_panel()
+        self._tb_draw_selection()
+
+    def _tb_on_list_select(self) -> None:
+        cur = self._tb_list.curselection()
+        if cur:
+            self._tb_select(cur[0])
+
+    def _tb_new_box(self, x: Optional[float] = None, y: Optional[float] = None) -> dict:
+        """A new box styled like the selected one (or the format's first)."""
+        if self._tb_sel is not None:
+            style = dict(self._text_boxes[self._tb_sel])
+        else:
+            style = dict((self._formats.get(self._format_var.get(), {}).get("text_boxes")
+                          or [{}])[0])
+        if self._frames and self._tb_sel is None:
+            style["size"] = max(float(style.get("size", 28)), self._tb_start_size())
+        style["text"] = "Your text here"
+        w = float(style.get("w", _TB_DEFAULT["w"]))
+        if x is not None:
+            style["x"] = max(0.0, min(1.0 - w, x - w / 2)) if w < 1 else 0.0
+        if y is not None:
+            style["y"] = max(0.0, min(0.95, y))
+        elif self._tb_sel is not None:
+            style["y"] = min(0.9, float(style.get("y", 0.5)) + 0.08)
+        return style
+
+    def _tb_start_size(self) -> float:
+        """A first text size that reads well on this picture: about 1/20 of
+        its height."""
+        return float(max(12, round(self._frames[0].size[1] * 0.05))) if self._frames else 28.0
+
+    def _tb_add(self, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        self._text_boxes.append(self._tb_new_box(x, y))
+        self._tb_select(len(self._text_boxes) - 1)
+        self._tb_text.focus_set()
+        self._tb_text.tag_add("sel", "1.0", "end-1c")
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_duplicate(self) -> None:
+        if self._tb_sel is None:
+            return
+        box = dict(self._text_boxes[self._tb_sel])
+        box["x"] = min(0.95, float(box.get("x", 0)) + 0.03)
+        box["y"] = min(0.95, float(box.get("y", 0)) + 0.03)
+        self._text_boxes.append(box)
+        self._tb_select(len(self._text_boxes) - 1)
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_delete(self) -> None:
+        if self._tb_sel is None:
+            return
+        del self._text_boxes[self._tb_sel]
+        self._tb_select(min(self._tb_sel, len(self._text_boxes) - 1)
+                        if self._text_boxes else None)
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_reorder(self, delta: int) -> None:
+        i = self._tb_sel
+        if i is None or not 0 <= i + delta < len(self._text_boxes):
+            return
+        boxes = self._text_boxes
+        boxes[i], boxes[i + delta] = boxes[i + delta], boxes[i]
+        self._tb_select(i + delta)
+        self._safe_refresh(debounce_ms=0)
+
+    def _overlay_mode(self) -> bool:
+        return self._formats.get(self._format_var.get(), {}).get("layout") == "overlay"
+
+    def _update_overlay_mode(self) -> None:
+        """Text Boxes format: swap the Caption tab for the Text tab, and
+        start with the format's boxes (the caption becomes the first one's
+        text) if there aren't any yet."""
+        nb = self._nb
+        self._flush_editor()
+        self._update_view_buttons()
+        if self._overlay_mode():
+            if not self._text_boxes:
+                boxes = [dict(b) for b in self._formats.get(self._format_var.get(), {})
+                         .get("text_boxes") or [dict(_TB_DEFAULT)]]
+                caption = self._text_box.get("1.0", "end-1c").strip()
+                if caption and boxes:
+                    boxes[0]["text"] = caption
+                if self._frames:
+                    for b in boxes:   # readable on this picture, whatever its size
+                        b["size"] = max(float(b.get("size", 28)), self._tb_start_size())
+                self._text_boxes = boxes
+                self._tb_sel = 0 if boxes else None
+            nb.add(self._tb_tab)          # re-shows it where it was
+            if str(nb.select()) == str(self._cap_tab):
+                nb.select(self._tb_tab)
+            nb.hide(self._cap_tab)
+        else:
+            nb.add(self._cap_tab)
+            if str(nb.select()) == str(self._tb_tab):
+                nb.select(self._cap_tab)
+            nb.hide(self._tb_tab)
+        self._tb_refresh_panel()
+        self._tb_draw_selection()
+
+    def _update_view_buttons(self) -> None:
+        """Hide the Editor view button in the Text Boxes format (switching to
+        Caption Builder if the Editor was showing), and bring both back after."""
+        btns = getattr(self, "_view_btns", None)
+        if not btns:
+            return
+        editor_btn = btns["editor"]
+        views_built = getattr(self, "_builder_view", None) is not None and \
+            getattr(self, "_editor_view", None) is not None
+        if self._overlay_mode():
+            if editor_btn.winfo_manager():
+                editor_btn.pack_forget()
+            if self._view_var.get() == "editor":
+                self._view_before_overlay = "editor"
+                self._view_var.set("builder")
+                if views_built:
+                    self._apply_view()
+        else:
+            if not editor_btn.winfo_manager():
+                editor_btn.pack(side="left", padx=(0, 2), before=btns["builder"])
+            if self._view_before_overlay == "editor":
+                self._view_before_overlay = None
+                self._view_var.set("editor")
+                if views_built:
+                    self._apply_view()
+
+    # Preview interaction: hit-testing uses the same layout the renderer does,
+    # computed at the exported size and scaled down to what's on screen.
+    def _tb_screen_rects(self) -> list:
+        """[(x0, y0, x1, y1)] of each box on the canvas, or [] if unknown."""
+        if (not self._overlay_mode() or not self._text_boxes or not self._cache
+                or getattr(self, "_preview_pil_img", None) is None):
+            return []
+        bbox = self._canvas.bbox("img")
+        if not bbox:
+            return []
+        out_w, out_h = self._cache[0].size
+        nat_w = self._frames[0].size[0] if self._frames else out_w
+        if self._ba_on_var.get() and self._before_path and self._frames:
+            nat_w = _ba_frame_size(*self._frames[0].size, "stacked" if
+                                   self._ba_layout_var.get() == "Stacked" else "side")[0]
+        k = out_w / max(1, nat_w)
+        d = self._preview_pil_img.width / out_w
+        left, top = bbox[0], bbox[1]
+        markup = self._markup_var.get()
+        rects = []
+        for box in self._text_boxes:
+            g = _tb_layout(box, out_w, out_h, k, markup)
+            rects.append((left + g["x"] * d, top + g["y"] * d,
+                          left + (g["x"] + g["w"]) * d, top + (g["y"] + g["h"]) * d))
+        return rects
+
+    def _tb_draw_selection(self) -> None:
+        c = self._canvas
+        c.delete("tbsel")
+        if getattr(self, "_view_var", None) is None or self._view_var.get() != "builder":
+            return
+        rects = self._tb_screen_rects()
+        if not rects:
+            return
+        accent = themes.accent(self._theme_name).get("accent", "#ff4f9a")
+        for i, (x0, y0, x1, y1) in enumerate(rects):
+            if i == self._tb_sel:
+                continue
+            c.create_rectangle(x0, y0, x1, y1, outline="#9a9a9a", dash=(2, 4), tags=("tbsel",))
+        if self._tb_sel is not None and self._tb_sel < len(rects):
+            x0, y0, x1, y1 = rects[self._tb_sel]
+            c.create_rectangle(x0, y0, x1, y1, outline=accent, width=2, dash=(6, 3),
+                               tags=("tbsel",))
+            ym = (y0 + y1) / 2
+            c.create_rectangle(x1 - 4, ym - 6, x1 + 4, ym + 6, fill=accent, outline="white",
+                               tags=("tbsel",))                    # width handle
+            c.create_rectangle(x1 - 5, y1 - 5, x1 + 5, y1 + 5, fill="white", outline=accent,
+                               width=2, tags=("tbsel",))           # text-size handle
+        c.tag_raise("tbsel")
+
+    def _tb_hit(self, x: float, y: float) -> tuple:
+        """(box index, "move" | "width" | "size") under canvas point x, y;
+        (None, None) if none. The selected box's handles come first."""
+        rects = self._tb_screen_rects()
+        sel = self._tb_sel
+        if sel is not None and sel < len(rects):
+            x0, y0, x1, y1 = rects[sel]
+            if abs(x - x1) <= 8 and abs(y - y1) <= 8:
+                return sel, "size"
+            if abs(x - x1) <= 6 and y0 <= y <= y1:
+                return sel, "width"
+        for i in range(len(rects) - 1, -1, -1):
+            x0, y0, x1, y1 = rects[i]
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return i, "move"
+        return None, None
+
+    def _tb_press(self, event) -> bool:
+        """Start dragging a box. True if the click was on one (so the
+        picture isn't panned)."""
+        if not self._overlay_mode():
+            return False
+        self._canvas.focus_set()
+        idx, mode = self._tb_hit(event.x, event.y)
+        if idx is None:
+            if self._tb_sel is not None:
+                self._tb_select(None)
+            return False
+        if idx != self._tb_sel:
+            self._tb_select(idx)
+        box = self._text_boxes[idx]
+        disp = self._preview_pil_img
+        self._tb_drag = {"mode": mode, "x": event.x, "y": event.y,
+                         "box": dict(_tb(box)), "dw": disp.width, "dh": disp.height,
+                         "rect": self._tb_screen_rects()[idx]}
+        return True
+
+    def _tb_motion(self, event) -> bool:
+        d = self._tb_drag
+        if not d or self._tb_sel is None:
+            return False
+        box = self._text_boxes[self._tb_sel]
+        start = d["box"]
+        dx, dy = event.x - d["x"], event.y - d["y"]
+        if d["mode"] == "move":
+            x = float(start["x"]) + dx / d["dw"]
+            y = float(start["y"]) + dy / d["dh"]
+            # Snap the box's center to the picture's center lines.
+            w = float(start["w"])
+            if abs(x + w / 2 - 0.5) < 0.012:
+                x = 0.5 - w / 2
+            x0, y0, x1, y1 = d["rect"]
+            h_frac = (y1 - y0) / d["dh"]
+            if abs(y + h_frac / 2 - 0.5) < 0.012:
+                y = 0.5 - h_frac / 2
+            box["x"] = round(max(-w + 0.02, min(0.98, x)), 4)
+            box["y"] = round(max(-h_frac + 0.02, min(0.98, y)), 4)
+        elif d["mode"] == "width":
+            x0, _y0, x1, _y1 = d["rect"]
+            new_w = (x1 - x0 + dx) / d["dw"]
+            box["w"] = round(max(0.05, min(1.5, new_w)), 4)
+        else:   # "size": scale the text with the box, like a corner drag
+            x0, y0, x1, y1 = d["rect"]
+            k = max(0.1, (x1 - x0 + dx) / max(1.0, x1 - x0))
+            box["size"] = round(max(4.0, min(400.0, float(start["size"]) * k)), 1)
+            box["w"] = round(max(0.05, min(1.5, float(start["w"]) * k)), 4)
+        self._tb_refresh_panel()
+        self._safe_refresh(debounce_ms=0)
+        return True
+
+    def _tb_release(self, _event=None) -> None:
+        self._tb_drag = None
+
+    def _tb_double_click(self, event) -> None:
+        if not self._overlay_mode() or not self._cache:
+            return
+        idx, _mode = self._tb_hit(event.x, event.y)
+        if idx is not None:
+            self._tb_select(idx)
+            self._nb.select(self._tb_tab)
+            self._tb_text.focus_set()
+            self._tb_text.tag_add("sel", "1.0", "end-1c")
+            return
+        bbox = self._canvas.bbox("img")
+        disp = self._preview_pil_img
+        if not bbox or disp is None:
+            return
+        fx = (event.x - bbox[0]) / disp.width
+        fy = (event.y - bbox[1]) / disp.height
+        if 0 <= fx <= 1 and 0 <= fy <= 1:
+            self._nb.select(self._tb_tab)
+            self._tb_add(fx, fy)
+
+    def _tb_key(self, event) -> Optional[str]:
+        if not self._overlay_mode() or self._tb_sel is None:
+            return None
+        if event.keysym in ("Delete", "BackSpace"):
+            self._tb_delete()
+            return "break"
+        step = 0.01 if event.state & 0x1 else 0.002   # Shift = bigger nudge
+        moves = {"Left": ("x", -step), "Right": ("x", step), "Up": ("y", -step),
+                 "Down": ("y", step)}
+        if event.keysym in moves:
+            key, delta = moves[event.keysym]
+            box = self._text_boxes[self._tb_sel]
+            box[key] = round(float(_tb(box)[key]) + delta, 4)
+            self._safe_refresh(debounce_ms=0)
+            return "break"
+        return None
+
     def _build_image_tab(self, f: ttk.Frame) -> None:
         """Framing: zoom into the picture and choose which part shows."""
         f.columnconfigure(1, weight=1)
@@ -3483,6 +4110,9 @@ class CaptionApp:
         self._pan_y_var.set(0.0)
 
     def _on_pan_press(self, event) -> None:
+        if getattr(self, "_color_pick_target", None) is None and self._tb_press(event):
+            self._pan_drag = None   # grabbed a text box, not the picture
+            return
         if (getattr(self, "_color_pick_target", None) is not None
                 or self._safe_float(self._zoom_var) <= 1.001):
             self._pan_drag = None
@@ -3493,6 +4123,8 @@ class CaptionApp:
     def _on_pan_drag(self, event) -> None:
         """Drag the picture inside its frame. A drag of the shown picture's
         own width moves the zoomed-in window by its full travel."""
+        if self._tb_motion(event):
+            return
         d = self._pan_drag
         disp = getattr(self, "_preview_pil_img", None)
         if not d or not self._frames or disp is None:
@@ -4807,7 +5439,13 @@ class CaptionApp:
 
     def _apply_view(self) -> None:
         view = self._view_var.get()
-        recent_store.set_setting("view", view)
+        if view == "editor" and self._overlay_mode():
+            # Text Boxes format: all text is placed on the picture, so the
+            # Editor (which writes the caption panel's story) isn't offered.
+            self._view_var.set("builder")
+            view = "builder"
+        else:
+            recent_store.set_setting("view", view)
         if view == "editor":
             self._builder_view.pack_forget()
             self._sync_caption_to_editor()
@@ -4890,6 +5528,10 @@ class CaptionApp:
         fmt_data = self._formats.get(self._format_var.get(), {})
         if fmt_data.get("chat_mode"):
             parts.append("Text Message format uses chat bubbles — edit them in Caption Builder")
+            color = "#888"
+        elif fmt_data.get("layout") == "overlay":
+            parts.append("Text Boxes format: place text on the picture in Caption Builder — "
+                         "this text goes in the DA description")
             color = "#888"
         elif raw is not None and words and self._story_mode_var.get():
             shown = len(_image_text(dict(raw, text=text)).split())
@@ -6270,6 +6912,9 @@ class CaptionApp:
             base["footer_size"] = self._footer_size_var.get()
             base["scale_overlays"] = self._scale_overlays_var.get()
             base["footer_text"] = self._footer_text_box.get("1.0", "end-1c")
+            if base.get("layout") == "overlay":
+                # The boxes' places and styles are the format's template.
+                base["text_boxes"] = [dict(b) for b in self._text_boxes]
         except tk.TclError:
             messagebox.showerror("Invalid Settings",
                                   "Fix the highlighted fields before saving — "
@@ -6348,6 +6993,7 @@ class CaptionApp:
         self._side_var.set(data.get("caption_side", "right"))
         self._update_side_visibility()
         self._update_chat_mode_visibility()
+        self._update_overlay_mode()
 
         # Panel size and label
         self._dynamic_width_var.set(data.get("dynamic_width", False))
@@ -6509,6 +7155,9 @@ class CaptionApp:
             font_color=self._fc_color,
             header_enabled=header_enabled,
         )
+        if raw["layout"] == "overlay":
+            raw["width"] = 0
+            raw["text_boxes"] = [dict(b) for b in self._text_boxes]
 
         if header_enabled:
             try:
@@ -7717,6 +8366,7 @@ class CaptionApp:
                     "label_size": self._ba_label_size_var.get(),
                 },
                 "series": dict(self._series) if self._series else None,
+                "text_boxes": [dict(b) for b in self._text_boxes],
                 "long_story": {"on": self._story_mode_var.get(),
                                "ending": self._story_ending,
                                "image_text": self._story_image_text},
@@ -7824,6 +8474,9 @@ class CaptionApp:
         log.info("PROJECT_OPEN  %s", os.path.basename(path))
 
     def _apply_project(self, data: dict) -> None:
+        # Before the format is applied, so a Text Boxes project keeps its own.
+        self._text_boxes = [dict(b) for b in data.get("text_boxes") or []]
+        self._tb_sel = 0 if self._text_boxes else None
         fmt = data.get("format") or self._format_var.get()
         settings = dict(data.get("format_settings") or {})
         if settings:
@@ -8076,6 +8729,8 @@ class CaptionApp:
         self._update_wall_items()  # app background (if any) underneath
         self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._tk_img,
                                   tags=("img",))
+        if self._text_boxes and self._overlay_mode():
+            self._tb_draw_selection()
 
     def _start_anim(self) -> None:
         self._anim_step()

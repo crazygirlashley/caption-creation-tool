@@ -27,6 +27,7 @@ formats/*.json
 !formats/X-Change (Vertical).json
 !formats/Text Message.json
 !formats/Text Message (Vertical).json
+!formats/Text Boxes.json
 
 # personal UI themes — only the built-in themes are committed by default
 # (Basic.json ships too, but as reference only — see themes.py)
