@@ -554,6 +554,18 @@ def _draw_rich(draw: ImageDraw.ImageDraw, xy: tuple, text: str,
             x += font.getlength(seg)
 
 
+_WORD_W_CACHE: dict = {}   # (font, word) -> width: Auto-fit and Long story wrap the same words many times
+
+
+def _word_w(draw: ImageDraw.ImageDraw, word: str, font: ImageFont.FreeTypeFont) -> float:
+    w = _WORD_W_CACHE.get((font, word))
+    if w is None:
+        if len(_WORD_W_CACHE) > 50_000:
+            _WORD_W_CACHE.clear()
+        w = _WORD_W_CACHE[(font, word)] = _text_w(draw, word, font)
+    return w
+
+
 def _split_long_words(words: list, font: ImageFont.FreeTypeFont, max_px: int,
                       draw: ImageDraw.ImageDraw) -> list:
     """Break any word wider than max_px (a URL, "Aaaaaaah", ...) into
@@ -562,7 +574,7 @@ def _split_long_words(words: list, font: ImageFont.FreeTypeFont, max_px: int,
     only counts lines against the panel height — never noticed."""
     out = []
     for word in words:
-        if len(word) <= 1 or _text_w(draw, word, font) <= max_px:
+        if len(word) <= 1 or _word_w(draw, word, font) <= max_px:
             out.append(word)
             continue
         piece = ""
@@ -596,7 +608,7 @@ def _wrap_lines(text: str, font: ImageFont.FreeTypeFont, max_px: int,
         current_words: list = []
         current_w = 0
         for word in _split_long_words(words, font, max_px, draw):
-            word_w = _text_w(draw, word, font)
+            word_w = _word_w(draw, word, font)
             added_w = word_w if not current_words else space_w + word_w
             if current_words and current_w + added_w > max_px:
                 lines.append(" ".join(current_words))
@@ -679,11 +691,21 @@ def _style_font(family: str, size: float, bold: bool, italic: bool) -> tuple:
 
 def _seg_len(seg: str, font: ImageFont.FreeTypeFont) -> float:
     """Advance width of a run — what the next run starts after."""
+    key = (font, seg, "len")
+    w = _WORD_W_CACHE.get(key)
+    if w is not None:
+        return w
+    w = None
     if _has_emoji(seg):
         efont = _emoji_font_for(font)
         if efont is not None:
-            return sum((efont if e else font).getlength(t) for t, e in _rich_segments(seg))
-    return font.getlength(seg)
+            w = sum((efont if e else font).getlength(t) for t, e in _rich_segments(seg))
+    if w is None:
+        w = font.getlength(seg)
+    if len(_WORD_W_CACHE) > 50_000:
+        _WORD_W_CACHE.clear()
+    _WORD_W_CACHE[key] = w
+    return w
 
 
 def _needs_styling(text: str, markup: bool, quotes: bool) -> bool:
@@ -884,6 +906,198 @@ def _words_that_fit(text: str, raw: dict, min_px: Optional[float] = None) -> int
     return best
 
 
+# Long story mode: the caption box holds the whole story (it goes in the
+# DeviantArt description) and the image shows its opening, cut at the end of
+# a sentence where it stops fitting, followed by this line.
+_STORY_ENDING = "(The story continues in the description ⬇)"
+_SENTENCE_END_RE = re.compile(r"[.!?…][\"'”’)\]*]*$")
+_EXCERPT_CACHE: "collections.OrderedDict" = collections.OrderedDict()
+
+
+def _raw_output_scale(raw: dict) -> float:
+    """The scale build_composite will draw raw's composite at."""
+    fw, fh = raw["frame_size"]
+    total_w, total_h = _panel_total_size(fw, fh, raw["width"], raw["layout"])
+    scale, new_w, new_h = _output_scale(total_w, total_h, raw["output_override"],
+                                        raw["output_size_pct"])
+    return 1.0 if (new_w, new_h) == (total_w, total_h) else scale
+
+
+def _fits_at(text: str, raw: dict, px: float, draw: Optional[ImageDraw.ImageDraw] = None) -> bool:
+    """Whether text, line breaks and all, fits the caption panel at px
+    (rounded up to the whole size Auto-fit works in) in the exported image."""
+    fw, fh = raw["frame_size"]
+    layout = raw["layout"]
+    total_w, total_h = _panel_total_size(fw, fh, raw["width"], layout)
+    scale = _raw_output_scale(raw)
+    new_w, new_h = round(total_w * scale), round(total_h * scale)
+    s_cap = max(1, round(raw["width"] * scale))
+    area_w, area_h = (new_w, s_cap) if layout == "vertical" else (s_cap, new_h)
+    pad = round(raw["pad"] * scale)
+    stroke = round(raw["stroke_w"] * scale)
+    size = math.ceil(px)
+    n = _count_lines(text, raw["font_family"], size, raw["bold"], area_w - pad * 2 - stroke * 2,
+                     draw or ImageDraw.Draw(Image.new("RGBA", (1, 1))), raw.get("markup", False))
+    return n * int(size * 1.3) + pad * 2 <= area_h
+
+
+def _story_excerpt(story: str, raw: dict, px: float, ending: str = _STORY_ENDING) -> str:
+    """The longest opening of story that fits the caption panel with text
+    px tall in the exported image, ending at a sentence end where one is
+    near, then `ending` on its own line. The whole story if it all fits."""
+    spans = list(re.finditer(r"\S+", story))
+    n = len(spans)
+    if not n:
+        return story
+    draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    tail = f"\n\n{ending.strip()}" if ending.strip() else ""
+
+    def upto(k: int) -> str:
+        return story[:spans[k - 1].end()].rstrip()
+
+    def fits(k: int) -> bool:
+        return _fits_at(upto(k) + tail, raw, px, draw)
+
+    # Grow the opening (32, 64, 128… words) until it stops fitting, then
+    # binary search inside the last step — only ever measuring about as much
+    # text as fits, not a whole 2,000-word story on every pass.
+    best, k = 0, 32
+    while True:
+        if k >= n:
+            if _fits_at(story, raw, px, draw):
+                return story
+            hi = n - 1
+            break
+        if not fits(k):
+            hi = k - 1
+            break
+        best, k = k, k * 2
+    lo = best + 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:
+        return tail.strip() or upto(1)
+    for k in range(best, max(0, int(best * 0.6)), -1):
+        if _SENTENCE_END_RE.search(spans[k - 1].group()):
+            return upto(k) + tail
+    return upto(best).rstrip(",;:—–-") + "…" + tail
+
+
+def _image_text(raw: dict) -> str:
+    """The caption drawn on the image: the caption itself, or in Long story
+    mode your own short version or else the opening that fits."""
+    text = raw["text"]
+    if (not raw.get("story_mode") or raw.get("chat_messages") is not None
+            or raw.get("frame_size") is None):
+        return text
+    if (raw.get("story_image_text") or "").strip():
+        return raw["story_image_text"]
+    if raw.get("auto_size"):
+        px = float(raw.get("min_px") or _READABLE_MIN_PX)
+    else:
+        px = max(1.0, raw["field_size"] * _raw_output_scale(raw))
+    ending = raw.get("story_ending", _STORY_ENDING)
+    key = (text, ending, px, tuple(raw["frame_size"]), raw["width"], raw["layout"], raw["pad"],
+           raw["stroke_w"], raw["font_family"], raw["bold"], raw.get("markup", False),
+           raw["output_override"], raw["output_size_pct"])
+    with _OVERLAY_CACHE_LOCK:
+        hit = _EXCERPT_CACHE.get(key)
+    if hit is None:
+        hit = _story_excerpt(text, raw, px, ending)
+        with _OVERLAY_CACHE_LOCK:
+            _EXCERPT_CACHE[key] = hit
+            while len(_EXCERPT_CACHE) > 8:
+                _EXCERPT_CACHE.popitem(last=False)
+    return hit
+
+
+# Where the export is headed: each site's upload limits (bytes) as of 2026 —
+# sites change these, so they all live here. max_side: longest edge the site
+# keeps (larger stills are scaled down before saving).
+_MB = 1_000_000
+_SITE_LIMITS = {
+    "DeviantArt": {"image": _DA_MAX_UPLOAD_BYTES, "gif": _DA_MAX_UPLOAD_BYTES,
+                   "video": _DA_MAX_UPLOAD_BYTES},
+    "Reddit": {"image": 20 * _MB, "gif": 100 * _MB, "video": 1000 * _MB},
+    "X / Twitter": {"image": 5 * _MB, "gif": 15 * _MB, "video": 512 * _MB, "max_side": 4096},
+    "No limit": {},
+}
+_KIND_WORD = {"image": "image", "gif": "GIF", "video": "video"}
+
+
+def _limit_label(num_bytes: int) -> str:
+    mb = num_bytes / (1024 * 1024 if num_bytes == _DA_MAX_UPLOAD_BYTES else _MB)
+    return f"{mb:g} MB"
+
+
+def _over_site_limit_msg(num_bytes: int, site: str, kind: str) -> Optional[str]:
+    """Warning text if num_bytes is over site's limit for this kind of file."""
+    limit = _SITE_LIMITS.get(site, {}).get(kind)
+    if not limit or num_bytes <= limit:
+        return None
+    return (f"This file is {_human_size(num_bytes)}, over {site}'s "
+            f"{_limit_label(limit)} {_KIND_WORD[kind]} limit.")
+
+
+def _save_still(img: Image.Image, path: str, limit: Optional[int] = None,
+                max_side: Optional[int] = None) -> list:
+    """Save a still image to path in the format its extension names,
+    shrinking it until it's under limit bytes: first the longest edge to
+    max_side, then (JPEG/WebP) lower quality, then smaller dimensions.
+    Returns notes on what was changed, for the "Saved" message."""
+    ext = os.path.splitext(path)[1].lower()
+    notes = []
+    if ext in (".jpg", ".jpeg", ".bmp"):
+        img = img.convert("RGB")
+    if max_side and max(img.size) > max_side:
+        k = max_side / max(img.size)
+        img = img.resize((max(1, round(img.width * k)), max(1, round(img.height * k))),
+                         Image.LANCZOS)
+        notes.append(f"scaled to {img.width}×{img.height} (the site's largest size)")
+
+    if ext in (".jpg", ".jpeg"):
+        steps = [dict(format="JPEG", quality=q, subsampling=0 if q >= 90 else 2)
+                 for q in (95, 90, 85, 80, 72)]
+    elif ext == ".webp":
+        steps = [dict(format="WEBP", lossless=True, method=4)] + [
+            dict(format="WEBP", quality=q, method=4) for q in (92, 85, 78, 70)]
+    elif ext == ".bmp":
+        steps = [dict(format="BMP")]
+    else:
+        steps = [dict(format="PNG", optimize=True)]
+
+    def encode(im: Image.Image, opts: dict) -> bytes:
+        buf = io.BytesIO()
+        im.save(buf, **opts)
+        return buf.getvalue()
+
+    best_opts = steps[0]
+    data = b""
+    shrunk = False
+    for _attempt in range(14):
+        for opts in steps:
+            data = encode(img, opts)
+            if not limit or len(data) <= limit:
+                break
+        if not limit or len(data) <= limit:
+            break
+        img = img.resize((max(1, round(img.width * 0.85)), max(1, round(img.height * 0.85))),
+                         Image.LANCZOS)
+        steps = steps[-1:]   # already at the lowest quality
+        shrunk = True
+    if opts is not best_opts and opts.get("quality"):
+        notes.append(f"{opts['format'].replace('WEBP', 'WebP')} quality {opts['quality']}")
+    if shrunk:
+        notes.append(f"scaled to {img.width}×{img.height} to fit the size limit")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return notes
+
+
 def _resolve_composite_kwargs(raw: dict) -> tuple:
     """Turn a CaptionApp._gather_raw_params() dict into build_composite
     kwargs, running Auto-fit's font-size search if enabled. Pure — touches
@@ -891,7 +1105,7 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
     whole point of splitting it out from CaptionApp._collect_render_params,
     since Auto-fit's search is the expensive part that used to block the UI
     on a large caption. Returns (kwargs, resolved_font_size)."""
-    text = raw["text"]
+    text = _image_text(raw)
     width = raw["width"]
     pad = raw["pad"]
     stroke_w = raw["stroke_w"]
@@ -2267,6 +2481,16 @@ class CaptionApp:
         self._dialogue_on_var = tk.BooleanVar(value=False)
         self._dialogue_color = "#e0457b"
 
+        # Long story mode (see _image_text): full story for the description,
+        # a shortened version on the image.
+        self._story_mode_var = tk.BooleanVar(value=False)
+        self._story_ending = _STORY_ENDING
+        self._story_image_text = ""     # your own image text; "" = the opening that fits
+
+        # Where exports are headed (see _SITE_LIMITS).
+        site = recent_store.get_setting("export_site", "DeviantArt")
+        self._site_var = tk.StringVar(value=site if site in _SITE_LIMITS else "DeviantArt")
+
         # Framing: zoom/pan the picture inside its frame (see _apply_zoom).
         self._zoom_var = tk.DoubleVar(value=1.0)
         self._pan_x_var = tk.DoubleVar(value=0.0)
@@ -2462,10 +2686,20 @@ class CaptionApp:
         self._size_est_row.pack(side="top", fill="x", pady=(0, 4))
         self._size_est_label = ttk.Label(self._size_est_row, text="", foreground="#888")
         self._size_est_label.pack(side="left", anchor="w")
-        # Shown only while a GIF estimate is over DeviantArt's upload cap.
+        # Shown only while a GIF estimate is over the chosen site's upload cap.
         self._fit_btn = ttk.Button(self._size_est_row, text="Fit under 80 MB",
                                    command=self._fit_to_da_limit)
         self._fit_running = False
+        site_combo = ttk.Combobox(self._size_est_row, textvariable=self._site_var,
+                                  state="readonly", width=12, values=list(_SITE_LIMITS))
+        site_combo.pack(side="right")
+        tooltip(ttk.Label(self._size_est_row, text="Post to:", style="Muted.TLabel"),
+                "Where the export is going. Saving keeps the file under that site's\n"
+                "upload limit (stills are shrunk automatically; for GIFs, Fit under…).\n"
+                "DeviantArt 80 MB · Reddit 20 MB images, 100 MB GIFs ·\n"
+                "X / Twitter 5 MB images, 15 MB GIFs").pack(side="right", padx=(0, 4))
+        self._site_var.trace_add("write", lambda *_: self._on_site_change())
+        self._last_estimate: Optional[tuple] = None
 
         self._canvas = tk.Canvas(pf, bg=themes.accent(self._theme_name)["canvas"],
                                  highlightthickness=0)
@@ -2549,8 +2783,9 @@ class CaptionApp:
                   self._zoom_var, self._pan_x_var, self._pan_y_var, self._wm_pos_var,
                   self._wm_opacity_var, self._ba_on_var, self._ba_layout_var,
                   self._ba_before_label_var, self._ba_after_label_var,
-                  self._ba_label_size_var):
+                  self._ba_label_size_var, self._story_mode_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
+        self._story_mode_var.trace_add("write", lambda *_: self._update_editor_stats())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
         for v in (self._trim_start_var, self._trim_end_var, self._speed_var):
             v.trace_add("write", lambda *_: self._on_trim_change())
@@ -2692,6 +2927,15 @@ class CaptionApp:
         self._dialogue_btn.pack(side="left")
         r += 1
 
+        story_row = ttk.Frame(f)
+        story_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        tooltip(ttk.Checkbutton(story_row, text="📖 Long story", variable=self._story_mode_var),
+                "The full story goes in the DeviantArt description; the image shows\n"
+                "the opening that fits (or your own short version)").pack(side="left")
+        ttk.Button(story_row, text="Text on image…",
+                   command=self._story_image_dialog).pack(side="left", padx=(8, 0))
+        r += 1
+
         self._align_label = ttk.Label(f, text="Alignment:")
         self._align_label.grid(row=r, column=0, sticky="w", pady=4)
         self._align_row = ttk.Frame(f)
@@ -2767,6 +3011,130 @@ class CaptionApp:
         self._stroke_btn.pack(side="left")
         ttk.Button(self._stroke_color_row, text="Pick", width=5,
                    command=lambda: self._start_color_pick("stroke")).pack(side="left", padx=(4, 0))
+
+    def _story_image_dialog(self) -> None:
+        """Long story mode: choose what goes on the image — the opening that
+        fits, or your own short version (typed, or written by the AI)."""
+        self._flush_editor()
+        story = self._text_box.get("1.0", "end-1c")
+        if not story.strip():
+            messagebox.showinfo("Text on image", "Write or paste the story first.")
+            return
+        raw = self._gather_raw_params() if self._frames else None
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Text on the image")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+
+        own = self._story_image_text.strip()
+        mode_var = tk.StringVar(value="own" if own else "opening")
+        ending_var = tk.StringVar(value=self._story_ending)
+        ttk.Label(body, text=f"The full story ({len(story.split()):,} words) goes in the "
+                             "DeviantArt description. On the image:",
+                  wraplength=520).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Radiobutton(body, text="The opening, cut at a sentence where it stops fitting, "
+                                   "then this line:",
+                        variable=mode_var, value="opening").grid(row=1, column=0, sticky="w")
+        ttk.Entry(body, textvariable=ending_var, width=60).grid(row=2, column=0, sticky="ew",
+                                                               padx=(22, 0), pady=(2, 10))
+        ttk.Radiobutton(body, text="My own short version:", variable=mode_var,
+                        value="own").grid(row=3, column=0, sticky="w")
+        box = tk.Text(body, wrap="word", width=64, height=12, relief="solid", bd=1,
+                      padx=6, pady=6, undo=True)
+        box.grid(row=4, column=0, sticky="nsew", padx=(22, 0), pady=(2, 4))
+
+        def opening() -> str:
+            if raw is None:
+                return story
+            return _image_text(dict(raw, text=story, story_mode=True, story_image_text="",
+                                    story_ending=ending_var.get()))
+
+        box.insert("1.0", own or opening())
+        box.bind("<Key>", lambda _e: mode_var.set("own"), add="+")
+        status = ttk.Label(body, text="", style="Muted.TLabel")
+        tools = ttk.Frame(body)
+        tools.grid(row=5, column=0, sticky="w", padx=(22, 0))
+        cancel = threading.Event()
+        running = {"on": False}
+
+        def fill(text: str) -> None:
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            mode_var.set("own")
+
+        def ai_shorten() -> None:
+            if running["on"]:
+                cancel.set()
+                return
+            settings = self._ensure_ai_ready()
+            if not settings:
+                return
+            fit = _words_that_fit(story, raw, self._min_text_px()) if raw else 120
+            words = max(20, int(fit * 0.9))
+            instruction = ai_writer.edit_instruction("shorten", words, "")
+            box.delete("1.0", "end")
+            mode_var.set("own")
+            running["on"] = True
+            cancel.clear()
+            ai_btn.config(text="■ Stop")
+            status.config(text=f"AI is writing a ~{words}-word version…")
+
+            def work() -> None:
+                err = None
+                try:
+                    for chunk in ai_writer.stream_edit(story, instruction, words, settings, cancel):
+                        self.root.after(0, lambda c=chunk: box.winfo_exists() and box.insert("end", c))
+                except ai_writer.AIWriterError as e:
+                    err = str(e)
+                except Exception as e:
+                    log.exception("AI_STORY_SHORTEN_ERROR")
+                    err = f"Unexpected error: {e}"
+                self.root.after(0, lambda: done(err))
+
+            def done(err: Optional[str]) -> None:
+                running["on"] = False
+                if not dlg.winfo_exists():
+                    return
+                ai_btn.config(text="✨ Shorten the story with AI")
+                status.config(text="")
+                if err:
+                    messagebox.showerror("Shorten with AI", err, parent=dlg)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        ai_btn = ttk.Button(tools, text="✨ Shorten the story with AI", command=ai_shorten)
+        ai_btn.pack(side="left")
+        ttk.Button(tools, text="Start from the opening",
+                   command=lambda: fill(opening())).pack(side="left", padx=(6, 0))
+        status.grid(row=6, column=0, sticky="w", padx=(22, 0), pady=(4, 0))
+
+        def ok() -> None:
+            cancel.set()
+            self._story_ending = ending_var.get()
+            text = box.get("1.0", "end-1c").strip()
+            self._story_image_text = text if mode_var.get() == "own" else ""
+            dlg.destroy()
+            if self._story_mode_var.get():
+                self._safe_refresh(debounce_ms=0)
+                self._update_editor_stats()
+            else:
+                self._story_mode_var.set(True)   # its traces refresh
+
+        def close() -> None:
+            cancel.set()
+            dlg.destroy()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=7, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=close).pack(side="right")
+        ttk.Button(btns, text="OK", style="Accent.TButton", command=ok).pack(side="right",
+                                                                         padx=(0, 6))
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        dlg.bind("<Escape>", lambda _e: close())
 
     def _pick_dialogue_color(self) -> None:
         r = colorchooser.askcolor(color=self._dialogue_color, title="Dialogue Color",
@@ -4122,6 +4490,14 @@ class CaptionApp:
                 "The word-count check and Shorten to fit use it.").pack(side="left", padx=6)
         ttk.Label(size_row, text="px", style="CardMuted.TLabel").pack(side="left")
         self._min_text_var.trace_add("write", lambda *_: self._on_min_text_change())
+        story_row = ttk.Frame(pv, style="Card.TFrame")
+        story_row.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        tooltip(ttk.Checkbutton(story_row, text="📖 Long story", variable=self._story_mode_var,
+                                style="Card.TCheckbutton"),
+                "Keep the whole story: it goes in the DeviantArt description, and the\n"
+                "image shows the opening that fits (or your own short version)").pack(side="left")
+        ttk.Button(story_row, text="Text on image…", command=self._story_image_dialog).pack(
+            side="left", padx=(8, 0))
         self._editor_placeholder = Placeholder(
             self._editor_box,
             "Start writing your caption story here…\n\n"
@@ -4498,6 +4874,8 @@ class CaptionApp:
             return  # mid-typing
         recent_store.set_setting("min_text_px", max(10, min(80, value)))
         self._update_editor_stats()
+        if self._story_mode_var.get():
+            self._safe_refresh()   # the opening shown on the image depends on it
 
     def _update_editor_stats(self) -> None:
         for ph in (getattr(self, "_editor_placeholder", None),
@@ -4513,6 +4891,15 @@ class CaptionApp:
         if fmt_data.get("chat_mode"):
             parts.append("Text Message format uses chat bubbles — edit them in Caption Builder")
             color = "#888"
+        elif raw is not None and words and self._story_mode_var.get():
+            shown = len(_image_text(dict(raw, text=text)).split())
+            if self._story_image_text.strip():
+                parts.append(f"📖 Long story: your own {shown}-word version is on the image; "
+                             "the full story goes in the DA description")
+            else:
+                parts.append(f"📖 Long story: the image shows the opening (~{shown} words); "
+                             "the full story goes in the DA description")
+            color = "#2e8b57"
         elif raw is not None and words:
             fit = _words_that_fit(text, raw, self._min_text_px())
             if fit >= words:
@@ -4520,7 +4907,7 @@ class CaptionApp:
                 color = "#2e8b57"
             else:
                 parts.append(f"⚠ about {fit} words fit beside the image at a readable size "
-                             "— try Shorten to fit")
+                             "— try Shorten to fit, or 📖 Long story")
                 color = "#b8860b"
         else:
             color = "#888"
@@ -5722,7 +6109,22 @@ class CaptionApp:
                                  "An export is already in progress — check its console window.")
             return
 
+        site = self._site_var.get()
         if self._is_anim:
+            est = self._last_estimate
+            gif_limit = self._site_limit("gif")
+            if (not self._is_video and est and est[0] and gif_limit and est[0] > gif_limit
+                    and self._estimate_kind(est[1]) == "gif"):
+                choice = messagebox.askyesnocancel(
+                    "Over the size limit",
+                    f"This GIF will be about {_human_size(est[0])}, over {site}'s "
+                    f"{_limit_label(gif_limit)} GIF limit.\n\nFind settings that fit first? "
+                    "(Yes = fit it, then press Save again · No = save it as it is)")
+                if choice is None:
+                    return
+                if choice:
+                    self._fit_to_da_limit()
+                    return
             if self._is_video:
                 default_ext = ".mp4"
                 filetypes = [("MP4 Video", "*.mp4"), ("Animated GIF", "*.gif")]
@@ -5755,8 +6157,9 @@ class CaptionApp:
                 self._export_in_progress = False
                 self._status.config(text=base_status)
                 log.info("FILE_SAVE  %s", os.path.basename(path))
-                msg = f"Saved:\n{path}"
-                over_msg = _over_da_limit_msg(os.path.getsize(path))
+                msg = f"Saved:\n{path}" + self._write_story_file(path)
+                kind = "video" if path.lower().endswith(".mp4") else "gif"
+                over_msg = _over_site_limit_msg(os.path.getsize(path), site, kind)
                 if over_msg:
                     msg += f"\n\n⚠ {over_msg}"
                 messagebox.showinfo("Saved", msg)
@@ -5784,21 +6187,43 @@ class CaptionApp:
 
         path = filedialog.asksaveasfilename(
             defaultextension=".png", initialfile=self._series_filename(""),
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("BMP", "*.bmp")],
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("WebP", "*.webp"), ("BMP", "*.bmp")],
         )
         if not path:
             return
-        out = self._cache[0]
-        if path.lower().endswith((".jpg", ".jpeg")):
-            out = out.convert("RGB")
-        out.save(path)
+        limits = _SITE_LIMITS.get(site, {})
+        try:
+            notes = _save_still(self._cache[0], path, limits.get("image"), limits.get("max_side"))
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Save", f"Couldn't save the image:\n{e}")
+            return
 
         log.info("FILE_SAVE  %s", os.path.basename(path))
         msg = f"Saved:\n{path}"
-        over_msg = _over_da_limit_msg(os.path.getsize(path))
+        if notes:
+            msg += f"\n\nTo fit {site}'s limits: " + ", ".join(notes) + "."
+        msg += self._write_story_file(path)
+        over_msg = _over_site_limit_msg(os.path.getsize(path), site, "image")
         if over_msg:
             msg += f"\n\n⚠ {over_msg}"
         messagebox.showinfo("Saved", msg)
+
+    def _write_story_file(self, path: str) -> str:
+        """Long story mode: save the full story beside the export (for the
+        description when posting by hand). Returns a line for the Saved
+        message."""
+        if not self._story_mode_var.get():
+            return ""
+        story = self._get_caption_text().strip()
+        if not story:
+            return ""
+        txt = os.path.splitext(path)[0] + " - story.txt"
+        try:
+            with open(txt, "w", encoding="utf-8") as fh:
+                fh.write(story + "\n")
+        except OSError as e:
+            return f"\n\nCouldn't save the story text: {e}"
+        return f"\n\nFull story saved for the description:\n{txt}"
 
     # ------------------------------------------------------------------
     # Rendering
@@ -6115,6 +6540,10 @@ class CaptionApp:
                 watermark_pos=_WM_POS_CODE.get(self._wm_pos_var.get(), "bl"),
                 watermark_opacity=max(10, min(100, int(self._wm_opacity_var.get()))) / 100,
                 auto_contrast=self._auto_contrast_var.get(),
+                story_mode=self._story_mode_var.get(),
+                story_ending=self._story_ending,
+                story_image_text=self._story_image_text,
+                min_px=self._min_text_px(),
             )
         except (tk.TclError, ValueError):
             return None
@@ -6917,31 +7346,54 @@ class CaptionApp:
         num_bytes is None either because nothing has been built yet or
         because the encode itself failed (see _rebuild_all_async)."""
         self._fit_btn.pack_forget()
+        self._last_estimate = (num_bytes, label, gif_alt_bytes) if self._cache else None
         if not self._cache:
             self._size_est_label.config(text="", foreground="#888")
             return
         if num_bytes is None:
             self._size_est_label.config(text="Est. size: unavailable", foreground="#888")
             return
+        site = self._site_var.get()
+        kind = self._estimate_kind(label)
+        limit = _SITE_LIMITS.get(site, {}).get(kind)
         text = f"Est. size ({label}): {_human_size(num_bytes)}"
-        over_msg = _over_da_limit_msg(num_bytes)
-        if over_msg:
-            text += "  ⚠ exceeds DeviantArt's 80 MB upload limit"
-            color = "#c0392b"
-        elif num_bytes > _DA_MAX_UPLOAD_BYTES * 0.9:
+        over = bool(limit) and num_bytes > limit
+        if over:
+            if kind == "image":
+                text += f"  · will be shrunk to fit {site}'s {_limit_label(limit)}"
+                color = "#b8860b"
+            else:
+                text += f"  ⚠ over {site}'s {_limit_label(limit)} {_KIND_WORD[kind]} limit"
+                color = "#c0392b"
+        elif limit and num_bytes > limit * 0.9:
             color = "#b8860b"
         else:
             color = "#888"
         # MP4 sources can also be saved as GIF, which is usually far bigger
-        # — show that too so the DA limit doesn't come as a surprise.
+        # — show that too so the site's GIF limit doesn't come as a surprise.
         if gif_alt_bytes is not None:
             text += f"  ·  as GIF ≈ {_human_size(gif_alt_bytes)}"
-            if _over_da_limit_msg(gif_alt_bytes):
+            if _over_site_limit_msg(gif_alt_bytes, site, "gif"):
                 text += " ⚠"
         self._size_est_label.config(text=text, foreground=color)
-        if over_msg and label.startswith("GIF") and not self._is_video:
-            self._fit_btn.config(state="disabled" if self._fit_running else "normal")
+        if over and kind == "gif" and not self._is_video:
+            self._fit_btn.config(text=f"Fit under {_limit_label(limit)}",
+                                 state="disabled" if self._fit_running else "normal")
             self._fit_btn.pack(side="left", padx=(8, 0))
+
+    @staticmethod
+    def _estimate_kind(label: str) -> str:
+        if label.upper().startswith("GIF"):
+            return "gif"
+        return "video" if label.upper().startswith("MP4") else "image"
+
+    def _site_limit(self, kind: str) -> Optional[int]:
+        return _SITE_LIMITS.get(self._site_var.get(), {}).get(kind)
+
+    def _on_site_change(self) -> None:
+        recent_store.set_setting("export_site", self._site_var.get())
+        if self._last_estimate is not None:
+            self._set_size_estimate(*self._last_estimate)
 
     def _set_output_override(self, pct: Optional[int]) -> None:
         """Turn Output Size Override on at pct (or off with None) without
@@ -7188,6 +7640,7 @@ class CaptionApp:
         self._rebuild_chat_rows()
         self._reset_framing()
         self._ba_on_var.set(False)
+        self._story_image_text = ""
         self._before_path = ""
         self._before_name_lbl.config(text="(none)")
         self._project_path = None
@@ -7264,6 +7717,9 @@ class CaptionApp:
                     "label_size": self._ba_label_size_var.get(),
                 },
                 "series": dict(self._series) if self._series else None,
+                "long_story": {"on": self._story_mode_var.get(),
+                               "ending": self._story_ending,
+                               "image_text": self._story_image_text},
                 "app": "Caption Creator project",
                 "version": 1,
                 "source": os.path.abspath(source) if source else "",
@@ -7430,6 +7886,10 @@ class CaptionApp:
         self._ba_label_size_var.set(round(float(ba.get("label_size", 28))))
         self._ba_on_var.set(bool(ba.get("on")) and bool(before))
         self._set_series(data.get("series"), retitle=False)
+        story = data.get("long_story") or {}
+        self._story_ending = story.get("ending", _STORY_ENDING)
+        self._story_image_text = story.get("image_text", "")
+        self._story_mode_var.set(bool(story.get("on")))
         if not self._wm_auto_var.get() and data.get("watermark_height"):
             self._updating_wm_display = True
             try:
@@ -7450,7 +7910,7 @@ class CaptionApp:
 
     def _fit_to_da_limit(self) -> None:
         """Find the highest-quality output settings whose GIF fits under
-        DeviantArt's upload cap, then apply them. Quality is given up in
+        the chosen site's GIF upload cap, then apply them. Quality is given up in
         order of how little it shows: first output size (down to the
         1280x720 floor), then palette colors. Each candidate is sized from a
         short sample (see _sampled_gif_bytes); the normal full estimate
@@ -7463,7 +7923,9 @@ class CaptionApp:
         self._fit_running = True
         self._fit_btn.config(state="disabled")
         base_text = self._size_est_label.cget("text")
-        self._size_est_label.config(text="Finding settings that fit under 80 MB…")
+        limit = self._site_limit("gif") or _DA_MAX_UPLOAD_BYTES
+        cap = _limit_label(limit)
+        self._size_est_label.config(text=f"Finding settings that fit under {cap}…")
 
         deferred_path, deferred_kind = self._deferred_path, self._deferred_kind
         first, last = self._trim_range()
@@ -7475,7 +7937,7 @@ class CaptionApp:
         fps = self._export_fps() * speed
         fw, fh = raw["frame_size"]
         current_pct = raw["output_size_pct"] if raw["output_override"] else None
-        target = _DA_MAX_UPLOAD_BYTES * 0.95  # headroom for sampling error
+        target = limit * 0.95  # headroom for sampling error
 
         def _search() -> Optional[tuple]:
             src = frames
@@ -7530,16 +7992,16 @@ class CaptionApp:
             self._fit_btn.config(state="normal")
             if result == "error":
                 self._size_est_label.config(text=base_text)
-                messagebox.showerror("Fit under 80 MB", "Couldn't work out smaller settings — "
+                messagebox.showerror(f"Fit under {cap}", "Couldn't work out smaller settings — "
                                      "see caption_creator_crash.log.")
                 return
             if result is None:
                 self._size_est_label.config(text=base_text)
                 messagebox.showinfo(
-                    "Fit under 80 MB",
+                    f"Fit under {cap}",
                     "Even at the smallest output size (1280×720) with 32 colors this "
-                    "GIF is still over 80 MB.\n\nUse Frames … to … under the preview to "
-                    "keep a shorter part of it, then press Fit under 80 MB again.")
+                    f"GIF is still over {cap}.\n\nUse Frames … to … under the preview to "
+                    f"keep a shorter part of it, then press Fit under {cap} again.")
                 return
             pct, colors = result
             log.info("FIT_DA_LIMIT  pct=%d colors=%d", pct, colors)
