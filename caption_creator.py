@@ -1707,9 +1707,12 @@ def _draw_text_boxes(out: Image.Image, boxes: list, origin: tuple, fw: int, fh: 
         if shadow_draw is not None:
             layer.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(3 * k)))
         layer.alpha_composite(text_layer)
-        placed = Image.new("RGBA", out.size, (0, 0, 0, 0))
-        placed.paste(layer, (ox + g["x"] - margin, oy + g["y"] - margin))
-        out.alpha_composite(placed)
+        # Composite just the box's own area (clipped to the picture), rather
+        # than a full-size layer per box — this runs on every drag step.
+        lx, ly = ox + g["x"] - margin, oy + g["y"] - margin
+        sx, sy = max(0, -lx), max(0, -ly)
+        if sx < layer.width and sy < layer.height and lx < out.width and ly < out.height:
+            out.alpha_composite(layer, (max(0, lx), max(0, ly)), (sx, sy))
 
 
 def _output_scale_bounds(total_w: int, total_h: int) -> tuple:
@@ -1874,6 +1877,7 @@ def build_composite(
             footer_outline=footer_outline and [_s(footer_outline[0]), footer_outline[1]],
             _px_scale=_px_scale * scale,
             text_boxes=text_boxes,
+            upscale_filter=upscale_filter,
             **ba_kw,
         )
 
@@ -2103,6 +2107,10 @@ def _iter_frames_from_path(path: str, kind: str):
 # Frames sampled across the animation to pick the shared GIF palette and to
 # find which pixels never change (the caption panel, mostly).
 _GIF_PALETTE_SAMPLES = 12
+# Median cut over all 12 full-size samples (22M pixels for a 2560x720
+# caption GIF) took over a second per export and per size estimate; an even
+# subsample of this many pixels picks practically the same palette.
+_GIF_PALETTE_PIXELS = 3_000_000
 
 # Fastest frame rate a GIF plays at reliably (20ms delays).
 _GIF_MAX_FPS = 50
@@ -2178,9 +2186,16 @@ def _write_gif(path: str, frames, samples: list, durations,
     colors = min(255, gif_colors or 255)
     rgb_samples = [f.convert("RGB") for f in samples]
     w, h = rgb_samples[0].size
-    mosaic = Image.new("RGB", (w, h * len(rgb_samples)))
+    # (Dithered output needs the full sample: a subsampled palette made
+    # MP4 -> GIF exports ~6% bigger. GIF sources, and every size estimate,
+    # lose nothing.)
+    k = 1.0 if dither else min(1.0, math.sqrt(_GIF_PALETTE_PIXELS /
+                                              (w * h * len(rgb_samples))))
+    pw, ph = max(1, round(w * k)), max(1, round(h * k))
+    mosaic = Image.new("RGB", (pw, ph * len(rgb_samples)))
     for i, f in enumerate(rgb_samples):
-        mosaic.paste(f, (0, h * i))
+        # NEAREST keeps the real colors (no blends) in their real proportions.
+        mosaic.paste(f if k == 1.0 else f.resize((pw, ph), Image.NEAREST), (0, ph * i))
     palette = mosaic.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
     # Reserve the first index past the palette for transparency, padding the
     # palette to the power-of-two size GIF stores it at anyway.
@@ -2203,6 +2218,45 @@ def _write_gif(path: str, frames, samples: list, durations,
             static_mask = None
     method = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
 
+    # Dithered frames: the static pixels (caption panel, overlays) get one
+    # undithered quantization, done once; each frame then only dithers the
+    # box where something moves. Quantizing every whole frame twice (dithered,
+    # then again undithered for the static pixels) made MP4 -> GIF exports
+    # spend ~0.1s a frame here. A frame whose "static" pixels did change
+    # after all (the samples missed it) takes the old full path.
+    fast = None
+    if static_mask is not None:
+        static_np = np.asarray(static_mask) > 0
+        moving = np.argwhere(~static_np)
+        if moving.size:
+            (y0, x0), (y1, x1) = moving.min(axis=0), moving.max(axis=0) + 1
+            box = (int(x0), int(y0), int(x1), int(y1))
+            ref_idx = np.asarray(rgb_samples[0].quantize(palette=palette,
+                                                         dither=Image.Dither.NONE))
+            fast = {"box": box, "ref": rgb_samples[0], "ref_idx": ref_idx,
+                    "ref_box": np.asarray(rgb_samples[0].crop(box)),
+                    "static_box": static_np[y0:y1, x0:x1]}
+
+    def _dithered(rgb: Image.Image) -> np.ndarray:
+        if fast is not None:
+            x0, y0, x1, y1 = fast["box"]
+            changed = ImageChops.difference(rgb, fast["ref"]).getbbox()
+            if changed is None:
+                return fast["ref_idx"]
+            if (changed[0] >= x0 and changed[1] >= y0
+                    and changed[2] <= x1 and changed[3] <= y1):
+                crop = rgb.crop(fast["box"])
+                part = np.array(crop.quantize(palette=palette, dither=method))
+                keep = fast["static_box"] & (np.asarray(crop) == fast["ref_box"]).all(axis=2)
+                part[keep] = fast["ref_idx"][y0:y1, x0:x1][keep]
+                idx = fast["ref_idx"].copy()
+                idx[y0:y1, x0:x1] = part
+                return idx
+        q = rgb.quantize(palette=palette, dither=method)
+        if static_mask is not None:
+            q.paste(rgb.quantize(palette=palette, dither=Image.Dither.NONE), (0, 0), static_mask)
+        return np.asarray(q)
+
     if isinstance(durations, (list, tuple)):
         delays = iter(durations)
     else:
@@ -2213,11 +2267,10 @@ def _write_gif(path: str, frames, samples: list, durations,
         prev = prev_out = None
         for f in frames:
             rgb = f.convert("RGB")
-            q = rgb.quantize(palette=palette, dither=method)
-            if static_mask is not None:
-                q.paste(rgb.quantize(palette=palette, dither=Image.Dither.NONE),
-                        (0, 0), static_mask)
-            idx = np.asarray(q)
+            if dither:
+                idx = _dithered(rgb)
+            else:
+                idx = np.asarray(rgb.quantize(palette=palette, dither=method))
             if prev is None:
                 out_idx = idx
             else:
@@ -5314,6 +5367,16 @@ class CaptionApp:
         self._wall_job = None
         if not self._wall_active() or not self._wall.animated:
             return
+        # Redrawing a full-window background costs ~a quarter of a CPU core;
+        # don't spend it while the window is minimized or another app is in
+        # front — just check back twice a second.
+        try:
+            hidden = self.root.state() == "iconic" or self.root.focus_displayof() is None
+        except (tk.TclError, KeyError):
+            hidden = False
+        if hidden:
+            self._wall_job = self.root.after(500, self._wall_tick)
+            return
         self._wall_idx = (self._wall_idx + 1) % len(self._wall.frames)
         self._update_wall_items()
         # Background animation is capped at ~16fps to keep CPU use low.
@@ -5439,11 +5502,13 @@ class CaptionApp:
 
     def _apply_view(self) -> None:
         view = self._view_var.get()
-        if view == "editor" and self._overlay_mode():
+        if self._overlay_mode():
             # Text Boxes format: all text is placed on the picture, so the
             # Editor (which writes the caption panel's story) isn't offered.
-            self._view_var.set("builder")
-            view = "builder"
+            # The saved choice is left alone for the other formats.
+            if view == "editor":
+                self._view_var.set("builder")
+                view = "builder"
         else:
             recent_store.set_setting("view", view)
         if view == "editor":
