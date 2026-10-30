@@ -1,6 +1,6 @@
 {
   "name": "Sissy",
-  "version": 2,
+  "version": 3,
   "bg": "#ecd9f2",
   "panel": "#fbf3fd",
   "input_bg": "#ffffff",
@@ -14,5 +14,9 @@
   "accent_hover": "#c277d8",
   "canvas": "#dcc4e6",
   "canvas_fg": "#4b2560",
-  "canvas_muted": "#8d6a9e"
+  "canvas_muted": "#8d6a9e",
+  "background": "Sissy_hearts.gif",
+  "background_mode": "tile",
+  "background_dim": 0.0,
+  "background_animate": true
 }

@@ -29,6 +29,7 @@ Two mechanisms cover the whole UI:
   the next time it's built.
 """
 
+import filecmp
 import json
 import os
 import shutil
@@ -117,6 +118,16 @@ def _ensure_themes_seeded() -> None:
             dest = os.path.join(_THEMES_DIR, fname)
             if not os.path.exists(dest):
                 shutil.copy(src, dest)
+                continue
+            if not fname.lower().endswith(".json"):
+                # A built-in theme's background image or GIF (or CREDITS):
+                # replace it when the bundled copy differs, so a reworked
+                # background reaches existing installs too.
+                try:
+                    if not filecmp.cmp(src, dest, shallow=False):
+                        shutil.copy(src, dest)
+                except OSError:
+                    pass
                 continue
             bundled, installed = _read_json(src) or {}, _read_json(dest) or {}
             if bundled.get("version", 1) > installed.get("version", 1):

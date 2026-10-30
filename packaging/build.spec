@@ -61,6 +61,7 @@ for fname in ("Dark.json", "Bimbo.json", "Sissy.json", "Basic.json",
               "Hypno.json", "Pink Pill.json", "Goth.json", "French Maid.json",
               "Bimbo_kisses.gif", "Hypno_spiral.gif",
               "Pink_Pill_pills.gif", "Goth_damask.jpg", "French_Maid_bows.gif",
+              "Sissy_hearts.gif",
               "CREDITS.md"):
     src = os.path.join(THEMES_DIR, fname)
     if os.path.isfile(src):

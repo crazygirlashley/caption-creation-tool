@@ -1,8 +1,9 @@
 # Theme artwork credits
 
 Background images shipped with the built-in themes. Every source image is
-in the public domain or dedicated to it (CC0 1.0), so they can be used,
-changed and redistributed freely; credit is given here anyway.
+either in the public domain / CC0 (credit given anyway) or under a Creative
+Commons license that allows changing and redistributing it with credit, as
+noted for each one.
 
 ## Bimbo — `Bimbo_kisses.gif`
 
@@ -48,8 +49,18 @@ changed and redistributed freely; credit is given here anyway.
   <https://creativecommons.org/publicdomain/zero/1.0/>):
   - "Bow png sticker illustration" — <https://www.rawpixel.com/image/6728656/png-sticker-public-domain>
   - "Pink heart png sticker" — <https://www.rawpixel.com/image/6704157/png-sticker-heart>
-    and <https://www.rawpixel.com/image/7278337/png-frame-sticker-heart>
-- Changes: cut out of their preview backgrounds, recolored (black and hot
-  pink bows, pink hearts), given white sticker outlines, scattered into a
-  seamless tile over pastel-pink polka dots, and lightly animated (a gentle
-  wobble).
+- Changes: cut out of their preview backgrounds, recolored black and white
+  (black bows, white bows with black linework, black hearts), given sticker
+  outlines, scattered into a seamless tile over black polka dots on white,
+  and lightly animated (a gentle wobble).
+
+## Sissy — `Sissy_hearts.gif`
+
+- Source: "Sparkling pink heart.gif" by Hotwiki (English Wikipedia), via
+  Wikimedia Commons — <https://commons.wikimedia.org/wiki/File:Sparkling_pink_heart.gif>
+- License: CC BY-SA 3.0 — <https://creativecommons.org/licenses/by-sa/3.0/>
+- Changes: cropped, recolored to violet, orchid and lilac, scattered at
+  varied sizes and angles into a seamless tile over lavender dots, each heart
+  twinkling on its own beat, with soft white star twinkles added (drawn for
+  this theme). As a derivative, `Sissy_hearts.gif` is likewise licensed
+  CC BY-SA 3.0.

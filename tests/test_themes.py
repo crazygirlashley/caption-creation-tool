@@ -53,11 +53,19 @@ class ThemeUpgradeTests(unittest.TestCase):
         self.assertEqual(palettes["Dark"]["bg"], "#1f1c24")  # upgraded to version 2
         self.assertIn("accent", palettes["Bimbo"])
         # Theme background images arrive with their themes.
-        for name in ("Bimbo", "Hypno", "Pink Pill", "Goth", "French Maid"):
+        for name in ("Bimbo", "Hypno", "Pink Pill", "Goth", "French Maid", "Sissy"):
             bg = themes.theme_background(name)
             self.assertIsNotNone(bg, name)
             self.assertTrue(bg["path"].startswith(self.user))
             self.assertTrue(os.path.isfile(bg["path"]))
+
+    def test_reworked_background_image_replaces_the_installed_one(self):
+        old = os.path.join(self.user, "French_Maid_bows.gif")
+        with open(old, "wb") as f:
+            f.write(b"GIF89a old pink version")
+        themes.get_palettes(force_reload=True)
+        with open(old, "rb") as a, open(os.path.join(REPO_THEMES, "French_Maid_bows.gif"), "rb") as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_customized_bubblegum_is_kept(self):
         custom = dict(themes._LEGACY_BUBBLEGUM, bg="#123456")
