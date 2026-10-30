@@ -49,6 +49,8 @@ datas = [
     (os.path.join(ASSETS_DIR, "given_names.txt"), "assets"),
     # YuNet face detector (MIT, opencv_zoo) — Find Online's single-person filter.
     (os.path.join(ASSETS_DIR, "face_detection_yunet_2023mar.onnx"), "assets"),
+    # The app's own version, for the "What's new" window.
+    (os.path.join(REPO_ROOT, "VERSION"), "."),
 ]
 for fname in ("Standard.json", "Standard (Vertical).json",
               "X-Change.json", "X-Change (Vertical).json",

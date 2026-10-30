@@ -189,6 +189,70 @@ _LATER_CORE_FORMATS = ("Text Boxes",)
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
 
+def _version_key(version: str) -> tuple:
+    return tuple(int(p) if p.isdigit() else 0 for p in str(version).split("."))
+
+
+@functools.lru_cache(maxsize=1)
+def _app_version() -> str:
+    """This build's version: VERSION (bundled with the app / in the repo),
+    else the launcher's version.txt next to the exe."""
+    for path in (os.path.join(RESOURCE_DIR, "VERSION"), os.path.join(BASE_DIR, "VERSION"),
+                 os.path.join(BASE_DIR, "version.txt")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    return "0"
+
+
+# Release notes for the "What's new" window: version -> [(section, [(name, text)])].
+_WHATS_NEW = {
+    "1.0.0": [
+        ("Captions", [
+            ("Text Boxes format", "no caption panel: Photoshop-style text boxes on the picture. "
+             "Drag to move, drag the edge or corner to resize, double-click to add. Each box "
+             "has its own font, colors, outline, shadow, rotation, gradient text and a box "
+             "behind the text with adjustable opacity"),
+            ("Speech & thought bubbles", "turn a text box into a bubble and drag its tail to "
+             "point at someone"),
+            ("Inline styling", "*italic* and **bold** in captions, and \"dialogue\" in its "
+             "own color"),
+            ("Long story", "the full story goes in the DeviantArt description; the image shows "
+             "the opening that fits (or your own short version)"),
+            ("Before & after", "a second picture beside or above the first, with labels"),
+            ("Series", "File → Series numbers your parts, titles them, and opens the previous "
+             "part in one click"),
+        ]),
+        ("Pictures", [
+            ("Image framing", "zoom and move the picture inside its frame (drag it, "
+             "Ctrl+scroll to zoom), or zoom straight to a face"),
+            ("Face-aware text", "new text boxes keep clear of faces"),
+            ("Censor boxes", "blur, pixelate or bar out parts of the picture"),
+            ("Auto-contrast", "the title and tagline get an outline over busy pictures"),
+            ("Watermarks", "any corner, adjustable opacity, or a text watermark"),
+        ]),
+        ("Posting & saving", [
+            ("DeviantArt", "posts are marked mature (choose strict or moderate and the "
+             "reasons), with tags, a gallery folder and AI / comment settings"),
+            ("Post to", "pick DeviantArt, Reddit or X and exports stay under that site's "
+             "size limits; WebP stills"),
+            ("Autosave", "if the app closes unexpectedly, your work is offered back next time"),
+            ("Faster GIFs", "exports and size estimates are up to ~45% faster"),
+        ]),
+        ("Look & feel", [
+            ("Editor view", "a roomy writing space with AI writing tools beside it"),
+            ("Themes", "Bimbo, Sissy, Hypno, Pink Pill, Goth and French Maid, most with "
+             "animated backgrounds (Settings → Background to change or turn off)"),
+            ("Find Online", "sex.com added as a source"),
+        ]),
+    ],
+}
+
+
 def _ensure_formats_seeded() -> None:
     """On a fresh install, formats/ won't exist yet under BASE_DIR — seed it
     from the read-only copy of the built-in formats bundled alongside the
@@ -2740,6 +2804,7 @@ class CaptionApp:
             except OSError:
                 pass
         self._watchdog.stop()
+        self._clear_autosave()   # closed normally: nothing to recover
         self.root.destroy()
 
     # ------------------------------------------------------------------
@@ -4224,6 +4289,9 @@ class CaptionApp:
                 label=label, value=key, variable=self._theme_var,
                 command=lambda k=key: self._set_theme(k))
         menu.add_cascade(label="Theme", menu=theme_menu)
+        menu.add_separator()
+        menu.add_command(label=f"What's New in {_app_version()}…",
+                         command=lambda: self._show_whats_new(force=True))
 
         x = self._settings_btn.winfo_rootx()
         y = self._settings_btn.winfo_rooty() + self._settings_btn.winfo_height()
@@ -6944,7 +7012,7 @@ class CaptionApp:
             self._format_var.set(next(iter(self._formats)))
         self._on_format_change()
 
-    def _collect_format_dict(self, name: str) -> Optional[dict]:
+    def _collect_format_dict(self, name: str, quiet: bool = False) -> Optional[dict]:
         """Build a format JSON dict from current UI state.
 
         Fields with no UI control (shadow, header_enabled, show_pill_presets,
@@ -6981,9 +7049,10 @@ class CaptionApp:
                 # The boxes' places and styles are the format's template.
                 base["text_boxes"] = [dict(b) for b in self._text_boxes]
         except tk.TclError:
-            messagebox.showerror("Invalid Settings",
-                                  "Fix the highlighted fields before saving — "
-                                  "one or more values isn't a valid number.")
+            if not quiet:
+                messagebox.showerror("Invalid Settings",
+                                      "Fix the highlighted fields before saving — "
+                                      "one or more values isn't a valid number.")
             return None
         return base
 
@@ -8505,9 +8574,12 @@ class CaptionApp:
         return True
 
 
-    def _project_dict(self, project_path: str) -> Optional[dict]:
+    def _project_dict(self, project_path: str, quiet: bool = False) -> Optional[dict]:
         fmt = self._format_var.get()
-        settings = self._collect_format_dict(fmt)
+        if quiet:
+            settings = self._collect_format_dict(fmt, quiet=True)
+        else:
+            settings = self._collect_format_dict(fmt)
         if settings is None:
             return None
         project_dir = os.path.dirname(os.path.abspath(project_path))
@@ -8518,7 +8590,8 @@ class CaptionApp:
             base = os.path.splitext(os.path.basename(project_path))[0]
             ext = os.path.splitext(source)[1] or ".jpg"
             kept = os.path.join(project_dir, f"{base}_source{ext}")
-            shutil.copyfile(source, kept)
+            if not (os.path.isfile(kept) and os.path.getsize(kept) == os.path.getsize(source)):
+                shutil.copyfile(source, kept)
             source = kept
         try:
             rel = os.path.relpath(source, project_dir) if source else ""
@@ -8574,7 +8647,8 @@ class CaptionApp:
                 "watermark_opacity": self._wm_opacity_var.get(),
             }
         except tk.TclError:
-            messagebox.showerror("Save Project", "Fix the invalid number fields first.")
+            if not quiet:
+                messagebox.showerror("Save Project", "Fix the invalid number fields first.")
             return None
 
     def _save_project(self) -> None:
@@ -8603,7 +8677,7 @@ class CaptionApp:
         log.info("PROJECT_SAVE  %s", os.path.basename(path))
         self._status.config(text=f"Saved project {os.path.basename(path)}")
 
-    def _open_project(self, path: Optional[str] = None) -> None:
+    def _open_project(self, path: Optional[str] = None, remember: bool = True) -> None:
         if path is None:
             path = filedialog.askopenfilename(
                 title="Open Project", filetypes=[("Caption Creator project", "*.ccproj"),
@@ -8645,7 +8719,8 @@ class CaptionApp:
         self._project_before = ""
         self._project_path = path
         self._update_title()
-        recent_store.add("projects", path)
+        if remember:
+            recent_store.add("projects", path)
         log.info("PROJECT_OPEN  %s", os.path.basename(path))
 
     def _apply_project(self, data: dict) -> None:
@@ -8735,6 +8810,144 @@ class CaptionApp:
                 self._trim_updating = False
             self._update_trim_info()
         self._safe_refresh(debounce_ms=0)
+
+    # ------------------------------------------------------------------
+    # Autosave & crash recovery — the session is saved as a project every
+    # 30 seconds while it changes, and offered back if the app didn't close
+    # normally. A clean close deletes it.
+    # ------------------------------------------------------------------
+
+    _AUTOSAVE_SECONDS = 30
+
+    def _autosave_path(self) -> str:
+        return os.path.join(BASE_DIR, "autosave", "session.ccproj")
+
+    def _autosave_tick(self) -> None:
+        self._autosave_job = self.root.after(self._AUTOSAVE_SECONDS * 1000, self._autosave_tick)
+        try:
+            self._autosave_now()
+        except Exception:
+            log.exception("AUTOSAVE_ERROR")
+
+    def _autosave_now(self) -> None:
+        self._flush_editor()
+        caption = self._text_box.get("1.0", "end-1c")
+        if not self._source_path and not caption.strip():
+            return   # nothing worth keeping yet
+        path = self._autosave_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = self._project_dict(path, quiet=True)
+        if data is None:
+            return
+        data["autosave_of"] = getattr(self, "_project_path", None)
+        text = json.dumps(data, indent=1, sort_keys=True)
+        if text == getattr(self, "_autosave_last", None):
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        self._autosave_last = text
+
+    def _clear_autosave(self) -> None:
+        folder = os.path.dirname(self._autosave_path())
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            pass
+
+    def _offer_autosave_restore(self) -> None:
+        path = self._autosave_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            when = time.strftime("%b %d at %I:%M %p", time.localtime(os.path.getmtime(path)))
+        except (OSError, ValueError):
+            self._clear_autosave()
+            return
+        caption = (data.get("caption") or "").strip()
+        what = []
+        if data.get("source"):
+            what.append(os.path.basename(data["source"]))
+        if caption:
+            what.append(f"a {len(caption.split()):,}-word caption")
+        if not messagebox.askyesno(
+                "Restore your work?",
+                "Caption Creator didn't close normally last time.\n\n"
+                f"Restore your work from {when}"
+                + (f" ({' and '.join(what)})" if what else "") + "?"):
+            self._clear_autosave()
+            return
+        log.info("AUTOSAVE_RESTORE")
+        source = data.get("source") or ""
+        if source and os.path.isfile(source):
+            self._open_project(path, remember=False)
+        else:
+            self._apply_project(data)
+            if source:
+                messagebox.showinfo("Restore", f"The image wasn't found:\n{source}\n\n"
+                                               "Your caption and settings were restored.")
+        # It's a recovered session, not the autosave file itself.
+        self._project_path = data.get("autosave_of")
+        self._update_title()
+
+    def _show_whats_new(self, force: bool = False) -> None:
+        """The release notes for this version, shown once after an update
+        (not on a fresh install), and from Settings any time."""
+        version = _app_version()
+        seen = recent_store.get_setting("last_seen_version")
+        if not force:
+            if seen == version:
+                return
+            recent_store.set_setting("last_seen_version", version)
+            existing_user = seen is not None or any(
+                recent_store.get(k) for k in ("files", "projects", "searches"))
+            if not existing_user or version not in _WHATS_NEW:
+                return
+        notes = _WHATS_NEW.get(version) or _WHATS_NEW[max(_WHATS_NEW, key=_version_key)]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"What's new in Caption Creator {version}")
+        dlg.transient(self.root)
+        dlg.geometry("640x560")
+        body = ttk.Frame(dlg, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"What's new in {version}", style="Heading.TLabel").pack(anchor="w")
+        frame = ttk.Frame(body)
+        frame.pack(fill="both", expand=True, pady=(10, 10))
+        box = tk.Text(frame, wrap="word", relief="flat", padx=10, pady=8, cursor="arrow",
+                      font=("Segoe UI", 10), spacing1=2, spacing3=4)
+        sb = ttk.Scrollbar(frame, command=box.yview)
+        box.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+        box.tag_configure("h", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=4)
+        box.tag_configure("b", lmargin1=8, lmargin2=24)
+        box.tag_configure("name", font=("Segoe UI", 10, "bold"))
+        for section, items in notes:
+            box.insert("end", section + "\n", "h")
+            for name, text in items:
+                box.insert("end", "•  ", "b")
+                box.insert("end", name, ("b", "name"))
+                box.insert("end", f" — {text}\n", "b")
+        box.config(state="disabled")
+        ttk.Button(body, text="Got it", style="Accent.TButton", command=dlg.destroy).pack(
+            anchor="e")
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _startup_checks(self) -> None:
+        """After the window is up: offer an autosaved session, then show
+        what's new after an update, then start autosaving."""
+        try:
+            self._offer_autosave_restore()
+        except Exception:
+            log.exception("AUTOSAVE_RESTORE_ERROR")
+        try:
+            self._show_whats_new()
+        except Exception:
+            log.exception("WHATS_NEW_ERROR")
+        self._autosave_job = self.root.after(self._AUTOSAVE_SECONDS * 1000, self._autosave_tick)
 
     def _fit_to_da_limit(self) -> None:
         """Find the highest-quality output settings whose GIF fits under
@@ -9015,8 +9228,9 @@ def main() -> None:
     if not _confirm_adult(root):
         root.destroy()
         return
-    CaptionApp(root)
+    app = CaptionApp(root)
     root.deiconify()
+    root.after(700, app._startup_checks)
     root.mainloop()
 
 
