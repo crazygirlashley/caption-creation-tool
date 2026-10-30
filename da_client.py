@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -24,6 +25,7 @@ _DA_AUTH_URL = "https://www.deviantart.com/oauth2/authorize"
 _DA_TOKEN_URL = "https://www.deviantart.com/oauth2/token"
 _DA_SUBMIT_URL = "https://www.deviantart.com/api/v1/oauth2/stash/submit"
 _DA_PUBLISH_URL = "https://www.deviantart.com/api/v1/oauth2/stash/publish"
+_DA_FOLDERS_URL = "https://www.deviantart.com/api/v1/oauth2/gallery/folders"
 
 _UA = "CaptionCreator/1.0"
 
@@ -208,7 +210,7 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": "stash publish",
+        "scope": "stash publish browse",
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -298,9 +300,38 @@ def da_has_cached_token() -> bool:
     return bool(tokens and time.time() < tokens.get("expires_at", 0))
 
 
+class StashId(str):
+    """A Sta.sh stackid (it's a str, as before) that also carries the
+    submission's itemid — /stash/publish is documented as taking itemid."""
+    itemid: Optional[str] = None
+
+
+_TAG_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def clean_tags(text) -> list:
+    """DeviantArt tags: letters, numbers and underscores only. Accepts a
+    comma/space separated string or a list; drops duplicates and blanks."""
+    if isinstance(text, (list, tuple)):
+        parts = list(text)
+    elif re.search(r"[,#\n]", text or ""):
+        # "pink pill, sissy" -> pink_pill, sissy
+        parts = [re.sub(r"\s+", "_", p.strip()) for p in re.split(r"[,#\n]+", text)]
+    else:
+        parts = (text or "").split()   # space-separated, like DeviantArt's own tag box
+    seen, out = set(), []
+    for p in parts:
+        tag = _TAG_RE.sub("", str(p).replace("-", "_"))[:50]
+        if tag and tag.lower() not in seen:
+            seen.add(tag.lower())
+            out.append(tag)
+    return out[:30]
+
+
 def da_stash_submit(access_token: str, file_path: str, title: str,
-                     artist_comments: str = "") -> str:
-    """Upload file to Sta.sh as a private submission. Returns stackid string."""
+                     artist_comments: str = "", tags: Optional[list] = None) -> str:
+    """Upload file to Sta.sh as a private submission. Returns the stackid (a
+    StashId, whose .itemid is the submission's itemid)."""
     file_size = os.path.getsize(file_path)
     log.info("Uploading %s (%.1f KB) to Sta.sh as '%s'...",
              os.path.basename(file_path), file_size / 1024, title or "Caption Creator Upload")
@@ -309,9 +340,10 @@ def da_stash_submit(access_token: str, file_path: str, title: str,
         "User-Agent": _UA,
         "Accept-Encoding": "gzip",
     }
-    data = {"title": title or "Caption Creator Upload"}
+    data: list = [("title", title or "Caption Creator Upload")]
     if artist_comments:
-        data["artist_comments"] = artist_comments
+        data.append(("artist_comments", artist_comments))
+    data += [("tags[]", t) for t in clean_tags(tags or [])]
     delay = 1.0
     for attempt in range(3):
         log.info("Sta.sh submit attempt %d/3...", attempt + 1)
@@ -342,13 +374,14 @@ def da_stash_submit(access_token: str, file_path: str, title: str,
             log.error("HTTP %d error from Sta.sh: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
         try:
-            data = resp.json()
+            result = resp.json()
         except Exception:
             log.error("Non-JSON response from Sta.sh: %s", resp.text[:300])
             raise RuntimeError(f"Unexpected response from Sta.sh (HTTP {resp.status_code})")
-        if data.get("status") != "success":
-            log.error("Sta.sh returned non-success: %s", data)
-            raise RuntimeError(f"Sta.sh submit error: {data}")
+        if result.get("status") != "success":
+            log.error("Sta.sh returned non-success: %s", result)
+            raise RuntimeError(f"Sta.sh submit error: {result}")
+        data = result
         # Only "status" and "itemid" are guaranteed by the API — "stackid" is optional,
         # but we need it to publish, so fail clearly rather than KeyError-ing.
         if "stackid" not in data:
@@ -358,12 +391,63 @@ def da_stash_submit(access_token: str, file_path: str, title: str,
                 "stackid, so it can't be published."
             )
         log.info("Upload successful — itemid=%s  stackid=%s", data.get("itemid"), data["stackid"])
-        return str(data["stackid"])
+        out = StashId(str(data["stackid"]))
+        out.itemid = str(data["itemid"]) if data.get("itemid") is not None else None
+        return out
     raise RuntimeError("DeviantArt upload failed after 3 attempts (rate limited).")
 
 
-def da_stash_publish(access_token: str, stackid: str) -> str:
-    """Publish a Sta.sh item to the gallery. Returns deviation URL."""
+MATURE_LEVELS = ("strict", "moderate")
+MATURE_CLASSES = ("nudity", "sexual", "gore", "language", "ideology")
+
+
+def publish_fields(stackid: str, options: Optional[dict] = None) -> list:
+    """Form fields for /stash/publish. options (all optional):
+    mature (bool, default True — this is an adults-only app), mature_level,
+    mature_classes (list), tags (list/str), galleryids (list), ai_generated
+    (bool), allow_comments (bool)."""
+    o = dict(options or {})
+    mature = bool(o.get("mature", True))
+    fields = [("stackid", str(stackid)), ("agree_tos", "true"), ("agree_submission", "true"),
+              ("is_mature", "true" if mature else "false")]
+    itemid = getattr(stackid, "itemid", None) or o.get("itemid")
+    if itemid:
+        fields.append(("itemid", str(itemid)))
+    if mature:
+        level = o.get("mature_level", "strict")
+        fields.append(("mature_level", level if level in MATURE_LEVELS else "strict"))
+        fields += [("mature_classification[]", c) for c in o.get("mature_classes", ["sexual"])
+                   if c in MATURE_CLASSES]
+    fields += [("tags[]", t) for t in clean_tags(o.get("tags") or [])]
+    fields += [("galleryids[]", g) for g in o.get("galleryids") or [] if g]
+    if "ai_generated" in o:
+        fields.append(("is_ai_generated", "true" if o["ai_generated"] else "false"))
+    if "allow_comments" in o:
+        fields.append(("allow_comments", "true" if o["allow_comments"] else "false"))
+    return fields
+
+
+def da_gallery_folders(access_token: str) -> list:
+    """[(folderid, name)] of the logged-in user's gallery folders. Needs the
+    "browse" scope — raises requests.HTTPError (403) for an older login."""
+    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": _UA}
+    folders, offset = [], 0
+    for _page in range(10):
+        resp = requests.get(_DA_FOLDERS_URL, headers=headers, timeout=30,
+                            params={"limit": 50, "offset": offset, "calculate_size": "false"})
+        resp.raise_for_status()
+        data = resp.json()
+        folders += [(f["folderid"], f.get("name") or "Untitled")
+                    for f in data.get("results", []) if f.get("folderid")]
+        if not data.get("has_more"):
+            break
+        offset = data.get("next_offset") or offset + 50
+    return folders
+
+
+def da_stash_publish(access_token: str, stackid: str, options: Optional[dict] = None) -> str:
+    """Publish a Sta.sh item to the gallery. Returns deviation URL. Marked
+    mature unless options say otherwise — see publish_fields."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": _UA,
@@ -372,13 +456,11 @@ def da_stash_publish(access_token: str, stackid: str) -> str:
     resp = requests.post(
         _DA_PUBLISH_URL,
         headers=headers,
-        data={
-            "stackid": stackid,
-            "is_mature": "false",
-            "agree_tos": "true",
-        },
+        data=publish_fields(stackid, options),
         timeout=30,
     )
+    if resp.status_code >= 400:
+        log.error("HTTP %d from Sta.sh publish: %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
     if data.get("status") != "success":

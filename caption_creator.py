@@ -7784,27 +7784,104 @@ class CaptionApp:
 
     def _da_send_prompt(self, default_title: str, default_description: str,
                         offer_mp4: bool = False) -> Optional[tuple]:
-        """Ask for a title (required), description, and — if offer_mp4 — an
+        """Ask for a title (required), description, tags, how it's published
+        (mature rating, gallery folder, AI, comments) and — if offer_mp4 — an
         upload format before uploading to DA.
-        Returns (title, description, upload_format) where upload_format is
-        "mp4" or "gif", or None if the user cancelled."""
+        Returns (title, description, upload_format, publish_options) where
+        upload_format is "mp4" or "gif", or None if the user cancelled.
+        publish_options is what da_client.da_stash_publish takes."""
+        saved = recent_store.get_setting("da_publish", {}) or {}
         dlg = tk.Toplevel(self.root)
         dlg.title("Send to DeviantArt")
         dlg.resizable(False, False)
         dlg.grab_set()
 
         ttk.Label(dlg, text="Title:", padding=(12, 12, 12, 2)).pack(anchor="w")
-        title_entry = ttk.Entry(dlg, width=40)
+        title_entry = ttk.Entry(dlg, width=52)
         title_entry.insert(0, default_title)
         title_entry.pack(padx=12, pady=(0, 8), fill="x")
         title_entry.focus_set()
         title_entry.icursor("end")
 
         ttk.Label(dlg, text="Description:", padding=(12, 0, 12, 2)).pack(anchor="w")
-        desc_box = tk.Text(dlg, width=40, height=6, wrap="word", relief="solid", bd=1,
+        desc_box = tk.Text(dlg, width=52, height=8, wrap="word", relief="solid", bd=1,
                            padx=4, pady=4)
         desc_box.insert("1.0", default_description)
-        desc_box.pack(padx=12, pady=(0, 10), fill="both", expand=True)
+        desc_box.pack(padx=12, pady=(0, 8), fill="both", expand=True)
+
+        ttk.Label(dlg, text="Tags (separate with commas or spaces):",
+                  padding=(12, 0, 12, 2)).pack(anchor="w")
+        tags_var = tk.StringVar(value=getattr(self, "_da_last_tags", ""))
+        ttk.Entry(dlg, textvariable=tags_var, width=52).pack(padx=12, pady=(0, 8), fill="x")
+
+        # Mature content — on by default: everything this app makes is for
+        # adults, and DeviantArt requires adult work to be marked mature.
+        mature = ttk.LabelFrame(dlg, text="Mature content", padding=(10, 6))
+        mature.pack(fill="x", padx=12, pady=(0, 8))
+        mature_var = tk.BooleanVar(value=saved.get("mature", True))
+        level_var = tk.StringVar(value=saved.get("mature_level", "strict"))
+        class_vars = {c: tk.BooleanVar(value=c in saved.get("mature_classes", ["sexual"]))
+                      for c in da_client.MATURE_CLASSES[:3] + ("language",)}
+        row = ttk.Frame(mature)
+        row.pack(fill="x")
+        ttk.Checkbutton(row, text="Mark as mature", variable=mature_var).pack(side="left")
+        ttk.Radiobutton(row, text="Strict", variable=level_var, value="strict").pack(
+            side="left", padx=(14, 4))
+        ttk.Radiobutton(row, text="Moderate", variable=level_var, value="moderate").pack(
+            side="left")
+        row = ttk.Frame(mature)
+        row.pack(fill="x", pady=(4, 0))
+        labels = {"nudity": "Nudity", "sexual": "Sexual themes", "gore": "Violence / gore",
+                  "language": "Strong language"}
+        for c, var in class_vars.items():
+            ttk.Checkbutton(row, text=labels[c], variable=var).pack(side="left", padx=(0, 8))
+
+        more = ttk.Frame(dlg)
+        more.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(more, text="Gallery folder:").pack(side="left")
+        folder_var = tk.StringVar(value="Featured (default)")
+        folder_combo = ttk.Combobox(more, textvariable=folder_var, state="readonly", width=26,
+                                    values=["Featured (default)"])
+        folder_combo.pack(side="left", padx=6)
+        folder_note = ttk.Label(more, text="loading…", style="Muted.TLabel")
+        folder_note.pack(side="left")
+        folder_ids: dict = {}
+        flags = ttk.Frame(dlg)
+        flags.pack(fill="x", padx=12, pady=(0, 8))
+        ai_var = tk.BooleanVar(value=saved.get("ai_generated", False))
+        comments_var = tk.BooleanVar(value=saved.get("allow_comments", True))
+        ttk.Checkbutton(flags, text="Image is AI-generated", variable=ai_var).pack(side="left")
+        ttk.Checkbutton(flags, text="Allow comments", variable=comments_var).pack(
+            side="left", padx=(14, 0))
+
+        def load_folders() -> None:
+            try:
+                client_id = da_client.load_client_id()
+                token = da_client.da_ensure_silent_token(client_id) if client_id else None
+                folders = da_client.da_gallery_folders(token) if token else None
+                note = "" if folders is not None else "(log in to DA to choose)"
+            except Exception as e:
+                log.info("DA_FOLDERS_UNAVAILABLE  %s", e)
+                folders, note = None, "(log in to DA again to choose)"
+            self.root.after(0, lambda: show_folders(folders or [], note))
+
+        def show_folders(folders: list, note: str) -> None:
+            if not dlg.winfo_exists():
+                return
+            folder_ids.clear()
+            names = ["Featured (default)"]
+            for fid, name in folders:
+                if name.lower() == "featured":
+                    continue
+                label = name if name not in folder_ids else f"{name} ({fid[:6]})"
+                folder_ids[label] = fid
+                names.append(label)
+            folder_combo.config(values=names)
+            if saved.get("folder") in folder_ids:
+                folder_var.set(saved["folder"])
+            folder_note.config(text=note)
+
+        threading.Thread(target=load_folders, daemon=True).start()
 
         fmt_var = tk.StringVar(value="mp4" if offer_mp4 else "gif")
         if offer_mp4:
@@ -7824,7 +7901,21 @@ class CaptionApp:
                 messagebox.showwarning("Title Required", "Please enter a title.", parent=dlg)
                 return
             description = desc_box.get("1.0", "end-1c").strip()
-            result[0] = (title, description, fmt_var.get())
+            folder = folder_var.get()
+            options = {
+                "mature": mature_var.get(),
+                "mature_level": level_var.get(),
+                "mature_classes": [c for c, v in class_vars.items() if v.get()],
+                "tags": da_client.clean_tags(tags_var.get()),
+                "galleryids": [folder_ids[folder]] if folder in folder_ids else [],
+                "ai_generated": ai_var.get(),
+                "allow_comments": comments_var.get(),
+            }
+            self._da_last_tags = tags_var.get()
+            recent_store.set_setting("da_publish", {
+                k: options[k] for k in ("mature", "mature_level", "mature_classes",
+                                        "ai_generated", "allow_comments")} | {"folder": folder})
+            result[0] = (title, description, fmt_var.get(), options)
             dlg.destroy()
 
         btn_row = ttk.Frame(dlg)
@@ -7873,7 +7964,7 @@ class CaptionApp:
                                       raw_text, offer_mp4=self._is_video)
         if prompt is None:
             return
-        title, description, upload_format = prompt
+        title, description, upload_format, self._da_pub_options = prompt
 
         self._da_in_progress = True
 
@@ -7976,8 +8067,9 @@ class CaptionApp:
                 return
 
             try:
-                stackid = da_client.da_stash_submit(token, tmp_path, title,
-                                                     artist_comments=description)
+                stackid = da_client.da_stash_submit(
+                    token, tmp_path, title, artist_comments=description,
+                    tags=(getattr(self, "_da_pub_options", None) or {}).get("tags"))
                 self.root.after(0, lambda: self._da_upload_done(stackid, token, tmp_path))
             except Exception as exc:
                 log.exception("DA_UPLOAD_ERROR")
@@ -8000,6 +8092,24 @@ class CaptionApp:
         dlg.grab_set()
         ttk.Label(dlg, text="Saved to Sta.sh — your DeviantArt account's private storage area.",
                   padding=(16, 16, 16, 8)).pack()
+        options = dict(getattr(self, "_da_pub_options", None) or {"mature": True})
+        if options.get("mature", True):
+            classes = ", ".join(options.get("mature_classes") or []) or "no classification"
+            rating = f"Mature ({options.get('mature_level', 'strict')}: {classes})"
+        else:
+            rating = "NOT marked mature"
+        details = [rating]
+        if options.get("galleryids"):
+            details.append("in your chosen gallery folder")
+        if options.get("tags"):
+            details.append(f"{len(options['tags'])} tags")
+        if options.get("ai_generated"):
+            details.append("AI-generated")
+        rating_lbl = ttk.Label(dlg, text="Publishing will post it as: " + " · ".join(details),
+                               padding=(16, 0, 16, 6))
+        if not options.get("mature", True):
+            rating_lbl.config(foreground="#c0392b")
+        rating_lbl.pack()
 
         pub_status = ttk.Label(dlg, text="", foreground="#555", padding=(16, 0, 16, 4))
         pub_status.pack()
@@ -8011,7 +8121,7 @@ class CaptionApp:
 
             def _do():
                 try:
-                    url = da_client.da_stash_publish(token, stackid)
+                    url = da_client.da_stash_publish(token, stackid, options)
                     self.root.after(0, lambda u=url: _publish_done(u))
                 except Exception as exc:
                     self.root.after(0, lambda e=exc: _publish_fail(str(e)))
