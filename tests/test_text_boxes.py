@@ -90,6 +90,55 @@ class TextBoxTests(unittest.TestCase):
         self.assertEqual(size, 20)    # no Auto-fit search without a panel
         self.assertEqual(cc._words_that_fit("a b c", raw), 3)
 
+    def test_speech_bubble_reaches_its_tail(self):
+        frame = Image.new("RGBA", (1280, 720), BLUE)
+        box = _box(text="Hi", shape="speech", bg="#ffffff", tail_x=0.5, tail_y=0.8,
+                   border=0, color="#000000")
+        img = cc.build_composite(frame, **_kw(text_boxes=[box])).convert("RGB")
+        g = cc._tb_layout(box, 1280, 720, 1.0)
+        # Near the tip (just above it, toward the bubble) is bubble-white.
+        tip_x, tip_y = 640, 576
+        cx, cy = g["x"] + g["w"] / 2, g["y"] + g["h"] / 2
+        px, py = tip_x + (cx - tip_x) * 0.1, tip_y + (cy - tip_y) * 0.1
+        r, g_, _b = img.getpixel((round(px), round(py)))
+        self.assertTrue(r > 230 and g_ > 230, (r, g_))     # bubble white (edges anti-aliased)
+        self.assertEqual(img.getpixel((20, 700)), (0, 0, 255))
+
+    def test_thought_bubble_and_border(self):
+        frame = Image.new("RGBA", (1280, 720), BLUE)
+        box = _box(text="Hmm", shape="thought", bg="#ffffff", border=3,
+                   border_color="#ff0000", color="#000000")
+        img = cc.build_composite(frame, **_kw(text_boxes=[box])).convert("RGB")
+        colors = {c for _n, c in img.getcolors(1_000_000)}
+        self.assertIn((255, 255, 255), colors)
+        self.assertTrue(any(r > 200 and g < 60 and b < 60 for r, g, b in colors))   # border
+
+    def test_gradient_text_uses_both_colors(self):
+        frame = Image.new("RGBA", (1280, 720), (128, 128, 128, 255))
+        box = _box(text="GRADIENT TEXT\nSECOND LINE", bg="", size=60, color="#ff0000",
+                   color2="#0000ff", w=0.8)
+        img = cc.build_composite(frame, **_kw(text_boxes=[box])).convert("RGB")
+        g = cc._tb_layout(box, 1280, 720, 1.0)
+        top = img.crop((g["x"], g["y"], g["x"] + g["w"], g["y"] + g["h"] // 3))
+        bottom = img.crop((g["x"], g["y"] + 2 * g["h"] // 3, g["x"] + g["w"], g["y"] + g["h"]))
+        reddest = max(c[0] - c[2] for _n, c in top.getcolors(1_000_000))
+        bluest = max(c[2] - c[0] for _n, c in bottom.getcolors(1_000_000))
+        self.assertGreater(reddest, 120)
+        self.assertGreater(bluest, 120)
+
+    def test_rotated_box_still_renders_in_place(self):
+        frame = Image.new("RGBA", (1280, 720), BLUE)
+        flat = cc.build_composite(frame, **_kw(text_boxes=[_box(text="")]))
+        tilted = cc.build_composite(frame, **_kw(text_boxes=[_box(text="", angle=20)]))
+        self.assertEqual(tilted.size, flat.size)
+        self.assertNotEqual(flat.tobytes(), tilted.tobytes())
+        g = cc._tb_layout(_box(text=""), 1280, 720, 1.0)
+        center = (g["x"] + g["w"] // 2, g["y"] + g["h"] // 2)
+        self.assertEqual(tilted.convert("RGB").getpixel(center), (255, 0, 0))
+
+    def test_short_hex_colors(self):
+        self.assertEqual(cc._hex_to_rgb("#f0c"), (255, 0, 204))
+
     def test_other_layouts_ignore_text_boxes(self):
         frame = Image.new("RGBA", (1000, 720), BLUE)
         a = cc.build_composite(frame, **_kw(layout="horizontal", text="x"))

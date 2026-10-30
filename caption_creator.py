@@ -524,7 +524,9 @@ _WM_POS_LABEL = {code: label for label, code in _WM_POSITIONS}
 
 
 def _hex_to_rgb(color: str) -> tuple:
-    h = color.lstrip("#")
+    h = color.strip().lstrip("#")
+    if len(h) == 3:              # "#f0c" shorthand (hand-edited formats/projects)
+        h = "".join(c * 2 for c in h)
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
@@ -1717,7 +1719,13 @@ _TB_DEFAULT = {
     "font": "Arial", "size": 28.0, "bold": False, "color": "#ffffff", "align": "center",
     "outline": 2, "outline_color": "#000000",
     "bg": "", "bg_opacity": 0.85, "padding": 8, "radius": 8, "shadow": False,
+    # Speech / thought bubbles: the tail points at (tail_x, tail_y), as
+    # fractions of the picture like x/y; the bubble has its own border.
+    "shape": "box", "tail_x": None, "tail_y": None, "border": 3, "border_color": "#111111",
+    "angle": 0.0,       # degrees, counter-clockwise (plain boxes only)
+    "color2": "",       # text fades from color (top) to this (bottom)
 }
+_TB_SHAPES = ("box", "speech", "thought")
 
 
 def _tb(box: dict) -> dict:
@@ -1741,6 +1749,84 @@ def _tb_layout(box: dict, fw: int, fh: int, k: float, markup: bool = False,
             "size": size, "pad": pad, "stroke": stroke}
 
 
+def _tb_tip(box: dict, g: dict, fw: int, fh: int) -> tuple:
+    """Where a bubble's tail points, in picture pixels (default: below the
+    box, toward its left third)."""
+    b = _tb(box)
+    if b["tail_x"] is not None and b["tail_y"] is not None:
+        return float(b["tail_x"]) * fw, float(b["tail_y"]) * fh
+    return g["x"] + g["w"] * 0.3, g["y"] + g["h"] + max(24.0, g["h"] * 1.5)
+
+
+def _bubble_geometry(shape: str, g: dict) -> dict:
+    """The bubble around a text box's area: speech = a rounded "stadium",
+    thought = a cloud (an ellipse ringed with bumps)."""
+    x, y, w, h = g["x"], g["y"], g["w"], g["h"]
+    cx, cy = x + w / 2, y + h / 2
+    if shape == "speech":
+        ex, ey = h * 0.32, h * 0.12
+        return {"cx": cx, "cy": cy, "rect": (x - ex, y - ey, x + w + ex, y + h + ey),
+                "reach": 0.0}
+    a, bb = w / 2 * 1.12 + h * 0.3, h * 0.82
+    r = h * 0.3
+    return {"cx": cx, "cy": cy, "a": a, "b": bb, "r": r, "reach": r,
+            "rect": (cx - a, cy - bb, cx + a, cy + bb)}
+
+
+def _bubble_masks(size: tuple, origin: tuple, shape: str, geo: dict, tip: tuple,
+                  border: int) -> tuple:
+    """(fill mask, border ring mask) of a bubble on a layer of `size` whose
+    top-left is at `origin` (picture px). Drawn at 2x for smooth edges."""
+    ss = 2
+    W, H = size
+    m = Image.new("L", (W * ss, H * ss), 0)
+    d = ImageDraw.Draw(m)
+    ox, oy = origin
+
+    def p(px, py):
+        return ((px - ox) * ss, (py - oy) * ss)
+
+    cx, cy = p(geo["cx"], geo["cy"])
+    tx, ty = p(*tip)
+    x0, y0 = p(*geo["rect"][:2])
+    x1, y1 = p(*geo["rect"][2:])
+    if shape == "speech":
+        d.rounded_rectangle((x0, y0, x1, y1), radius=(y1 - y0) / 2, fill=255)
+        dx, dy = tx - cx, ty - cy
+        dist = math.hypot(dx, dy) or 1.0
+        half = min(x1 - x0, y1 - y0) * 0.2
+        nx, ny = -dy / dist * half, dx / dist * half
+        d.polygon([(cx + nx, cy + ny), (cx - nx, cy - ny), (tx, ty)], fill=255)
+    else:
+        a, bb, r = geo["a"] * ss, geo["b"] * ss, geo["r"] * ss
+        d.ellipse((cx - a, cy - bb, cx + a, cy + bb), fill=255)
+        n = max(8, int(2 * math.pi * math.sqrt((a * a + bb * bb) / 2) / (r * 1.35)))
+        for i in range(n):
+            t = 2 * math.pi * i / n
+            px, py = cx + a * math.cos(t), cy + bb * math.sin(t)
+            d.ellipse((px - r, py - r, px + r, py + r), fill=255)
+        # The little trail of puffs from the cloud's edge to the thinker.
+        h = (y1 - y0) / 1.64
+        ex, ey = cx, cy
+        for i in range(1, 101):                   # walk out to the cloud's edge
+            px, py = cx + (tx - cx) * i / 100, cy + (ty - cy) * i / 100
+            if not (0 <= px < m.width and 0 <= py < m.height) or not m.getpixel((int(px), int(py))):
+                ex, ey = px, py
+                break
+        else:
+            ex, ey = tx, ty                       # tail point is inside the cloud
+        for t, rr in ((0.18, 0.3), (0.52, 0.2), (0.85, 0.12)):
+            px, py = ex + (tx - ex) * t, ey + (ty - ey) * t
+            rad = h * rr
+            d.ellipse((px - rad, py - rad, px + rad, py + rad), fill=255)
+    fill = m.resize(size, Image.LANCZOS)
+    if border <= 0:
+        return fill, None
+    grown = m.filter(ImageFilter.BoxBlur(border * ss)).point(lambda v: 255 if v > 0 else 0)
+    ring = ImageChops.subtract(grown.resize(size, Image.LANCZOS), fill)
+    return fill, ring
+
+
 def _draw_text_boxes(out: Image.Image, boxes: list, origin: tuple, fw: int, fh: int, k: float,
                      markup: bool = False, dialogue_color: str = "") -> None:
     """Draw text boxes (first = bottom) onto out, over the fw x fh picture
@@ -1748,32 +1834,88 @@ def _draw_text_boxes(out: Image.Image, boxes: list, origin: tuple, fw: int, fh: 
     ox, oy = origin
     for box in boxes:
         b = _tb(box)
-        if not str(b["text"]).strip() and not b["bg"]:
+        shape = b["shape"] if b["shape"] in _TB_SHAPES else "box"
+        bubble = shape != "box"
+        if not str(b["text"]).strip() and not b["bg"] and not bubble:
             continue
         g = _tb_layout(b, fw, fh, k, markup)
         margin = g["stroke"] + round(8 * k) + 4    # room for the outline and shadow
-        layer = Image.new("RGBA", (g["w"] + margin * 2, g["h"] + margin * 2), (0, 0, 0, 0))
-        if b["bg"]:
-            alpha = round(255 * max(0.0, min(1.0, float(b["bg_opacity"]))))
+        border = (max(1, round(float(b["border"]) * k))
+                  if bubble and float(b["border"] or 0) > 0 else 0)
+        if bubble:
+            geo = _bubble_geometry(shape, g)
+            tip = _tb_tip(b, g, fw, fh)
+            rx0, ry0, rx1, ry1 = geo["rect"]
+            reach = geo["reach"] + border + margin
+            lx0 = int(min(rx0 - reach, tip[0] - margin))
+            ly0 = int(min(ry0 - reach, tip[1] - margin))
+            lx1 = int(math.ceil(max(rx1 + reach, tip[0] + margin)))
+            ly1 = int(math.ceil(max(ry1 + reach, tip[1] + margin)))
+        else:
+            lx0, ly0 = g["x"] - margin, g["y"] - margin
+            lx1, ly1 = g["x"] + g["w"] + margin, g["y"] + g["h"] + margin
+        size = (max(1, lx1 - lx0), max(1, ly1 - ly0))
+        tx, ty = g["x"] - lx0, g["y"] - ly0          # the text area, in the layer
+        layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        alpha = max(0.0, min(1.0, float(b["bg_opacity"])))
+        if bubble:
+            fill, ring = _bubble_masks(size, (lx0, ly0), shape, geo, tip, border)
+            if b["shadow"]:
+                sh = ImageChops.lighter(fill, ring) if ring is not None else fill
+                sh_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+                sh_layer.putalpha(sh.point(lambda v: v * 0.35))
+                sh_layer = sh_layer.filter(ImageFilter.GaussianBlur(3 * k))
+                layer.alpha_composite(sh_layer, (min(size[0] - 1, max(1, round(3 * k))),
+                                                 min(size[1] - 1, max(1, round(4 * k)))))
+            body = Image.new("RGBA", size, _hex_to_rgb(b["bg"] or "#ffffff") + (0,))
+            body.putalpha(fill.point(lambda v: round(v * alpha)))
+            layer.alpha_composite(body)
+            if ring is not None:
+                edge = Image.new("RGBA", size, _hex_to_rgb(b["border_color"]) + (0,))
+                edge.putalpha(ring)
+                layer.alpha_composite(edge)
+        elif b["bg"]:
             ImageDraw.Draw(layer).rounded_rectangle(
-                (margin, margin, margin + g["w"] - 1, margin + g["h"] - 1),
-                radius=round(float(b["radius"]) * k), fill=_hex_to_rgb(b["bg"]) + (alpha,))
+                (tx, ty, tx + g["w"] - 1, ty + g["h"] - 1),
+                radius=round(float(b["radius"]) * k),
+                fill=_hex_to_rgb(b["bg"]) + (round(255 * alpha),))
         shadow_draw = None
-        if b["shadow"]:
-            shadow = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        if b["shadow"] and not bubble:
+            shadow = Image.new("RGBA", size, (0, 0, 0, 0))
             shadow_draw = ImageDraw.Draw(shadow)
-        text_layer = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-        _draw_text_block(ImageDraw.Draw(text_layer), margin, margin, g["w"], g["h"],
-                         str(b["text"]), b["font"], g["size"], b["color"], g["pad"],
-                         g["stroke"], b["outline_color"], b["bold"], shadow_draw,
-                         shadow_offset=(max(1, round(2 * k)), max(1, round(3 * k))),
-                         align=b["align"], markup=markup, dialogue_color=dialogue_color)
+        text_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        text_args = (str(b["text"]), b["font"], g["size"])
+        text_kw = dict(shadow_offset=(max(1, round(2 * k)), max(1, round(3 * k))),
+                       align=b["align"], markup=markup, dialogue_color=dialogue_color)
+        _draw_text_block(ImageDraw.Draw(text_layer), tx, ty, g["w"], g["h"], *text_args,
+                         b["color"], g["pad"], g["stroke"], b["outline_color"], b["bold"],
+                         shadow_draw, **text_kw)
+        if b["color2"]:
+            # Gradient text: tint just the letters (not their outline) from
+            # color at the top of the box to color2 at the bottom.
+            mask_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+            _draw_text_block(ImageDraw.Draw(mask_layer), tx, ty, g["w"], g["h"], *text_args,
+                             "#ffffff", g["pad"], g["stroke"], "#000000", b["bold"], None,
+                             **dict(text_kw, dialogue_color=""))
+            letters = ImageChops.multiply(mask_layer.getchannel("R"), mask_layer.getchannel("A"))
+            c1, c2 = np.array(_hex_to_rgb(b["color"]), float), np.array(_hex_to_rgb(b["color2"]), float)
+            t = np.clip((np.arange(size[1]) - ty) / max(1, g["h"]), 0, 1)[:, None]
+            ramp = (c1 + (c2 - c1) * t).astype(np.uint8)[:, None, :].repeat(size[0], axis=1)
+            grad = Image.fromarray(ramp, "RGB").convert("RGBA")
+            grad.putalpha(letters)
+            text_layer.alpha_composite(grad)
         if shadow_draw is not None:
             layer.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(3 * k)))
         layer.alpha_composite(text_layer)
+        angle = float(b["angle"] or 0)
+        if not bubble and abs(angle) > 0.05:
+            w0, h0 = layer.size
+            layer = layer.rotate(angle, resample=Image.BICUBIC, expand=True)
+            lx0 -= (layer.width - w0) // 2
+            ly0 -= (layer.height - h0) // 2
         # Composite just the box's own area (clipped to the picture), rather
         # than a full-size layer per box — this runs on every drag step.
-        lx, ly = ox + g["x"] - margin, oy + g["y"] - margin
+        lx, ly = ox + lx0, oy + ly0
         sx, sy = max(0, -lx), max(0, -ly)
         if sx < layer.width and sy < layer.height and lx < out.width and ly < out.height:
             out.alpha_composite(layer, (max(0, lx), max(0, ly)), (sx, sy))
@@ -2776,6 +2918,9 @@ class CaptionApp:
             self._canvas.tag_bind(tag, "<Double-Button-1>", self._tb_double_click)
         self._canvas.bind("<ButtonRelease-1>", self._tb_release, add="+")
         self._canvas.bind("<Key>", self._tb_key)
+        for seq, fn in (("<Control-z>", self._tb_undo), ("<Control-y>", self._tb_redo),
+                        ("<Control-Z>", self._tb_redo)):
+            self._canvas.bind(seq, fn)
         self._canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self._build_editor_view()  # needs the builder's caption box to exist
         self._build_builder_view()
@@ -3658,6 +3803,13 @@ class CaptionApp:
                 "Bring forward").pack(side="left", expand=True, fill="x")
         tooltip(ttk.Button(order, text="▼", width=4, command=lambda: self._tb_reorder(-1)),
                 "Send backward").pack(side="left", expand=True, fill="x")
+        history = ttk.Frame(btns)
+        history.grid(row=4, column=0, sticky="ew", pady=1)
+        tooltip(ttk.Button(history, text="↶", width=4, command=self._tb_undo),
+                "Undo a box change (Ctrl+Z on the preview)").pack(side="left", expand=True,
+                                                                 fill="x")
+        tooltip(ttk.Button(history, text="↷", width=4, command=self._tb_redo),
+                "Redo (Ctrl+Y on the preview)").pack(side="left", expand=True, fill="x")
 
         self._tb_text = tk.Text(f, height=4, width=22, wrap="word", relief="solid", bd=1,
                                 padx=4, pady=4, undo=True)
@@ -3672,9 +3824,23 @@ class CaptionApp:
             "outline": tk.DoubleVar(value=2), "bg_on": tk.BooleanVar(value=False),
             "bg_opacity": tk.IntVar(value=85), "padding": tk.IntVar(value=8),
             "shadow": tk.BooleanVar(value=False), "w": tk.IntVar(value=84),
+            "shape": tk.StringVar(value="Box"), "angle": tk.DoubleVar(value=0),
+            "grad_on": tk.BooleanVar(value=False), "border": tk.DoubleVar(value=3),
         }
         v = self._tb_vars
         r = 2
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(row, text="Shape:").pack(side="left")
+        ttk.Combobox(row, textvariable=v["shape"], state="readonly", width=13,
+                     values=list(self._TB_SHAPE_LABELS.values())).pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="Rotate:").pack(side="left")
+        self._tb_angle_spin = tooltip(ttk.Spinbox(row, from_=-180, to=180, increment=1, width=5,
+                                                  textvariable=v["angle"]),
+                                      "Degrees (plain boxes)")
+        self._tb_angle_spin.pack(side="left", padx=(4, 0))
+        ttk.Label(row, text="°").pack(side="left")
+        r += 1
         ttk.Label(f, text="Font:").grid(row=r, column=0, sticky="w", pady=3)
         font_combo = ttk.Combobox(f, textvariable=v["font"], values=_font_list(), width=18)
         font_combo.grid(row=r, column=1, sticky="ew", padx=6)
@@ -3691,6 +3857,12 @@ class CaptionApp:
         self._tb_color_btn = tk.Button(row, width=3, relief="groove",
                                        command=lambda: self._tb_pick_color("color"))
         self._tb_color_btn.pack(side="left")
+        tooltip(ttk.Checkbutton(row, text="→", variable=v["grad_on"]),
+                "Gradient: the text fades to a second color, top to bottom").pack(
+            side="left", padx=(6, 2))
+        self._tb_color2_btn = tk.Button(row, width=3, relief="groove",
+                                        command=lambda: self._tb_pick_color("color2"))
+        self._tb_color2_btn.pack(side="left")
         r += 1
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
@@ -3711,10 +3883,17 @@ class CaptionApp:
         r += 1
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Checkbutton(row, text="Box behind text", variable=v["bg_on"]).pack(side="left")
+        self._tb_bg_check = ttk.Checkbutton(row, text="Box behind text", variable=v["bg_on"])
+        self._tb_bg_check.pack(side="left")
         self._tb_bg_btn = tk.Button(row, width=3, relief="groove",
                                     command=lambda: self._tb_pick_color("bg"))
-        self._tb_bg_btn.pack(side="left", padx=(4, 6))
+        self._tb_bg_btn.pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="Border:").pack(side="left")
+        tooltip(ttk.Spinbox(row, from_=0, to=20, increment=1, width=3, textvariable=v["border"]),
+                "Bubble border width").pack(side="left", padx=(4, 4))
+        self._tb_border_btn = tk.Button(row, width=3, relief="groove",
+                                        command=lambda: self._tb_pick_color("border_color"))
+        self._tb_border_btn.pack(side="left")
         r += 1
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=3)
@@ -3737,16 +3916,21 @@ class CaptionApp:
         ttk.Spinbox(row, from_=0, to=100, width=4, textvariable=v["padding"]).pack(
             side="left", padx=(4, 0))
         r += 1
-        ttk.Label(f, text="On the preview: drag a box to move it, drag its right edge\n"
-                          "to change the width, drag the corner to resize the text.\n"
-                          "Double-click the picture to add a box; Delete removes it.",
+        ttk.Label(f, text="On the preview: drag to move · right edge = width · corner = "
+                          "text size · round handle = bubble tail · double-click to add · "
+                          "Delete removes", wraplength=320, justify="left",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
                                              pady=(8, 0))
         self._tb_default_bg: Optional[str] = None   # the last box color picked
+        self._tb_undo_stack: list = []
+        self._tb_redo_stack: list = []
+        self._tb_undo_mark: Optional[tuple] = None
         for key in ("size", "bold", "align", "outline", "bg_on", "bg_opacity", "padding",
-                    "shadow", "w"):
+                    "shadow", "w", "shape", "angle", "grad_on", "border"):
             v[key].trace_add("write", lambda *_a, k=key: self._tb_on_var(k))
         self._tb_refresh_panel()
+
+    _TB_SHAPE_LABELS = {"box": "Box", "speech": "Speech bubble", "thought": "Thought bubble"}
 
     def _tb_on_var(self, key: str) -> None:
         if self._tb_loading or self._tb_sel is None:
@@ -3756,6 +3940,32 @@ class CaptionApp:
         except (tk.TclError, ValueError):
             return   # mid-typing
         box = self._text_boxes[self._tb_sel]
+        if key == "shape":
+            code = {lbl: c for c, lbl in self._TB_SHAPE_LABELS.items()}.get(value, "box")
+            if code == _tb(box)["shape"]:
+                return
+            self._tb_push_undo()
+            box["shape"] = code
+            if code != "box":
+                # A bubble reads as one: solid fill, dark text, no outline.
+                b = _tb(box)
+                box["bg"] = b["bg"] or "#ffffff"
+                box["bg_opacity"] = 1.0
+                r, g, bl = _hex_to_rgb(b["color"])
+                fr, fg, fb = _hex_to_rgb(box["bg"])
+                if abs((0.299 * r + 0.587 * g + 0.114 * bl) - (0.299 * fr + 0.587 * fg
+                                                                + 0.114 * fb)) < 100:
+                    box["color"] = "#111111"
+                box["outline"] = 0
+                box["angle"] = 0.0
+            self._tb_refresh_panel()
+            self._safe_refresh(debounce_ms=0)
+            return
+        if key == "grad_on":
+            b = _tb(box)
+            self._tb_set("color2", (b["color2"] or "#7a2cff") if value else "")
+            self._tb_refresh_panel()
+            return
         if key == "bg_on":
             if value:
                 bg = box.get("bg") or self._tb_default_bg
@@ -3780,6 +3990,7 @@ class CaptionApp:
         box = self._text_boxes[self._tb_sel]
         if box.get(key) == value:
             return
+        self._tb_push_undo(coalesce=(self._tb_sel, key))
         box[key] = value
         if key == "bg" and value:
             self._tb_default_bg = value
@@ -3792,14 +4003,12 @@ class CaptionApp:
             return
         box = _tb(self._text_boxes[self._tb_sel])
         current = box[key] or self._tb_default_bg or "#ffffff"
+        if key == "color2" and not box["color2"]:
+            current = "#7a2cff"
         picked = colorchooser.askcolor(color=current, title="Choose a color")[1]
         if not picked:
             return
         self._tb_set(key, picked)
-        if key == "bg":
-            self._tb_loading = True
-            self._tb_vars["bg_on"].set(True)
-            self._tb_loading = False
         self._tb_refresh_panel()
 
     def _tb_update_list(self) -> None:
@@ -3836,12 +4045,57 @@ class CaptionApp:
             v["padding"].set(int(b["padding"]))
             v["shadow"].set(bool(b["shadow"]))
             v["w"].set(round(float(b["w"]) * 100))
+            v["shape"].set(self._TB_SHAPE_LABELS.get(b["shape"], "Box"))
+            v["angle"].set(round(float(b["angle"] or 0), 1))
+            v["grad_on"].set(bool(b["color2"]))
+            v["border"].set(float(b["border"]))
         finally:
             self._tb_loading = False
+        bubble = b["shape"] != "box"
         self._tb_color_btn.config(bg=b["color"])
+        self._tb_color2_btn.config(bg=b["color2"] or "#7a2cff")
         self._tb_outline_btn.config(bg=b["outline_color"])
         self._tb_bg_btn.config(bg=b["bg"] or self._tb_default_bg or "#000000")
+        self._tb_border_btn.config(bg=b["border_color"])
+        self._tb_bg_check.config(text="Bubble color" if bubble else "Box behind text")
+        self._tb_angle_spin.config(state="disabled" if bubble else "normal")
         self._tb_placeholder.update()
+
+    # Undo/redo for text boxes: snapshots of the whole list, taken before a
+    # change. Quick repeats of the same change (typing, a slider, a drag)
+    # are one step.
+    def _tb_push_undo(self, coalesce: Optional[tuple] = None) -> None:
+        now = time.monotonic()
+        mark = self._tb_undo_mark
+        if coalesce is not None and mark and mark[0] == coalesce and now - mark[1] < 1.2:
+            self._tb_undo_mark = (coalesce, now)
+            return
+        self._tb_undo_mark = (coalesce, now)
+        snap = json.dumps(self._text_boxes)
+        if self._tb_undo_stack and self._tb_undo_stack[-1][0] == snap:
+            return    # e.g. a click on a box that didn't move it
+        self._tb_undo_stack.append((snap, self._tb_sel))
+        del self._tb_undo_stack[:-100]
+        self._tb_redo_stack.clear()
+
+    def _tb_restore(self, src: list, dst: list) -> None:
+        if not src:
+            return
+        dst.append((json.dumps(self._text_boxes), self._tb_sel))
+        boxes, sel = src.pop()
+        self._text_boxes = json.loads(boxes)
+        self._tb_undo_mark = None
+        self._tb_select(sel if sel is not None and sel < len(self._text_boxes) else
+                        (0 if self._text_boxes else None))
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_undo(self, _event=None) -> str:
+        self._tb_restore(self._tb_undo_stack, self._tb_redo_stack)
+        return "break"
+
+    def _tb_redo(self, _event=None) -> str:
+        self._tb_restore(self._tb_redo_stack, self._tb_undo_stack)
+        return "break"
 
     def _tb_select(self, idx: Optional[int]) -> None:
         self._tb_sel = idx if idx is not None and 0 <= idx < len(self._text_boxes) else None
@@ -3878,6 +4132,7 @@ class CaptionApp:
         return float(max(12, round(self._frames[0].size[1] * 0.05))) if self._frames else 28.0
 
     def _tb_add(self, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        self._tb_push_undo()
         self._text_boxes.append(self._tb_new_box(x, y))
         self._tb_select(len(self._text_boxes) - 1)
         self._tb_text.focus_set()
@@ -3887,6 +4142,7 @@ class CaptionApp:
     def _tb_duplicate(self) -> None:
         if self._tb_sel is None:
             return
+        self._tb_push_undo()
         box = dict(self._text_boxes[self._tb_sel])
         box["x"] = min(0.95, float(box.get("x", 0)) + 0.03)
         box["y"] = min(0.95, float(box.get("y", 0)) + 0.03)
@@ -3897,6 +4153,7 @@ class CaptionApp:
     def _tb_delete(self) -> None:
         if self._tb_sel is None:
             return
+        self._tb_push_undo()
         del self._text_boxes[self._tb_sel]
         self._tb_select(min(self._tb_sel, len(self._text_boxes) - 1)
                         if self._text_boxes else None)
@@ -3906,6 +4163,7 @@ class CaptionApp:
         i = self._tb_sel
         if i is None or not 0 <= i + delta < len(self._text_boxes):
             return
+        self._tb_push_undo()
         boxes = self._text_boxes
         boxes[i], boxes[i + delta] = boxes[i + delta], boxes[i]
         self._tb_select(i + delta)
@@ -3990,11 +4248,17 @@ class CaptionApp:
         d = self._preview_pil_img.width / out_w
         left, top = bbox[0], bbox[1]
         markup = self._markup_var.get()
-        rects = []
+        rects, tips = [], []
         for box in self._text_boxes:
             g = _tb_layout(box, out_w, out_h, k, markup)
             rects.append((left + g["x"] * d, top + g["y"] * d,
                           left + (g["x"] + g["w"]) * d, top + (g["y"] + g["h"]) * d))
+            if _tb(box)["shape"] != "box":
+                tx, ty = _tb_tip(box, g, out_w, out_h)
+                tips.append((left + tx * d, top + ty * d))
+            else:
+                tips.append(None)
+        self._tb_screen_tips = tips     # bubble tail points, for the tail handle
         return rects
 
     def _tb_draw_selection(self) -> None:
@@ -4019,6 +4283,13 @@ class CaptionApp:
                                tags=("tbsel",))                    # width handle
             c.create_rectangle(x1 - 5, y1 - 5, x1 + 5, y1 + 5, fill="white", outline=accent,
                                width=2, tags=("tbsel",))           # text-size handle
+            tip = self._tb_screen_tips[self._tb_sel]
+            if tip is not None:                                     # bubble tail handle
+                tx, ty = tip
+                c.create_line((x0 + x1) / 2, (y0 + y1) / 2, tx, ty, fill=accent, dash=(2, 3),
+                              tags=("tbsel",))
+                c.create_oval(tx - 6, ty - 6, tx + 6, ty + 6, fill=accent, outline="white",
+                              width=2, tags=("tbsel",))
         c.tag_raise("tbsel")
 
     def _tb_hit(self, x: float, y: float) -> tuple:
@@ -4028,6 +4299,9 @@ class CaptionApp:
         sel = self._tb_sel
         if sel is not None and sel < len(rects):
             x0, y0, x1, y1 = rects[sel]
+            tip = self._tb_screen_tips[sel]
+            if tip is not None and math.hypot(x - tip[0], y - tip[1]) <= 9:
+                return sel, "tail"
             if abs(x - x1) <= 8 and abs(y - y1) <= 8:
                 return sel, "size"
             if abs(x - x1) <= 6 and y0 <= y <= y1:
@@ -4051,6 +4325,7 @@ class CaptionApp:
             return False
         if idx != self._tb_sel:
             self._tb_select(idx)
+        self._tb_push_undo()
         box = self._text_boxes[idx]
         disp = self._preview_pil_img
         self._tb_drag = {"mode": mode, "x": event.x, "y": event.y,
@@ -4078,6 +4353,11 @@ class CaptionApp:
                 y = 0.5 - h_frac / 2
             box["x"] = round(max(-w + 0.02, min(0.98, x)), 4)
             box["y"] = round(max(-h_frac + 0.02, min(0.98, y)), 4)
+        elif d["mode"] == "tail":
+            bbox = self._canvas.bbox("img")
+            if bbox:
+                box["tail_x"] = round(max(-0.2, min(1.2, (event.x - bbox[0]) / d["dw"])), 4)
+                box["tail_y"] = round(max(-0.2, min(1.2, (event.y - bbox[1]) / d["dh"])), 4)
         elif d["mode"] == "width":
             x0, _y0, x1, _y1 = d["rect"]
             new_w = (x1 - x0 + dx) / d["dw"]
@@ -4125,6 +4405,7 @@ class CaptionApp:
                  "Down": ("y", step)}
         if event.keysym in moves:
             key, delta = moves[event.keysym]
+            self._tb_push_undo(coalesce=(self._tb_sel, "nudge"))
             box = self._text_boxes[self._tb_sel]
             box[key] = round(float(_tb(box)[key]) + delta, 4)
             self._safe_refresh(debounce_ms=0)
