@@ -669,6 +669,35 @@ def count_faces(img: Image.Image) -> "int | None":
     return sum(1 for f in faces if f[2] * f[3] >= min_area)
 
 
+def find_faces(img: Image.Image, min_area: float = 0.002) -> "list | None":
+    """Faces in img as (x0, y0, x1, y1) fractions of its size, largest
+    first, or None if detection isn't available. Ignores faces smaller than
+    min_area of the picture."""
+    with _face_lock:
+        det = _get_face_detector()
+        if det is None:
+            return None
+        import cv2
+        import numpy as np
+        work = img.convert("RGB")
+        work.thumbnail((640, 640))
+        arr = cv2.cvtColor(np.asarray(work), cv2.COLOR_RGB2BGR)
+        det.setInputSize((arr.shape[1], arr.shape[0]))
+        _ok, faces = det.detect(arr)
+    if faces is None:
+        return []
+    h, w = arr.shape[:2]
+    out = []
+    for f in faces:
+        x, y, fw, fh = (float(v) for v in f[:4])
+        if fw * fh < min_area * w * h:
+            continue
+        out.append((max(0.0, x / w), max(0.0, y / h), min(1.0, (x + fw) / w),
+                    min(1.0, (y + fh) / h)))
+    out.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return out
+
+
 def load_preview(item: dict, size: tuple = (130, 95)) -> tuple:
     """(thumbnail PIL image, face count or None) for a gallery item —
     downloads its small `thumb` version, cached so paging back and forth

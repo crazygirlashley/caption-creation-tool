@@ -1277,6 +1277,12 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
     )
     if layout == "overlay":
         kwargs["text_boxes"] = raw.get("text_boxes") or []
+    if raw.get("censors"):
+        kwargs["censors"] = raw["censors"]
+    if raw.get("watermark_text"):
+        kwargs.update(watermark_text=raw["watermark_text"],
+                      watermark_text_color=raw.get("watermark_text_color", "#ffffff"),
+                      watermark_text_font=raw.get("watermark_text_font", "Arial"))
     if raw.get("before_path"):
         kwargs.update(before_path=raw["before_path"], ba_layout=raw.get("ba_layout", "side"),
                       ba_labels=tuple(raw.get("ba_labels") or ("", "")),
@@ -1357,15 +1363,32 @@ def _apply_zoom(frame: Image.Image, zoom: float, pan_x: float, pan_y: float,
 _BA_FOCUS = (0.5, 0.4)   # crop the before picture a little above center (faces)
 
 
-@functools.lru_cache(maxsize=4)
-def _load_before_image(path: str, mtime: float) -> Optional[Image.Image]:
+# An animated before picture plays alongside the main one, frame for frame
+# (looping if it's shorter); up to this many of its frames are kept.
+_BEFORE_MAX_FRAMES = 300
+
+
+@functools.lru_cache(maxsize=2)
+def _load_before_frames(path: str, mtime: float) -> tuple:
     try:
         with Image.open(path) as img:
-            img.seek(0)   # a GIF's first frame
-            return img.convert("RGBA")
+            frames = []
+            for frm in ImageSequence.Iterator(img):
+                frm = frm.convert("RGBA")
+                if max(frm.size) > 1600:     # plenty for a half of the output
+                    frm.thumbnail((1600, 1600), Image.LANCZOS)
+                frames.append(frm)
+                if len(frames) >= _BEFORE_MAX_FRAMES:
+                    break
+            return tuple(frames)
     except Exception:
         log.exception("BEFORE_IMAGE_ERROR  %s", path)
-        return None
+        return ()
+
+
+def _load_before_image(path: str, mtime: float) -> Optional[Image.Image]:
+    frames = _load_before_frames(path, mtime)
+    return frames[0] if frames else None
 
 
 @functools.lru_cache(maxsize=8)
@@ -1390,7 +1413,7 @@ def _ba_frame_size(fw: int, fh: int, ba_layout: str) -> tuple:
 
 
 def _ba_combine(before_path: str, mtime: float, after: Image.Image, size: tuple,
-                ba_layout: str, gap_color: tuple, resample) -> tuple:
+                ba_layout: str, gap_color: tuple, resample, frame_index: int = 0) -> tuple:
     """(combined RGBA picture of exactly `size`, [before box, after box]).
     The after keeps its own length along the split (squeezed to half if
     needed); the gap takes up any rounding left over."""
@@ -1407,7 +1430,12 @@ def _ba_combine(before_path: str, mtime: float, after: Image.Image, size: tuple,
     if after.size != slot:
         after = after.resize(slot, resample)
     out = Image.new("RGBA", (W, H), gap_color + (255,))
-    before = _fitted_before(before_path, mtime, slot)
+    frames = _load_before_frames(before_path, mtime)
+    if len(frames) > 1:   # animated: this frame's picture, fitted fresh
+        before = ImageOps.fit(frames[frame_index % len(frames)], slot, Image.LANCZOS,
+                              centering=_BA_FOCUS)
+    else:
+        before = _fitted_before(before_path, mtime, slot)
     if before is not None:
         out.paste(before, boxes[0][:2])
     out.paste(after.convert("RGBA"), boxes[1][:2])
@@ -1459,6 +1487,86 @@ def _find_series_part(name: str, part: int, folders: list,
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     return max(found)[1] if found else None
+
+
+_CENSOR_STYLES = ("blur", "pixelate", "bar")
+
+
+def _apply_censors(frame: Image.Image, censors: list) -> Image.Image:
+    """Blur, pixelate or bar out regions of the picture. Each censor is
+    {"x", "y", "w", "h"} (fractions of the picture) plus "style" and, for
+    bars, "color". Strength scales with the region, so it looks the same at
+    any output size."""
+    if not censors:
+        return frame
+    frame = frame.copy()
+    fw, fh = frame.size
+    for c in censors:
+        x0 = max(0, round(float(c.get("x", 0)) * fw))
+        y0 = max(0, round(float(c.get("y", 0)) * fh))
+        x1 = min(fw, round((float(c.get("x", 0)) + float(c.get("w", 0))) * fw))
+        y1 = min(fh, round((float(c.get("y", 0)) + float(c.get("h", 0))) * fh))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        bw, bh = x1 - x0, y1 - y0
+        style = c.get("style", "blur")
+        if style == "bar":
+            frame.paste(_hex_to_rgb(c.get("color") or "#000000") + (255,), (x0, y0, x1, y1))
+            continue
+        # Work on a margin around the region so blur doesn't pull in black edges.
+        m = max(4, min(bw, bh) // 4)
+        box = (max(0, x0 - m), max(0, y0 - m), min(fw, x1 + m), min(fh, y1 + m))
+        region = frame.crop(box)
+        if style == "pixelate":
+            block = max(4, round(max(bw, bh) / 10))
+            small = region.resize((max(1, region.width // block), max(1, region.height // block)),
+                                  Image.BILINEAR)
+            region = small.resize(region.size, Image.NEAREST)
+        else:
+            region = region.filter(ImageFilter.GaussianBlur(max(6.0, min(bw, bh) / 5)))
+        inner = region.crop((x0 - box[0], y0 - box[1], x1 - box[0], y1 - box[1]))
+        frame.paste(inner, (x0, y0))
+    return frame
+
+
+def _zoom_to_face(face: tuple, target: float = 0.38) -> tuple:
+    """(zoom, pan_x, pan_y) that frames a face (x0, y0, x1, y1 fractions of
+    the picture) so it fills about `target` of the height, sitting a little
+    above center — see _apply_zoom for what pan means."""
+    fx0, fy0, fx1, fy1 = face
+    zoom = max(1.0, min(4.0, target / max(1e-3, fy1 - fy0)))
+    if zoom <= 1.001:
+        return 1.0, 0.0, 0.0
+    win = 1.0 / zoom
+    cx = (fx0 + fx1) / 2
+    cy = (fy0 + fy1) / 2 + win * 0.1
+
+    def pan(c: float) -> float:
+        return round(max(-1.0, min(1.0, (c - 0.5) / ((1 - win) / 2))), 3)
+
+    return round(zoom, 2), pan(cx), pan(cy)
+
+
+def _place_off_faces(rect: tuple, faces: list, pad: float = 0.03) -> float:
+    """A y (fraction) for a box rect=(x, y, w, h) — all fractions of the
+    picture — where it doesn't cover any face: its own y if that's already
+    clear, else the clear spot nearest to it. Unchanged if nowhere is clear."""
+    x, y, w, h = rect
+
+    def clear(ty: float) -> bool:
+        for fx0, fy0, fx1, fy1 in faces:
+            if (x < fx1 + pad and x + w > fx0 - pad and ty < fy1 + pad and ty + h > fy0 - pad):
+                return False
+        return True
+
+    if not faces or clear(y):
+        return y
+    top = max(0.0, 1.0 - h)
+    spots = sorted({round(i / 40 * top, 4) for i in range(41)}, key=lambda t: abs(t - y))
+    for ty in spots:
+        if clear(ty):
+            return ty
+    return y
 
 
 def _text_x(draw: ImageDraw.ImageDraw, line: str, font: ImageFont.FreeTypeFont,
@@ -1921,6 +2029,25 @@ def _draw_text_boxes(out: Image.Image, boxes: list, origin: tuple, fw: int, fh: 
             out.alpha_composite(layer, (max(0, lx), max(0, ly)), (sx, sy))
 
 
+def _picture_rect(fw: int, fh: int, cap_width: int, layout: str, side: str,
+                  output_override: bool = False, output_size_pct: float = 0.0) -> tuple:
+    """Where the picture sits in the exported image: (x0, y0, x1, y1) px —
+    the same geometry build_composite lays out."""
+    if layout == "overlay":
+        cap_width = 0
+    total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
+    scale, new_w, new_h = _output_scale(total_w, total_h, output_override, output_size_pct)
+    if (new_w, new_h) == (total_w, total_h):
+        new_w, new_h, s_cap = total_w, total_h, cap_width
+    else:
+        s_cap = max(1, round(cap_width * scale)) if cap_width else 0
+    if layout == "vertical":
+        return 0, 0, new_w, new_h - s_cap
+    if layout != "overlay" and side == "left":
+        return s_cap, 0, new_w, new_h
+    return 0, 0, new_w - s_cap, new_h
+
+
 def _output_scale_bounds(total_w: int, total_h: int) -> tuple:
     """(floor_scale, default_scale, ceiling_scale) for a composite of size
     total_w x total_h:
@@ -2010,6 +2137,11 @@ def build_composite(
     ba_label_size: float = 28,
     _ba_size: Optional[tuple] = None,
     text_boxes: Optional[list] = None,
+    censors: Optional[list] = None,
+    watermark_text: str = "",
+    watermark_text_color: str = "#ffffff",
+    watermark_text_font: str = "Arial",
+    frame_index: int = 0,
     _px_scale: float = 1.0,
 ) -> Image.Image:
     if layout == "overlay":
@@ -2027,7 +2159,7 @@ def build_composite(
         frame, ba_boxes = _ba_combine(
             before_path, before_mtime, frame, _ba_size or _ba_frame_size(*frame.size, ba_layout),
             ba_layout, _hex_to_rgb(page_bg),
-            Image.NEAREST if upscale_filter == "nearest" else Image.LANCZOS)
+            Image.NEAREST if upscale_filter == "nearest" else Image.LANCZOS, frame_index)
     fw, fh = frame.size
     total_w, total_h = _panel_total_size(fw, fh, cap_width, layout)
 
@@ -2083,9 +2215,17 @@ def build_composite(
             footer_outline=footer_outline and [_s(footer_outline[0]), footer_outline[1]],
             _px_scale=_px_scale * scale,
             text_boxes=text_boxes,
+            censors=censors,
             upscale_filter=upscale_filter,
+            watermark_text=watermark_text, watermark_text_color=watermark_text_color,
+            watermark_text_font=watermark_text_font, frame_index=frame_index,
             **ba_kw,
         )
+
+    # Censor boxes go on the picture at its final size (after any resize
+    # above), so blur/pixel size looks the same whatever the output size.
+    if censors:
+        frame = _apply_censors(frame, censors)
 
     # Fixed pixel margins/offsets below were tuned at natural size; scale
     # them along with everything else when rendering at output resolution.
@@ -2149,11 +2289,39 @@ def build_composite(
         wm_right = image_x + margin        # where the footer starts
         footer_end = image_x + fw - margin  # ...and ends
         header_x = image_x + margin
+        parts = []
         if watermark_path and os.path.exists(watermark_path):
             try:
-                wm = Image.open(watermark_path).convert("RGBA")
-                wm_scale = watermark_height / wm.height
-                wm = wm.resize((max(1, int(wm.width * wm_scale)), watermark_height), Image.LANCZOS)
+                img_wm = Image.open(watermark_path).convert("RGBA")
+                wm_scale = watermark_height / img_wm.height
+                parts.append(img_wm.resize((max(1, int(img_wm.width * wm_scale)),
+                                            watermark_height), Image.LANCZOS))
+            except Exception:
+                pass
+        if watermark_text.strip():
+            # A text watermark ("@yourname"): about 3/10 of the watermark
+            # height, outlined in whichever of black/white contrasts.
+            t_font = _pil_font(watermark_text_font, max(6, round(watermark_height * 0.3)), True)
+            t_sw = max(1, round(watermark_height * 0.025))
+            tr, tg, tb = _hex_to_rgb(watermark_text_color)
+            t_sc = "#000000" if 0.299 * tr + 0.587 * tg + 0.114 * tb >= 128 else "#ffffff"
+            probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            l, t, r_, b_ = probe.textbbox((0, 0), watermark_text.strip(), font=t_font,
+                                          stroke_width=t_sw)
+            t_img = Image.new("RGBA", (max(1, r_ - l), watermark_height), (0, 0, 0, 0))
+            _draw_rich(ImageDraw.Draw(t_img), (-l, (watermark_height - (b_ - t)) / 2 - t),
+                       watermark_text.strip(), t_font, _hex_to_rgb(watermark_text_color),
+                       t_sw, _hex_to_rgb(t_sc))
+            parts.append(t_img)
+        if parts:
+            try:
+                gap = _px(6)
+                wm = Image.new("RGBA", (sum(p.width for p in parts) + gap * (len(parts) - 1),
+                                        watermark_height), (0, 0, 0, 0))
+                px_ = 0
+                for p in parts:
+                    wm.alpha_composite(p, (px_, 0))
+                    px_ += p.width + gap
                 if watermark_opacity < 0.999:
                     k = max(0.0, watermark_opacity)
                     wm.putalpha(wm.getchannel("A").point(lambda v: round(v * k)))
@@ -2250,7 +2418,8 @@ def build_composite(
            inline_markup, dialogue_color, watermark_pos, watermark_opacity,
            json.dumps(header_outline), json.dumps(footer_outline),
            json.dumps(ba_boxes), json.dumps(list(ba_labels)), ba_label_size,
-           json.dumps(text_boxes, sort_keys=True) if layout == "overlay" else None)
+           json.dumps(text_boxes, sort_keys=True) if layout == "overlay" else None,
+           watermark_text, watermark_text_color, watermark_text_font)
     with _OVERLAY_CACHE_LOCK:
         overlay = _OVERLAY_CACHE.get(key)
         if overlay is not None:
@@ -2566,7 +2735,7 @@ def _export_worker_main(job_path: str) -> None:
         writer = imageio.get_writer(output_path, fps=out_fps, codec="libx264", quality=8)
         try:
             for i, frame in _trimmed():
-                composited = build_composite(frame, **params)
+                composited = build_composite(frame, **params, frame_index=i)
                 writer.append_data(_pad_to_macro_block(np.array(composited.convert("RGB"))))
                 _progress(i)
         finally:
@@ -2591,13 +2760,13 @@ def _export_worker_main(job_path: str) -> None:
         # every Nth frame, with each one held N frames' worth of time.
         step = 1 if durations else max(1, math.ceil(out_fps / _GIF_MAX_FPS))
         wanted = set(_gif_sample_indices(count))
-        samples = [build_composite(frame, **params)
+        samples = [build_composite(frame, **params, frame_index=i)
                    for i, frame in _trimmed() if i in wanted]
 
         def _composited():
             for i, frame in _trimmed():
                 if i % step == 0:
-                    yield build_composite(frame, **params)
+                    yield build_composite(frame, **params, frame_index=i)
                 _progress(i)
 
         duration = durations if durations else 1000.0 * step / out_fps
@@ -2636,7 +2805,7 @@ def _sampled_gif_bytes(source_frames: list, kwargs: dict, durations, fps: float,
     linearly from frame 0: estimate the first frame on its own, then
     extrapolate the average delta cost across the remaining frames."""
     sample = source_frames[:_GIF_SIZE_SAMPLE_FRAMES]
-    comps = [build_composite(f, **kwargs) for f in sample]
+    comps = [build_composite(f, **kwargs, frame_index=i) for i, f in enumerate(sample)]
     sample_durations = durations[:len(comps)] if durations else None
     all_bytes = _estimate_anim_bytes(comps, False, fps, sample_durations, gif_colors)
     if total <= len(comps) or len(comps) < 2:
@@ -2871,6 +3040,11 @@ class CaptionApp:
         self._ba_after_label_var = tk.StringVar(value="After")
         self._ba_label_size_var = tk.IntVar(value=28)
 
+        # Censor boxes on the picture (see _apply_censors).
+        self._censors: list = []
+        self._cz_sel: Optional[int] = None
+        self._cz_drag: Optional[dict] = None
+
         # Text boxes on the picture ("Text Boxes" format; see _TB_DEFAULT).
         self._text_boxes: list = []
         self._tb_sel: Optional[int] = None
@@ -2889,6 +3063,11 @@ class CaptionApp:
         # _auto_watermark_height) and the field just displays it; typing a
         # value turns Auto off and keeps the manual height.
         self._watermark_height_var = tk.IntVar(value=120)
+        # Text watermark ("@yourname") — remembered between sessions.
+        self._wm_text_var = tk.StringVar(value=recent_store.get_setting("wm_text", "") or "")
+        self._wm_text_font_var = tk.StringVar(
+            value=recent_store.get_setting("wm_text_font", "Arial") or "Arial")
+        self._wm_text_color = recent_store.get_setting("wm_text_color", "#ffffff") or "#ffffff"
         self._wm_auto_var = tk.BooleanVar(value=True)
         self._updating_wm_display = False
         self._wm_pos_var = tk.StringVar(value=_WM_POSITIONS[0][0])
@@ -2912,7 +3091,7 @@ class CaptionApp:
         # the image item, so the eyedropper's own canvas binding is untouched.
         # Text boxes (Text Boxes format) are dragged the same way; their
         # selection outline/handles ("tbsel") pass clicks on to the same code.
-        for tag in ("img", "tbsel"):
+        for tag in ("img", "tbsel", "czsel"):
             self._canvas.tag_bind(tag, "<ButtonPress-1>", self._on_pan_press)
             self._canvas.tag_bind(tag, "<B1-Motion>", self._on_pan_drag)
             self._canvas.tag_bind(tag, "<Double-Button-1>", self._tb_double_click)
@@ -3174,7 +3353,7 @@ class CaptionApp:
                   self._zoom_var, self._pan_x_var, self._pan_y_var, self._wm_pos_var,
                   self._wm_opacity_var, self._ba_on_var, self._ba_layout_var,
                   self._ba_before_label_var, self._ba_after_label_var,
-                  self._ba_label_size_var, self._story_mode_var):
+                  self._ba_label_size_var, self._story_mode_var, self._wm_text_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._story_mode_var.trace_add("write", lambda *_: self._update_editor_stats())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
@@ -3777,6 +3956,35 @@ class CaptionApp:
             text=f"{int(self._safe_float(self._wm_opacity_var))}%"))
         r += 1
 
+        # Text watermark — a signature like "@yourname", with or without an image.
+        ttk.Separator(f).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        r += 1
+        ttk.Label(f, text="Text:").grid(row=r, column=0, sticky="w", pady=4)
+        tooltip(ttk.Entry(f, textvariable=self._wm_text_var, width=22),
+                "A text watermark such as @yourname — shown beside the image\n"
+                "watermark, or on its own").grid(row=r, column=1, sticky="ew", padx=6)
+        r += 1
+        ttk.Label(f, text="Text font:").grid(row=r, column=0, sticky="w", pady=4)
+        row = ttk.Frame(f)
+        row.grid(row=r, column=1, sticky="ew", padx=6)
+        font_combo = ttk.Combobox(row, textvariable=self._wm_text_font_var, values=_font_list(),
+                                  width=16)
+        font_combo.pack(side="left", fill="x", expand=True)
+        for ev in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            font_combo.bind(ev, lambda _e: self._safe_refresh())
+        self._wm_text_color_btn = tk.Button(row, width=3, relief="groove",
+                                            bg=self._wm_text_color,
+                                            command=self._pick_wm_text_color)
+        self._wm_text_color_btn.pack(side="left", padx=(6, 0))
+        r += 1
+
+    def _pick_wm_text_color(self) -> None:
+        picked = colorchooser.askcolor(color=self._wm_text_color, title="Watermark text color")[1]
+        if picked:
+            self._wm_text_color = picked
+            self._wm_text_color_btn.config(bg=picked)
+            self._safe_refresh(debounce_ms=0)
+
     # ------------------------------------------------------------------
     # Text boxes — Photoshop-style text placed on the picture
     # ------------------------------------------------------------------
@@ -3810,6 +4018,9 @@ class CaptionApp:
                                                                  fill="x")
         tooltip(ttk.Button(history, text="↷", width=4, command=self._tb_redo),
                 "Redo (Ctrl+Y on the preview)").pack(side="left", expand=True, fill="x")
+        tooltip(ttk.Button(btns, text="Off faces", width=10, command=self._tb_move_off_faces),
+                "Move the selected box up or down so it doesn't cover a face\n"
+                "(new boxes do this by themselves)").grid(row=5, column=0, sticky="ew", pady=1)
 
         self._tb_text = tk.Text(f, height=4, width=22, wrap="word", relief="solid", bd=1,
                                 padx=4, pady=4, undo=True)
@@ -4122,9 +4333,82 @@ class CaptionApp:
             style["x"] = max(0.0, min(1.0 - w, x - w / 2)) if w < 1 else 0.0
         if y is not None:
             style["y"] = max(0.0, min(0.95, y))
-        elif self._tb_sel is not None:
-            style["y"] = min(0.9, float(style.get("y", 0.5)) + 0.08)
+        else:
+            if self._tb_sel is not None:
+                style["y"] = min(0.9, float(style.get("y", 0.5)) + 0.08)
+            self._tb_off_faces(style)   # not placed by hand: keep clear of faces
         return style
+
+    def _faces(self, framed: bool = True) -> Optional[list]:
+        """Faces on the picture — as shown (zoomed, paired with a before
+        picture) when framed, else in the opened image itself — as fraction
+        boxes, largest first. None if there's no picture or no detector."""
+        if not self._frames:
+            return None
+        frame = self._frames[0]
+        zoom = max(1.0, self._safe_float(self._zoom_var))
+        pan = (self._safe_float(self._pan_x_var), self._safe_float(self._pan_y_var))
+        before = self._before_path if (framed and self._ba_on_var.get()) else ""
+        ba_layout = "stacked" if self._ba_layout_var.get() == "Stacked" else "side"
+        key = (id(frame), framed, zoom if framed else 1.0, pan if framed else (0, 0), before,
+               ba_layout, _before_mtime(before))
+        cache = getattr(self, "_face_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        img = frame
+        if framed:
+            img = _apply_zoom(frame, zoom, pan[0], pan[1], Image.BILINEAR)
+            if before and key[-1] is not None:
+                img = _ba_combine(before, key[-1], img, _ba_frame_size(*img.size, ba_layout),
+                                  ba_layout, (0, 0, 0), Image.BILINEAR)[0]
+        try:
+            faces = web_lookup.find_faces(img)
+        except Exception:
+            log.exception("FACE_DETECT_ERROR")
+            faces = None
+        self._face_cache = (key, faces, img.size)
+        return faces
+
+    def _tb_off_faces(self, box: dict) -> dict:
+        """Move a box (in place) up or down so it doesn't cover a face."""
+        faces = self._faces()
+        if not faces:
+            return box
+        fw, fh = self._face_cache[2]
+        b = _tb(box)
+        g = _tb_layout(b, fw, fh, 1.0, self._markup_var.get())
+        box["y"] = round(_place_off_faces((float(b["x"]), float(b["y"]), g["w"] / fw,
+                                           g["h"] / fh), faces), 4)
+        return box
+
+    def _tb_move_off_faces(self) -> None:
+        if self._tb_sel is None:
+            return
+        faces = self._faces()
+        if faces is None:
+            messagebox.showinfo("Move off faces", "Face detection isn't available.")
+            return
+        if not faces:
+            self._status.config(text="No faces found in the picture.")
+            return
+        self._tb_push_undo()
+        self._tb_off_faces(self._text_boxes[self._tb_sel])
+        self._tb_refresh_panel()
+        self._safe_refresh(debounce_ms=0)
+
+    def _zoom_to_face(self) -> None:
+        faces = self._faces(framed=False)
+        if faces is None:
+            messagebox.showinfo("Zoom to face", "Open a picture first." if not self._frames
+                                else "Face detection isn't available.")
+            return
+        if not faces:
+            messagebox.showinfo("Zoom to face", "No face was found in this picture.")
+            return
+        zoom, px, py = _zoom_to_face(faces[0])
+        self._zoom_var.set(zoom)
+        self._pan_x_var.set(px)
+        self._pan_y_var.set(py)
 
     def _tb_start_size(self) -> float:
         """A first text size that reads well on this picture: about 1/20 of
@@ -4189,6 +4473,7 @@ class CaptionApp:
                 if self._frames:
                     for b in boxes:   # readable on this picture, whatever its size
                         b["size"] = max(float(b.get("size", 28)), self._tb_start_size())
+                        self._tb_off_faces(b)
                 self._text_boxes = boxes
                 self._tb_sel = 0 if boxes else None
             nb.add(self._tb_tab)          # re-shows it where it was
@@ -4325,6 +4610,8 @@ class CaptionApp:
             return False
         if idx != self._tb_sel:
             self._tb_select(idx)
+        if self._cz_sel is not None:
+            self._cz_select(None)
         self._tb_push_undo()
         box = self._text_boxes[idx]
         disp = self._preview_pil_img
@@ -4373,6 +4660,7 @@ class CaptionApp:
 
     def _tb_release(self, _event=None) -> None:
         self._tb_drag = None
+        self._cz_drag = None
 
     def _tb_double_click(self, event) -> None:
         if not self._overlay_mode() or not self._cache:
@@ -4395,6 +4683,9 @@ class CaptionApp:
             self._tb_add(fx, fy)
 
     def _tb_key(self, event) -> Optional[str]:
+        if self._cz_sel is not None and event.keysym in ("Delete", "BackSpace"):
+            self._cz_delete()
+            return "break"
         if not self._overlay_mode() or self._tb_sel is None:
             return None
         if event.keysym in ("Delete", "BackSpace"):
@@ -4430,8 +4721,12 @@ class CaptionApp:
             var.trace_add("write", lambda *_a, v=var, l=lbl, fm=fmt: l.config(
                 text=fm(self._safe_float(v))))
             r += 1
-        ttk.Button(f, text="Reset framing", command=self._reset_framing).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        framing_btns = ttk.Frame(f)
+        framing_btns.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Button(framing_btns, text="Reset framing", command=self._reset_framing).pack(
+            side="left")
+        tooltip(ttk.Button(framing_btns, text="☺ Zoom to face", command=self._zoom_to_face),
+                "Zoom in on the largest face and center it").pack(side="left", padx=(6, 0))
         r += 1
         ttk.Label(f, text="Tip: drag the picture in the preview to move it,\n"
                           "Ctrl + scroll over it to zoom.",
@@ -4470,6 +4765,173 @@ class CaptionApp:
         ttk.Spinbox(f, from_=0, to=200, increment=1, width=6,
                     textvariable=self._ba_label_size_var).grid(row=r, column=1, sticky="w",
                                                                padx=6)
+        r += 1
+        r = self._build_censor_section(f, r)
+
+    # ------------------------------------------------------------------
+    # Censor boxes — blur / pixelate / bar regions of the picture
+    # ------------------------------------------------------------------
+
+    def _build_censor_section(self, f: ttk.Frame, r: int) -> int:
+        ttk.Separator(f).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        r += 1
+        ttk.Label(f, text="Censor:").grid(row=r, column=0, sticky="w")
+        add = ttk.Frame(f)
+        add.grid(row=r, column=1, sticky="w", padx=6)
+        for label, style in (("＋ Blur", "blur"), ("＋ Pixelate", "pixelate"), ("＋ Bar", "bar")):
+            ttk.Button(add, text=label, command=lambda s=style: self._cz_add(s)).pack(
+                side="left", padx=(0, 4))
+        r += 1
+        sel = ttk.Frame(f)
+        sel.grid(row=r, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Label(sel, text="Selected:").pack(side="left")
+        self._cz_style_var = tk.StringVar(value="")
+        self._cz_style_combo = ttk.Combobox(sel, textvariable=self._cz_style_var, width=9,
+                                            state="disabled", values=("Blur", "Pixelate", "Bar"))
+        self._cz_style_combo.pack(side="left", padx=4)
+        self._cz_style_combo.bind("<<ComboboxSelected>>", lambda _e: self._cz_set_style())
+        self._cz_color_btn = tk.Button(sel, width=3, relief="groove", bg="#000000",
+                                       command=self._cz_pick_color)
+        self._cz_color_btn.pack(side="left", padx=4)
+        ttk.Button(sel, text="Delete", command=self._cz_delete).pack(side="left", padx=4)
+        r += 1
+        ttk.Label(f, text="Drag a censor box on the preview to move it; drag its corner "
+                          "to resize. Delete removes the selected one.",
+                  style="Muted.TLabel", wraplength=320, justify="left").grid(
+            row=r, column=0, columnspan=2, sticky="w")
+        return r + 1
+
+    def _cz_add(self, style: str) -> None:
+        if not self._frames:
+            messagebox.showinfo("Censor", "Open a picture first.")
+            return
+        self._censors.append({"x": 0.35, "y": 0.4, "w": 0.3, "h": 0.2, "style": style,
+                              "color": "#000000"})
+        self._cz_select(len(self._censors) - 1)
+        self._safe_refresh(debounce_ms=0)
+
+    def _cz_select(self, idx: Optional[int]) -> None:
+        self._cz_sel = idx if idx is not None and 0 <= idx < len(self._censors) else None
+        if self._cz_sel is not None and self._tb_sel is not None:
+            self._tb_select(None)
+        c = self._censors[self._cz_sel] if self._cz_sel is not None else None
+        self._cz_style_combo.config(state="readonly" if c else "disabled")
+        self._cz_style_var.set(c["style"].capitalize() if c else "")
+        self._cz_color_btn.config(bg=(c or {}).get("color", "#000000"))
+        self._cz_draw()
+
+    def _cz_set_style(self) -> None:
+        if self._cz_sel is not None:
+            self._censors[self._cz_sel]["style"] = self._cz_style_var.get().lower()
+            self._safe_refresh(debounce_ms=0)
+
+    def _cz_pick_color(self) -> None:
+        if self._cz_sel is None:
+            return
+        c = self._censors[self._cz_sel]
+        picked = colorchooser.askcolor(color=c.get("color", "#000000"), title="Bar color")[1]
+        if picked:
+            c["color"] = picked
+            c["style"] = "bar"
+            self._cz_select(self._cz_sel)
+            self._safe_refresh(debounce_ms=0)
+
+    def _cz_delete(self) -> None:
+        if self._cz_sel is None:
+            return
+        del self._censors[self._cz_sel]
+        self._cz_select(None)
+        self._safe_refresh(debounce_ms=0)
+
+    def _picture_screen_rect(self) -> Optional[tuple]:
+        """Where the picture itself is on the preview canvas."""
+        disp = getattr(self, "_preview_pil_img", None)
+        bbox = self._canvas.bbox("img")
+        if not (self._cache and self._frames and disp is not None and bbox):
+            return None
+        fw, fh = self._frames[0].size
+        if self._ba_on_var.get() and self._before_path:
+            fw, fh = _ba_frame_size(fw, fh, "stacked" if self._ba_layout_var.get() == "Stacked"
+                                    else "side")
+        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        try:
+            cap = int(self._width_var.get())
+            pct = float(self._output_pct_var.get())
+        except (tk.TclError, ValueError):
+            return None
+        x0, y0, x1, y1 = _picture_rect(fw, fh, cap, layout, self._side_var.get(),
+                                       self._output_override_var.get(), pct)
+        d = disp.width / self._cache[0].size[0]
+        return bbox[0] + x0 * d, bbox[1] + y0 * d, bbox[0] + x1 * d, bbox[1] + y1 * d
+
+    def _cz_screen_rects(self) -> list:
+        pic = self._picture_screen_rect() if self._censors else None
+        if pic is None:
+            return []
+        px0, py0, px1, py1 = pic
+        pw, ph = px1 - px0, py1 - py0
+        return [(px0 + c["x"] * pw, py0 + c["y"] * ph, px0 + (c["x"] + c["w"]) * pw,
+                 py0 + (c["y"] + c["h"]) * ph) for c in self._censors]
+
+    def _cz_draw(self) -> None:
+        c = self._canvas
+        c.delete("czsel")
+        if getattr(self, "_view_var", None) is None or self._view_var.get() != "builder":
+            return
+        for i, (x0, y0, x1, y1) in enumerate(self._cz_screen_rects()):
+            sel = i == self._cz_sel
+            c.create_rectangle(x0, y0, x1, y1, outline="#ff4040", width=2 if sel else 1,
+                               dash=(6, 3) if sel else (2, 4), tags=("czsel",))
+            if sel:
+                c.create_rectangle(x1 - 5, y1 - 5, x1 + 5, y1 + 5, fill="white",
+                                   outline="#ff4040", width=2, tags=("czsel",))
+        c.tag_raise("czsel")
+
+    def _cz_press(self, event) -> bool:
+        rects = self._cz_screen_rects()
+        if not rects:
+            return False
+        sel = self._cz_sel
+        mode = idx = None
+        if sel is not None and sel < len(rects):
+            x0, y0, x1, y1 = rects[sel]
+            if abs(event.x - x1) <= 8 and abs(event.y - y1) <= 8:
+                idx, mode = sel, "size"
+        if idx is None:
+            for i in range(len(rects) - 1, -1, -1):
+                x0, y0, x1, y1 = rects[i]
+                if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                    idx, mode = i, "move"
+                    break
+        if idx is None:
+            if self._cz_sel is not None:
+                self._cz_select(None)
+            return False
+        self._canvas.focus_set()
+        if idx != self._cz_sel:
+            self._cz_select(idx)
+        pic = self._picture_screen_rect()
+        self._cz_drag = {"mode": mode, "x": event.x, "y": event.y,
+                         "box": dict(self._censors[idx]),
+                         "pw": pic[2] - pic[0], "ph": pic[3] - pic[1]}
+        return True
+
+    def _cz_motion(self, event) -> bool:
+        d = self._cz_drag
+        if not d or self._cz_sel is None:
+            return False
+        c = self._censors[self._cz_sel]
+        s = d["box"]
+        dx, dy = (event.x - d["x"]) / d["pw"], (event.y - d["y"]) / d["ph"]
+        if d["mode"] == "move":
+            c["x"] = round(max(-s["w"] + 0.02, min(0.98, s["x"] + dx)), 4)
+            c["y"] = round(max(-s["h"] + 0.02, min(0.98, s["y"] + dy)), 4)
+        else:
+            c["w"] = round(max(0.02, min(1.5, s["w"] + dx)), 4)
+            c["h"] = round(max(0.02, min(1.5, s["h"] + dy)), 4)
+        self._cz_draw()
+        self._safe_refresh(debounce_ms=0)
+        return True
 
     def _pick_before_image(self) -> None:
         path = filedialog.askopenfilename(
@@ -4509,8 +4971,9 @@ class CaptionApp:
         self._pan_y_var.set(0.0)
 
     def _on_pan_press(self, event) -> None:
-        if getattr(self, "_color_pick_target", None) is None and self._tb_press(event):
-            self._pan_drag = None   # grabbed a text box, not the picture
+        if getattr(self, "_color_pick_target", None) is None and (
+                self._tb_press(event) or self._cz_press(event)):
+            self._pan_drag = None   # grabbed a text box or censor box, not the picture
             return
         if (getattr(self, "_color_pick_target", None) is not None
                 or self._safe_float(self._zoom_var) <= 1.001):
@@ -4522,7 +4985,7 @@ class CaptionApp:
     def _on_pan_drag(self, event) -> None:
         """Drag the picture inside its frame. A drag of the shown picture's
         own width moves the zoomed-in window by its full travel."""
-        if self._tb_motion(event):
+        if self._tb_motion(event) or self._cz_motion(event):
             return
         d = self._pan_drag
         disp = getattr(self, "_preview_pil_img", None)
@@ -7573,6 +8036,17 @@ class CaptionApp:
         if raw["layout"] == "overlay":
             raw["width"] = 0
             raw["text_boxes"] = [dict(b) for b in self._text_boxes]
+        if self._censors:
+            raw["censors"] = [dict(c) for c in self._censors]
+        wm_text = self._wm_text_var.get().strip()
+        if wm_text:
+            raw.update(watermark_text=wm_text, watermark_text_color=self._wm_text_color,
+                       watermark_text_font=self._wm_text_font_var.get() or "Arial")
+        wm_state = (self._wm_text_var.get(), self._wm_text_font_var.get(), self._wm_text_color)
+        if wm_state != getattr(self, "_wm_text_saved", None):
+            self._wm_text_saved = wm_state      # remembered for next time
+            for key, value in zip(("wm_text", "wm_text_font", "wm_text_color"), wm_state):
+                recent_store.set_setting(key, value)
 
         if header_enabled:
             try:
@@ -7798,7 +8272,8 @@ class CaptionApp:
                     src.append(frame)
                 if not src:
                     return
-                sample = [build_composite(frame, **kwargs) for frame in src]
+                sample = [build_composite(frame, **kwargs, frame_index=i)
+                          for i, frame in enumerate(src)]
                 sample_bytes = _estimate_anim_bytes(sample, as_mp4, fps, None, gif_colors)
                 size_bytes = round(sample_bytes / len(sample) * total)
                 gif_alt = _mp4_as_gif_bytes(src, kwargs, fps, total) if as_mp4 else None
@@ -7869,7 +8344,7 @@ class CaptionApp:
                     log.debug("GIF_BUILD_CANCELLED  frame=%d", i)
                     return
                 try:
-                    results.append(build_composite(f, **kwargs))
+                    results.append(build_composite(f, **kwargs, frame_index=i))
                 except Exception:
                     log.exception("FRAME_BUILD_ERROR  frame=%d", i)
                     return
@@ -8815,6 +9290,8 @@ class CaptionApp:
         self._reset_framing()
         self._ba_on_var.set(False)
         self._story_image_text = ""
+        self._censors = []
+        self._cz_sel = None
         self._before_path = ""
         self._before_name_lbl.config(text="(none)")
         self._project_path = None
@@ -8896,6 +9373,7 @@ class CaptionApp:
                 },
                 "series": dict(self._series) if self._series else None,
                 "text_boxes": [dict(b) for b in self._text_boxes],
+                "censors": [dict(c) for c in self._censors],
                 "long_story": {"on": self._story_mode_var.get(),
                                "ending": self._story_ending,
                                "image_text": self._story_image_text},
@@ -9007,6 +9485,8 @@ class CaptionApp:
     def _apply_project(self, data: dict) -> None:
         # Before the format is applied, so a Text Boxes project keeps its own.
         self._text_boxes = [dict(b) for b in data.get("text_boxes") or []]
+        self._censors = [dict(c) for c in data.get("censors") or []]
+        self._cz_sel = None
         self._tb_sel = 0 if self._text_boxes else None
         fmt = data.get("format") or self._format_var.get()
         settings = dict(data.get("format_settings") or {})
@@ -9400,6 +9880,8 @@ class CaptionApp:
                                   tags=("img",))
         if self._text_boxes and self._overlay_mode():
             self._tb_draw_selection()
+        if self._censors:
+            self._cz_draw()
 
     def _start_anim(self) -> None:
         self._anim_step()
