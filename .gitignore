@@ -52,3 +52,6 @@ user_dictionary.txt
 
 # App background images chosen in Settings -> Background (per-user)
 backgrounds/
+
+# autosaved session (crash recovery) — personal, never committed
+autosave/

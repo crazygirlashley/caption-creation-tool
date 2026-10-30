@@ -223,7 +223,8 @@ _WHATS_NEW = {
              "own color"),
             ("Long story", "the full story goes in the DeviantArt description; the image shows "
              "the opening that fits (or your own short version)"),
-            ("Before & after", "a second picture beside or above the first, with labels"),
+            ("Before & after", "a second picture beside or above the first, with labels — "
+             "a GIF before picture plays along"),
             ("Series", "File → Series numbers your parts, titles them, and opens the previous "
              "part in one click"),
         ]),
