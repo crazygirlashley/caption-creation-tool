@@ -270,6 +270,66 @@ def stream_edit(text: str, instruction: str, words: int, settings: dict,
                             settings, cancel, temperature=temperature)
 
 
+# ---------------------------------------------------------------------------
+# Planning an animation: a description ("zoom into her face, then purple
+# smoke reveals the after picture") becomes a storyboard of the steps
+# animate.py can play. The step list (`guide`) comes from animate.PLAN_GUIDE.
+# ---------------------------------------------------------------------------
+
+PLAN_SYSTEM_PROMPT = (
+    "You direct short looping animations made from one or two still pictures for an "
+    "adult caption-art community. Turn the user's description into a storyboard using "
+    "ONLY these steps:\n\n{guide}\n"
+    "Pictures available: {pictures}.\n"
+    "Rules: start with a hold step; keep the whole animation under 15 seconds; use the "
+    "user's colors and timings when given; when they don't say, choose what fits the "
+    "mood (a gentle zoom for something slow and dreamy, shakes and flashes for something "
+    "sudden). Output only a JSON array of step objects — no explanation, no markdown."
+)
+
+PLAN_EXAMPLE_USER = ("hold on her for a second, slowly zoom into her face, then a purple "
+                     "smoke bomb reveals the after picture")
+PLAN_EXAMPLE_REPLY = (
+    '[{"type": "hold", "picture": "first", "seconds": 1}, '
+    '{"type": "zoom", "to": 1.6, "focus": "face", "seconds": 2.5}, '
+    '{"type": "transition", "effect": "smoke", "to": "second", "color": "#b05cc9", '
+    '"seconds": 1.8}, {"type": "hold", "picture": "second", "seconds": 1.5}]'
+)
+
+
+def parse_plan(text: str):
+    """The JSON storyboard in a model's reply, tolerating code fences and
+    chatter around it. Raises AIWriterError if there isn't one."""
+    s = text.strip()
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start, end = s.find(opener), s.rfind(closer)
+        if start != -1 and end > start:
+            try:
+                return json.loads(s[start:end + 1])
+            except ValueError:
+                continue
+    raise AIWriterError("The AI didn't reply with a plan it could follow. Try again, or "
+                        "describe it a little differently.")
+
+
+def plan_animation(description: str, guide: str, has_second: bool, settings: dict,
+                   cancel: Optional[threading.Event] = None):
+    """Ask the writing model for a storyboard; returns the parsed JSON
+    (normalize it with animate.normalize_plan before playing it)."""
+    pictures = ('"first" and "second" (the second is usually the "after")' if has_second
+                else 'only "first" (transitions go back to the same picture)')
+    messages = [
+        {"role": "system", "content": PLAN_SYSTEM_PROMPT.format(guide=guide,
+                                                                pictures=pictures)},
+        {"role": "user", "content": PLAN_EXAMPLE_USER},
+        {"role": "assistant", "content": PLAN_EXAMPLE_REPLY},
+        {"role": "user", "content": description.strip()},
+    ]
+    text = "".join(_stream_chat(messages, 900, settings, cancel, timeout=240,
+                                temperature=0.3))
+    return parse_plan(text)
+
+
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
                  timeout: float = 300.0, picture: str = "") -> Iterator[str]:

@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 
 import ai_writer
 import animate
+import comfy_client
 import da_client
 import recent_store
 import spellcheck
@@ -217,6 +218,10 @@ _WHATS_NEW = {
             ("Create Animation", "File → Create Animation brings a still picture to life (slow "
              "zoom, pan, pulse, shake) or turns one picture into another — crossfade, wipe, "
              "slide, dissolve, circle reveal, zoom, or a smoke bomb in the color you pick"),
+            ("Describe it", "say what should happen and your AI writer plans it as a "
+             "sequence — hold, zoom into her face, a jolt, purple smoke to the after picture"),
+            ("AI video", "real AI-generated motion through ComfyUI on a PC with a strong "
+             "graphics card"),
             ("Keep every 2nd frame", "beside Frames and Speed: a smaller GIF that plays just "
              "as long"),
             ("Smarter Fit under…", "when a GIF still won't fit, offers to drop frames or "
@@ -6339,6 +6344,14 @@ class CaptionApp:
                         variable=mode_var).pack(anchor="w")
         ttk.Radiobutton(modes, text="Change one picture into another", value="transition",
                         variable=mode_var).pack(anchor="w")
+        tooltip(ttk.Radiobutton(modes, text="Describe it — the AI plans it", value="describe",
+                                variable=mode_var),
+                "Say what should happen; your AI writer turns it into zooms, pans,\n"
+                "shakes, flashes and transitions, one after another.").pack(anchor="w")
+        tooltip(ttk.Radiobutton(modes, text="AI video (ComfyUI)", value="comfy",
+                                variable=mode_var),
+                "Real AI-generated motion from a ComfyUI server with a strong\n"
+                "graphics card (on this PC, another PC, or a rented one).").pack(anchor="w")
 
         picf = ttk.LabelFrame(left, text="Pictures", padding=8)
         picf.pack(fill="x", pady=(10, 0))
@@ -6364,14 +6377,27 @@ class CaptionApp:
                 names[k].config(text=_name(k))
             _schedule()
 
+        def _clear_b() -> None:
+            pics["b"] = None
+            names["b"].config(text=_name("b"))
+            _schedule()
+
         rows = {}
+        b_label = None
         for r, (key, label) in enumerate((("a", "First:"), ("b", "Then:"))):
-            ttk.Label(picf, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            lbl = ttk.Label(picf, text=label)
+            lbl.grid(row=r, column=0, sticky="w", pady=2)
+            if key == "b":
+                b_label = lbl
             names[key] = ttk.Label(picf, text=_name(key), width=26, style="Muted.TLabel")
             names[key].grid(row=r, column=1, sticky="w", padx=6)
             ttk.Button(picf, text="Choose…", style="Small.TButton",
                        command=lambda k=key: _choose(k)).grid(row=r, column=2)
             rows[key] = [w for w in picf.grid_slaves(row=r)]
+        clear_b = tooltip(ttk.Button(picf, text="✕", width=2, style="Small.TButton",
+                                     command=_clear_b), "Don't use a second picture")
+        clear_b.grid(row=1, column=4, padx=(2, 0))
+        rows["b"].append(clear_b)
         swap_btn = tooltip(ttk.Button(picf, text="⇅", width=3, style="Small.TButton",
                                       command=_swap), "Swap the two pictures")
         swap_btn.grid(row=0, column=3, rowspan=2, padx=(4, 0))
@@ -6449,6 +6475,62 @@ class CaptionApp:
         ttk.Checkbutton(trans_opts, text="Change back afterwards (loops smoothly)",
                         variable=loop_var).pack(anchor="w", pady=2)
 
+        # Describe it: the AI writer plans a storyboard (animate.PLAN_GUIDE).
+        desc_opts = ttk.Frame(left)
+        ttk.Label(desc_opts, text="What should happen?").pack(anchor="w")
+        desc_box = tk.Text(desc_opts, width=46, height=4, wrap="word", relief="solid", bd=1,
+                           padx=4, pady=4)
+        desc_box.pack(anchor="w", fill="x", pady=(2, 4))
+        desc_box.insert("1.0", getattr(self, "_anim_last_desc", ""))
+        Placeholder(desc_box, "e.g. hold on her for a second, slowly zoom into her face, "
+                              "then a purple smoke bomb reveals the after picture")
+        plan_row = ttk.Frame(desc_opts)
+        plan_row.pack(anchor="w", fill="x")
+        plan_btn = ttk.Button(plan_row, text="Plan it", style="Small.TButton")
+        plan_btn.pack(side="left")
+        plan_model = ttk.Label(plan_row, style="Muted.TLabel", text="")
+        plan_model.pack(side="left", padx=(8, 0))
+        plan_label = ttk.Label(desc_opts, text="", justify="left", wraplength=470)
+        plan_label.pack(anchor="w", pady=(6, 2))
+        desc_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(desc_opts, text="End where it starts (loops smoothly)",
+                        variable=desc_loop_var).pack(anchor="w", pady=2)
+        plan = {"steps": None}
+
+        # AI video: a ComfyUI server makes real motion (comfy_client).
+        comfy_opts = ttk.Frame(left)
+        ttk.Label(comfy_opts, text="Describe the motion:").pack(anchor="w")
+        comfy_box = tk.Text(comfy_opts, width=46, height=4, wrap="word", relief="solid", bd=1,
+                            padx=4, pady=4)
+        comfy_box.pack(anchor="w", fill="x", pady=(2, 4))
+        comfy_box.insert("1.0", getattr(self, "_anim_last_comfy", ""))
+        Placeholder(comfy_box, "e.g. she turns to the camera and smiles, her hair blowing "
+                               "in the wind, slow and dreamy")
+        comfy_row = ttk.Frame(comfy_opts)
+        comfy_row.pack(anchor="w", fill="x")
+        comfy_status = ttk.Label(comfy_row, style="Muted.TLabel", wraplength=400,
+                                 justify="left")
+        comfy_status.pack(side="left")
+        match_var = tk.BooleanVar(value=True)
+        tooltip(ttk.Checkbutton(comfy_opts, text="Use my picture's shape",
+                                variable=match_var),
+                "Sets the workflow's width and height to your picture's shape\n"
+                "(same number of pixels as the workflow asks for).").pack(anchor="w", pady=2)
+
+        def _show_comfy() -> None:
+            cfg = self._comfy_settings()
+            wf = os.path.basename(cfg["workflow"]) if cfg["workflow"] else "no workflow yet"
+            comfy_status.config(text=f"ComfyUI at {cfg['url']} · {wf}")
+
+        def _comfy_setup() -> None:
+            self._comfy_settings_dialog(parent=win)
+            if win.winfo_exists():
+                _show_comfy()
+                _schedule()
+        ttk.Button(comfy_row, text="Set up…", style="Small.TButton",
+                   command=_comfy_setup).pack(side="right")
+        _show_comfy()
+
         fps_row = ttk.Frame(left)
         fps_row.pack(fill="x", pady=(6, 0), side="bottom")
         ttk.Label(fps_row, text="Smoothness:").pack(side="left")
@@ -6486,6 +6568,15 @@ class CaptionApp:
             mode = mode_var.get()
             if not pics["a"] or (mode == "transition" and not pics["b"]):
                 return None
+            if mode == "describe":
+                if not plan["steps"]:
+                    return None
+                return dict(mode=mode, a=pics["a"], b=pics["b"], steps=plan["steps"],
+                            loop=desc_loop_var.get(), fps=_fps(), label="AI animation")
+            if mode == "comfy":
+                return dict(mode=mode, a=pics["a"], b=pics["b"], label="AI video",
+                            prompt=comfy_box.get("1.0", "end-1c").strip(),
+                            match=match_var.get())
             if mode == "still":
                 return dict(mode=mode, a=pics["a"],
                             effect=animate.STILL_EFFECTS[still_var.get()],
@@ -6499,10 +6590,30 @@ class CaptionApp:
                         color=smoke_color[0], fps=_fps())
 
         def _layout(*_a) -> None:
-            transition = mode_var.get() == "transition"
+            mode = mode_var.get()
+            transition = mode == "transition"
+            two = mode != "still"
             for w in rows["b"]:
-                w.grid() if transition else w.grid_remove()
-            swap_btn.grid() if transition else swap_btn.grid_remove()
+                w.grid() if two else w.grid_remove()
+            if two and not transition:
+                b_label.config(text="Then (optional):")
+            else:
+                b_label.config(text="Then:")
+                clear_b.grid_remove()
+            swap_btn.grid() if two else swap_btn.grid_remove()
+            ai = mode in ("describe", "comfy")
+            for f in (eff, still_opts, trans_opts, smoke_row, desc_opts, comfy_opts):
+                f.pack_forget()
+            if mode == "comfy":
+                fps_row.pack_forget()
+            elif not fps_row.winfo_manager():
+                fps_row.pack(fill="x", pady=(6, 0), side="bottom")
+            if ai:
+                (desc_opts if mode == "describe" else comfy_opts).pack(
+                    anchor="w", fill="x", pady=(10, 0), after=picf)
+                _schedule()
+                return
+            eff.pack(fill="x", pady=(10, 0), after=picf)
             if transition:
                 effect_box.config(textvariable=trans_var, values=list(animate.TRANSITIONS))
                 still_opts.pack_forget()
@@ -6534,19 +6645,42 @@ class CaptionApp:
             state["i"] = i + 1
             state["play"] = win.after(max(20, state["durs"][i]), _play)
 
+        def _stop_preview(text: str) -> None:
+            if state["play"]:
+                win.after_cancel(state["play"])
+                state["play"] = None
+            preview.config(image="", text=text)
+            state["imgs"] = []
+            info.config(text="")
+
         def _make_preview() -> None:
             state["job"] = None
+            if state["busy"]:
+                return
             s = _settings()
+            mode = mode_var.get()
             if s is None:
-                if state["play"]:
-                    win.after_cancel(state["play"])
-                    state["play"] = None
-                preview.config(image="", text="Choose the picture(s)\nto see a preview")
-                state["imgs"] = []
-                info.config(text="")
+                if mode == "describe" and pics["a"]:
+                    _stop_preview("Describe what should happen,\nthen press Plan it")
+                else:
+                    _stop_preview("Choose the picture(s)\nto see a preview")
                 create_btn.config(state="disabled")
                 return
             create_btn.config(state="normal")
+            if mode == "comfy":
+                # Too slow to preview; show the starting picture.
+                _stop_preview("")
+                state["gen"] += 1
+                try:
+                    with Image.open(s["a"]) as im:
+                        thumb = animate.prepare(im, 320)
+                    state["imgs"] = [ImageTk.PhotoImage(thumb)]
+                    preview.config(image=state["imgs"][0])
+                except OSError:
+                    pass
+                info.config(text="Made on the ComfyUI PC when you press Create —\n"
+                                 "usually a few minutes.")
+                return
             state["gen"] += 1
             gen = state["gen"]
             info.config(text="Making a preview…")
@@ -6578,20 +6712,36 @@ class CaptionApp:
             if state["play"] is None:
                 _play()
 
+        def _face_center(img: Image.Image) -> Optional[tuple]:
+            try:
+                faces = web_lookup.find_faces(img)
+            except Exception:
+                faces = None
+            if faces:
+                x0, y0, x1, y1 = faces[0]
+                return (x0 + x1) / 2, (y0 + y1) / 2
+            return None
+
         def _render(s: dict, max_side: int = animate.MAX_SIDE) -> tuple:
             """Runs off the Tk thread."""
             with Image.open(s["a"]) as im:
                 a = animate.prepare(im, max_side)
+            if s["mode"] == "describe":
+                b = None
+                if s["b"]:
+                    with Image.open(s["b"]) as im:
+                        b = animate.prepare(im, max_side * 2)
+                faces = {}
+                if any(st["type"] == "zoom" and st["focus"] == "face" for st in s["steps"]):
+                    faces = {k: c for k, c in (("first", _face_center(a)),
+                                               ("second", _face_center(b) if b else None))
+                             if c}
+                return animate.render_storyboard(a, b, s["steps"], s["fps"], faces,
+                                                 s["loop"], max_side)
             if s["mode"] == "still":
                 focus = (0.5, 0.5)
                 if s["face"] and s["effect"] in ("zoom_in", "zoom_out", "pulse"):
-                    try:
-                        faces = web_lookup.find_faces(a)
-                    except Exception:
-                        faces = None
-                    if faces:
-                        x0, y0, x1, y1 = faces[0]
-                        focus = ((x0 + x1) / 2, (y0 + y1) / 2)
+                    focus = _face_center(a) or focus
                 return animate.still_frames(a, s["effect"], s["seconds"], s["fps"],
                                             s["strength"], focus, s["bounce"], max_side)
             with Image.open(s["b"]) as im:
@@ -6600,20 +6750,51 @@ class CaptionApp:
                                              s["hold_b"], s["fps"], s["loop_back"],
                                              s["color"], max_side)
 
+        def _progress(text: str) -> None:
+            self.root.after(0, lambda: info.config(text=text) if win.winfo_exists() else None)
+
         def _create() -> None:
             s = _settings()
             if s is None or state["busy"]:
                 return
+            if s["mode"] == "comfy":
+                cfg = self._comfy_settings()
+                if not cfg["workflow"]:
+                    _comfy_setup()
+                    cfg = self._comfy_settings()
+                    if not cfg["workflow"]:
+                        return
+                if not s["prompt"]:
+                    info.config(text="Describe the motion first.")
+                    return
+                self._anim_last_comfy = s["prompt"]
+                s.update(url=cfg["url"], workflow=cfg["workflow"])
             state["busy"] = True
+            cancel = threading.Event()
+            state["cancel"] = cancel
             create_btn.config(state="disabled")
+            stop_btn.pack(side="right", padx=(0, 6), before=create_btn)
             info.config(text="Making the animation…")
 
             def _work() -> None:
                 path, err = None, None
                 try:
-                    frames, durs = _render(s)
+                    if s["mode"] == "comfy":
+                        pictures = []
+                        for key in ("a", "b"):
+                            if s[key]:
+                                with Image.open(s[key]) as im:
+                                    pictures.append(animate.prepare(im, 1536))
+                        frames, durs, notes = comfy_client.generate(
+                            s["url"], s["workflow"], pictures, s["prompt"], _progress, cancel,
+                            match_shape=s["match"])
+                        log.info("COMFY_DONE  frames=%d  %s", len(frames), "; ".join(notes))
+                        # Keep it a sensible size for captioning.
+                        frames = [animate.prepare(f) for f in frames]
+                    else:
+                        frames, durs = _render(s)
                     stem = os.path.splitext(os.path.basename(s["a"]))[0]
-                    if s["mode"] == "transition":
+                    if s["mode"] == "transition" or (s["mode"] == "describe" and s["b"]):
                         stem += " to " + os.path.splitext(os.path.basename(s["b"]))[0]
                     base = _safe_filename(f"{stem} - {s['label']}")[:120] or "animation"
                     path = os.path.join(self._ANIM_DIR, base + ".webp")
@@ -6624,20 +6805,31 @@ class CaptionApp:
                     animate.save_webp(path, frames, durs)
                     log.info("ANIMATION_CREATED  %s  frames=%d", os.path.basename(path),
                              len(frames))
+                except comfy_client.ComfyError as e:
+                    err = str(e)
                 except Exception as e:
                     log.exception("ANIMATION_ERROR")
-                    err = str(e)
+                    err = f"Couldn't make the animation: {e}"
                 self.root.after(0, lambda: _done(path, err))
             threading.Thread(target=_work, daemon=True).start()
 
+        def _stop() -> None:
+            if state.get("cancel") is not None:
+                state["cancel"].set()
+                info.config(text="Stopping…")
+
         def _done(path: Optional[str], err: Optional[str]) -> None:
             state["busy"] = False
+            state["cancel"] = None
+            if win.winfo_exists():
+                stop_btn.pack_forget()
             if err:
                 if win.winfo_exists():
                     create_btn.config(state="normal")
-                    info.config(text="")
-                messagebox.showerror("Create Animation", f"Couldn't make the animation: {err}",
-                                     parent=win if win.winfo_exists() else self.root)
+                    info.config(text="Stopped." if err == "cancelled" else "")
+                if err != "cancelled":
+                    messagebox.showerror("Create Animation", err,
+                                         parent=win if win.winfo_exists() else self.root)
                 return
             _close()
             self._load_source(path, generated=True)
@@ -6645,16 +6837,71 @@ class CaptionApp:
                                                                   "Animation")
 
         def _close() -> None:
+            _stop()
+            plan_cancel = state.get("plan_cancel")
+            if plan_cancel is not None:
+                plan_cancel.set()
             state["gen"] += 1
             for key in ("job", "play"):
                 if state[key]:
                     win.after_cancel(state[key])
+            self._anim_last_desc = desc_box.get("1.0", "end-1c")
+            self._anim_last_comfy = comfy_box.get("1.0", "end-1c")
             self._anim_win = None
             win.destroy()
+
+        # Plan it: the AI writer turns the description into a storyboard.
+        def _plan() -> None:
+            text = desc_box.get("1.0", "end-1c").strip()
+            if not text:
+                plan_label.config(text="Describe what should happen first.")
+                return
+            settings = self._ensure_ai_ready()
+            if not settings or not win.winfo_exists():
+                return
+            self._anim_last_desc = text
+            has_second = bool(pics["b"])
+            plan_btn.config(state="disabled")
+            plan_model.config(text=f"{settings['model']} is planning it… (the first run "
+                                   "can take a while)")
+            cancel = threading.Event()
+            state["plan_cancel"] = cancel
+
+            def _work() -> None:
+                steps, err = None, None
+                try:
+                    raw = ai_writer.plan_animation(text, animate.PLAN_GUIDE, has_second,
+                                                   settings, cancel)
+                    steps = animate.normalize_plan(raw, has_second)
+                except ai_writer.AIWriterError as e:
+                    err = str(e)
+                except Exception as e:
+                    log.exception("ANIM_PLAN_ERROR")
+                    err = f"Unexpected error: {e}"
+                log.info("ANIM_PLAN_DONE  steps=%s error=%s", len(steps or []), bool(err))
+                self.root.after(0, lambda: _planned(steps, err))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _planned(steps: Optional[list], err: Optional[str]) -> None:
+            state["plan_cancel"] = None
+            if not win.winfo_exists():
+                return
+            plan_btn.config(state="normal")
+            plan_model.config(text="")
+            if err:
+                messagebox.showerror("Plan it", err, parent=win)
+                return
+            plan["steps"] = steps
+            plan_label.config(text="\n".join(f"{i}. {animate.describe_step(st)}"
+                                             for i, st in enumerate(steps, 1)))
+            plan_btn.config(text="Plan again")
+            _schedule()
+        plan_btn.config(command=_plan)
 
         btns = ttk.Frame(body)
         btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(14, 0))
         create_btn = ttk.Button(btns, text="Create", style="Accent.TButton", command=_create)
+        stop_btn = ttk.Button(btns, text="Stop", command=_stop)
         ttk.Button(btns, text="Close", command=_close).pack(side="right")
         create_btn.pack(side="right", padx=(0, 6))
         ttk.Label(body, style="Muted.TLabel", wraplength=560, justify="left",
@@ -6665,10 +6912,113 @@ class CaptionApp:
         for var in (still_var, trans_var, mode_var):
             var.trace_add("write", _layout)
         for var in (length_var, strength_var, bounce_var, face_var, hold_a_var, change_var,
-                    hold_b_var, loop_var, fps_var):
+                    hold_b_var, loop_var, fps_var, desc_loop_var):
             var.trace_add("write", _schedule)
         win.protocol("WM_DELETE_WINDOW", _close)
         _layout()
+
+    # ComfyUI connection (AI video): server address and the user's own
+    # API-format workflow, kept in recent.json ("comfy"); the workflow file
+    # is copied into comfyui/ so it keeps working if the original moves.
+    _COMFY_DIR = os.path.join(BASE_DIR, "comfyui")
+
+    def _comfy_settings(self) -> dict:
+        cfg = recent_store.get_setting("comfy", {}) or {}
+        wf = cfg.get("workflow") or ""
+        return {"url": cfg.get("url") or comfy_client.DEFAULT_URL,
+                "workflow": wf if wf and os.path.isfile(wf) else ""}
+
+    def _comfy_settings_dialog(self, parent=None) -> None:
+        parent = parent or self.root
+        cfg = self._comfy_settings()
+        dlg = tk.Toplevel(parent)
+        dlg.title("AI Video — ComfyUI")
+        dlg.transient(parent)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, wraplength=470, justify="left", text=(
+            "AI video needs a strong NVIDIA graphics card (roughly 8–24 GB of video "
+            "memory), so it runs in ComfyUI — free, on this PC, another PC at home, or a "
+            "rented cloud GPU — and Caption Creator sends it your picture and description."
+            "\n\n1. In ComfyUI, open an image-to-video workflow (e.g. Workflow → Browse "
+            "Templates → Video, then a Wan or LTX image-to-video one), download the models "
+            "it asks for, and check it runs.\n2. Use Workflow → Export (API) and choose that "
+            "file below.\n\nYour picture goes into its Load Image node and your description "
+            "into its prompt (or wherever you type %prompt% and %image%).")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="Address:").grid(row=1, column=0, sticky="w", pady=(12, 4))
+        url_var = tk.StringVar(value=cfg["url"])
+        ttk.Entry(body, textvariable=url_var, width=36).grid(row=1, column=1, sticky="ew",
+                                                             padx=6, pady=(12, 4))
+        ttk.Label(body, text="Workflow:").grid(row=2, column=0, sticky="w", pady=4)
+        wf_var = tk.StringVar(value=cfg["workflow"])
+        wf_label = ttk.Label(body, style="Muted.TLabel", width=36,
+                             text=os.path.basename(cfg["workflow"]) or "(none chosen)")
+        wf_label.grid(row=2, column=1, sticky="w", padx=6)
+        status = ttk.Label(body, wraplength=470, justify="left", text="")
+        status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        def _choose_wf() -> None:
+            path = filedialog.askopenfilename(parent=dlg, title="ComfyUI workflow (API format)",
+                                              filetypes=[("Workflow", "*.json"),
+                                                         ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                wf = comfy_client.load_workflow(path)
+                _filled, notes = comfy_client.fill_workflow(wf, ["test.png"], "test")
+            except comfy_client.ComfyError as e:
+                status.config(text=f"⚠ {e}", foreground="#c0392b")
+                return
+            wf_var.set(path)
+            wf_label.config(text=os.path.basename(path))
+            status.config(text="✓ Ready: " + "; ".join(notes), foreground="")
+
+        def _test() -> None:
+            status.config(text="Connecting…", foreground="")
+            url = url_var.get().strip()
+
+            def _work() -> None:
+                try:
+                    text, ok = "✓ " + (comfy_client.describe_server(
+                        comfy_client.check(url)) or "Connected"), True
+                except comfy_client.ComfyError as e:
+                    text, ok = f"⚠ {e}", False
+                self.root.after(0, lambda: status.config(
+                    text=text, foreground="" if ok else "#c0392b")
+                    if dlg.winfo_exists() else None)
+            threading.Thread(target=_work, daemon=True).start()
+
+        ttk.Button(body, text="Test", style="Small.TButton", command=_test).grid(
+            row=1, column=2, pady=(12, 4))
+        ttk.Button(body, text="Choose…", style="Small.TButton", command=_choose_wf).grid(
+            row=2, column=2)
+
+        def _save() -> None:
+            wf = wf_var.get()
+            if wf and os.path.abspath(os.path.dirname(wf)) != os.path.abspath(self._COMFY_DIR):
+                try:
+                    os.makedirs(self._COMFY_DIR, exist_ok=True)
+                    dest = os.path.join(self._COMFY_DIR, os.path.basename(wf))
+                    shutil.copyfile(wf, dest)
+                    wf = dest
+                except OSError as e:
+                    messagebox.showerror("AI Video", f"Couldn't keep a copy of the workflow: {e}",
+                                         parent=dlg)
+                    return
+            recent_store.set_setting("comfy", {"url": url_var.get().strip()
+                                               or comfy_client.DEFAULT_URL, "workflow": wf})
+            dlg.destroy()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=_save).pack(
+            side="right", padx=(0, 6))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
 
     # ------------------------------------------------------------------
     # Theme editor — make or change a personal theme (themes/<name>.json),

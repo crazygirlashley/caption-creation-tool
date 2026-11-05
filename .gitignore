@@ -61,5 +61,8 @@ autosave/
 # animations made with File → Create Animation (personal)
 animations/
 
+# the user's ComfyUI workflow for AI video (personal)
+comfyui/
+
 # Source art for tools/build_assets.py (see themes/CREDITS.md)
 tools/theme_art_src/

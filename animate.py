@@ -1,9 +1,12 @@
 """Make an animation from still pictures — pure PIL, no Tk.
 
-Two kinds (File → Create Animation…):
+Three kinds (File → Create Animation…):
 - one picture brought to life: a slow zoom, a pan, a pulse or a shake;
 - a transition from one picture to another (crossfade, wipe, slide, …),
-  e.g. a "before" picture turning into the "after".
+  e.g. a "before" picture turning into the "after";
+- a storyboard of those moves one after another, usually planned by the
+  AI writer from a description (see render_storyboard).
+(Real AI-generated motion comes from ComfyUI instead — comfy_client.py.)
 
 Each returns (frames, durations_ms); the app saves them as a lossless
 animated WebP and opens that like any GIF, so captions, text boxes and the
@@ -325,6 +328,323 @@ def transition_frames(a: Image.Image, b: Image.Image, effect: str, hold_a: float
             frames.append(blend(b, a, effect, i / n, noise, smoke))
             durations.append(step_ms)
     return frames, durations
+
+
+# ---------------------------------------------------------------------------
+# Storyboards: a list of steps played one after another — what the AI plans
+# from a description ("hold, zoom into her face, purple smoke bomb to the
+# after picture"). Each step carries on from where the last one ended (the
+# same picture, zoom and spot), so the whole thing flows as one shot.
+#
+#   {"type": "hold",       "picture": "first"|"second", "seconds": 1}
+#   {"type": "zoom",       "to": 1.4, "focus": "face"|"center"|"top"|…|[x, y], "seconds": 2}
+#   {"type": "pan",        "direction": "left"|"right"|"up"|"down", "seconds": 2}
+#   {"type": "shake",      "strength": 0-1, "seconds": 0.6}
+#   {"type": "pulse",      "beats": 2, "strength": 0-1, "seconds": 1.2}
+#   {"type": "flash",      "color": "#ffffff", "seconds": 0.4}
+#   {"type": "transition", "effect": "smoke"|…, "to": "first"|"second",
+#                          "color": "#b05cc9", "seconds": 1.5}
+# ---------------------------------------------------------------------------
+
+STEP_TYPES = ("hold", "zoom", "pan", "shake", "pulse", "flash", "transition")
+MAX_STEPS = 14
+MAX_SECONDS = 20.0
+
+_STEP_ALIASES = {
+    "show": "hold", "pause": "hold", "wait": "hold", "still": "hold", "stay": "hold",
+    "zoom_in": "zoom", "zoom_out": "zoom", "zoomin": "zoom", "zoomout": "zoom", "push": "zoom",
+    "move": "pan", "slide_view": "pan", "scroll": "pan",
+    "tremble": "shake", "jitter": "shake", "quake": "shake",
+    "heartbeat": "pulse", "throb": "pulse", "beat": "pulse",
+    "change": "transition", "switch": "transition", "reveal": "transition",
+    "transform": "transition", "fade": "transition", "cut": "transition",
+    "blink": "flash", "strobe": "flash",
+}
+
+_FOCUS_WORDS = {
+    "center": (0.5, 0.5), "centre": (0.5, 0.5), "middle": (0.5, 0.5),
+    "top": (0.5, 0.25), "bottom": (0.5, 0.75), "left": (0.25, 0.5), "right": (0.75, 0.5),
+    "chest": (0.5, 0.45), "body": (0.5, 0.55), "legs": (0.5, 0.78), "feet": (0.5, 0.9),
+    "head": (0.5, 0.2),
+}
+
+_COLOR_WORDS = {
+    "pink": "#ff5fb0", "hot pink": "#ff2d95", "purple": "#b05cc9", "violet": "#8a3cff",
+    "lavender": "#c9a3ff", "lilac": "#c8a2c8", "red": "#e8322e", "blue": "#4f7dff",
+    "light blue": "#8ecbff", "cyan": "#3fe0ff", "teal": "#1fb5a8", "green": "#3fcf6a",
+    "yellow": "#ffd93d", "gold": "#e5b53a", "orange": "#ff8a2b", "white": "#ffffff",
+    "black": "#202024", "grey": "#8c8c8c", "gray": "#8c8c8c", "silver": "#c8c8d0",
+}
+
+# For the AI: what it may use, in words it can follow.
+PLAN_GUIDE = (
+    "Steps (play in order; each continues from where the last ended):\n"
+    '- {"type": "hold", "picture": "first" or "second", "seconds": 1} — show a picture '
+    "without moving (use it first to choose the starting picture)\n"
+    '- {"type": "zoom", "to": 1.0-2.5, "focus": "face"|"center"|"top"|"bottom"|"left"|'
+    '"right"|"chest"|"legs", "seconds": 2} — zoom in (bigger number) or back out (1.0) '
+    "toward a spot\n"
+    '- {"type": "pan", "direction": "left"|"right"|"up"|"down", "seconds": 2} — slide '
+    "the view across the picture\n"
+    '- {"type": "shake", "strength": 0.1-1, "seconds": 0.6} — a jolt or tremble\n'
+    '- {"type": "pulse", "beats": 1-4, "strength": 0.1-1, "seconds": 1.2} — a '
+    "heartbeat-like throb\n"
+    '- {"type": "flash", "color": "#ffffff", "seconds": 0.4} — a quick flash of color\n'
+    '- {"type": "transition", "effect": EFFECT, "to": "first" or "second", '
+    '"color": "#hex (smoke only)", "seconds": 1.5} — change to a picture (or to the same '
+    "picture, e.g. a puff of smoke)\n"
+    "EFFECT is one of: crossfade, white (fade through white), black (fade through "
+    "black), wipe, slide, dissolve (pixels), circle (circle reveal), zoom (zoom through), "
+    "smoke (a colored smoke bomb).\n"
+)
+
+
+def _num(v, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _color(v, default: str) -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in _COLOR_WORDS:
+            return _COLOR_WORDS[s]
+        h = s.lstrip("#")
+        if len(h) == 3 and all(c in "0123456789abcdef" for c in h):
+            h = "".join(c * 2 for c in h)
+        if len(h) == 6 and all(c in "0123456789abcdef" for c in h):
+            return "#" + h
+        for word, hexv in _COLOR_WORDS.items():      # "light purple smoke"
+            if word in s:
+                return hexv
+    return default
+
+
+def _picture(v, has_second: bool, default: str = "first") -> str:
+    s = str(v).strip().lower() if v is not None else ""
+    if s in ("second", "2", "after", "b", "end", "last", "new", "other"):
+        return "second" if has_second else "first"
+    if s in ("first", "1", "before", "a", "start", "original"):
+        return "first"
+    return default if (default == "first" or has_second) else "first"
+
+
+def _effect(v) -> str:
+    s = str(v or "").strip().lower().replace("-", " ").replace("_", " ")
+    if s in TRANSITIONS.values():
+        return s
+    for label, key in TRANSITIONS.items():
+        if s == label.lower():
+            return key
+    for word, key in (("smoke", "smoke"), ("white", "white"), ("black", "black"),
+                      ("wipe", "wipe"), ("slide", "slide"), ("pixel", "dissolve"),
+                      ("dissolve", "dissolve"), ("circle", "circle"), ("iris", "circle"),
+                      ("zoom", "zoom"), ("cross", "crossfade"), ("fade", "crossfade"),
+                      ("blend", "crossfade")):
+        if word in s:
+            return key
+    return "crossfade"
+
+
+def normalize_plan(steps, has_second: bool) -> list:
+    """Clean up a storyboard (typically from an AI): unknown steps dropped,
+    names and values mapped and clamped, length capped. Always returns a
+    playable list (at least one step)."""
+    if isinstance(steps, dict):
+        steps = steps.get("steps") or steps.get("plan") or [steps]
+    out, total = [], 0.0
+    current = "first"
+    for raw in steps if isinstance(steps, list) else []:
+        if not isinstance(raw, dict) or len(out) >= MAX_STEPS:
+            continue
+        kind = str(raw.get("type") or raw.get("step") or raw.get("action") or "").lower()
+        kind = kind.strip().replace(" ", "_")
+        kind = _STEP_ALIASES.get(kind, kind)
+        if kind not in STEP_TYPES:
+            continue
+        step = {"type": kind}
+        default_secs = {"hold": 1.0, "shake": 0.6, "flash": 0.4, "pulse": 1.2}.get(kind, 1.5)
+        step["seconds"] = _num(raw.get("seconds", raw.get("duration")), default_secs, 0.1, 6)
+        if total + step["seconds"] > MAX_SECONDS:
+            break
+        if kind == "hold":
+            step["picture"] = current = _picture(raw.get("picture"), has_second, current)
+        elif kind == "zoom":
+            to = raw.get("to", raw.get("zoom", raw.get("amount")))
+            if to is None:
+                to = 1.0 if "out" in str(raw.get("type", "")).lower() else 1.4
+            step["to"] = _num(to, 1.4, 1.0, 3.0)
+            focus = raw.get("focus", "face")
+            if isinstance(focus, (list, tuple)) and len(focus) == 2:
+                step["focus"] = [_num(focus[0], 0.5, 0, 1), _num(focus[1], 0.5, 0, 1)]
+            else:
+                f = str(focus).strip().lower()
+                step["focus"] = f if (f == "face" or f in _FOCUS_WORDS) else "face"
+        elif kind == "pan":
+            d = str(raw.get("direction", "right")).strip().lower()
+            step["direction"] = d if d in ("left", "right", "up", "down") else "right"
+        elif kind == "shake":
+            step["strength"] = _num(raw.get("strength"), 0.5, 0.05, 1)
+        elif kind == "pulse":
+            step["beats"] = int(_num(raw.get("beats"), 2, 1, 6))
+            step["strength"] = _num(raw.get("strength"), 0.5, 0.05, 1)
+        elif kind == "flash":
+            step["color"] = _color(raw.get("color"), "#ffffff")
+        elif kind == "transition":
+            step["effect"] = _effect(raw.get("effect", raw.get("style")))
+            other = "second" if current == "first" else "first"
+            step["to"] = current = _picture(raw.get("to", raw.get("picture")), has_second,
+                                            other if has_second else "first")
+            if step["effect"] in COLORED:
+                step["color"] = _color(raw.get("color"), DEFAULT_SMOKE)
+        out.append(step)
+        total += step["seconds"]
+    return out or [{"type": "hold", "picture": "first", "seconds": 1.0}]
+
+
+def describe_step(step: dict) -> str:
+    """One line a person can read, e.g. "Zoom in toward the face — 2.0s"."""
+    k, secs = step["type"], f"{step['seconds']:.1f}s"
+    if k == "hold":
+        return f"Show the {step['picture']} picture — {secs}"
+    if k == "zoom":
+        f = step["focus"]
+        where = ("the face" if f == "face" else f"the {f}" if isinstance(f, str)
+                 else "a spot")
+        verb = "Zoom back out" if step["to"] <= 1.01 else f"Zoom in to {step['to']:.1f}×"
+        return f"{verb} toward {where} — {secs}"
+    if k == "pan":
+        return f"Pan {step['direction']} — {secs}"
+    if k == "shake":
+        return f"Shake ({round(step['strength'] * 100)}%) — {secs}"
+    if k == "pulse":
+        return f"Pulse ×{step['beats']} — {secs}"
+    if k == "flash":
+        return f"Flash {step['color']} — {secs}"
+    label = next((lbl for lbl, key in TRANSITIONS.items() if key == step["effect"]),
+                 step["effect"])
+    extra = f" ({step['color']})" if "color" in step else ""
+    return f"{label}{extra} to the {step['to']} picture — {secs}"
+
+
+def render_storyboard(first: Image.Image, second: Optional[Image.Image], steps: list,
+                      fps: float = 12, faces: Optional[dict] = None,
+                      loop: bool = True, max_side: int = MAX_SIDE) -> tuple:
+    """Play `steps` (see normalize_plan) into (frames, durations_ms).
+    `faces` maps "first"/"second" to a face's (x, y) center, for zooms that
+    head for the face. With `loop`, a short crossfade back to the opening
+    shot is added when it ends somewhere else, so the GIF loops smoothly."""
+    pics = {"first": prepare(first, max_side)}
+    if second is not None:
+        pics["second"] = fit_cover(prepare(second, max(pics["first"].size) * 2),
+                                   pics["first"].size)
+    faces = faces or {}
+    step_ms = round(1000 / fps)
+    frames: list = []
+    durations: list = []
+    # The camera: which picture, how far in, and where it's looking.
+    cam = {"pic": "first", "zoom": 1.0, "cx": 0.5, "cy": 0.5}
+    if steps and steps[0]["type"] == "hold":
+        cam["pic"] = steps[0].get("picture", "first") if steps[0].get(
+            "picture") in pics else "first"
+    start = dict(cam)
+
+    def view(c: dict) -> Image.Image:
+        return _view(pics[c["pic"]], c["zoom"], c["cx"], c["cy"])
+
+    def emit(img: Image.Image, ms: int) -> None:
+        frames.append(img)
+        durations.append(max(20, int(ms)))
+
+    def n_frames(secs: float) -> int:
+        return max(2, round(secs * fps))
+
+    for step in steps:
+        k = step["type"]
+        if k == "hold":
+            if step.get("picture") in pics:
+                cam["pic"] = step["picture"]
+            emit(view(cam), step["seconds"] * 1000)
+        elif k == "zoom":
+            f = step["focus"]
+            if f == "face":
+                tx, ty = faces.get(cam["pic"], (0.5, 0.4))
+            elif isinstance(f, list):
+                tx, ty = f
+            else:
+                tx, ty = _FOCUS_WORDS.get(f, (0.5, 0.5))
+            z0, x0, y0 = cam["zoom"], cam["cx"], cam["cy"]
+            z1 = step["to"]
+            if z1 <= 1.01:
+                tx, ty = 0.5, 0.5
+            n = n_frames(step["seconds"])
+            for i in range(1, n + 1):
+                k2 = _ease(i / n)
+                cam.update(zoom=z0 + (z1 - z0) * k2, cx=x0 + (tx - x0) * k2,
+                           cy=y0 + (ty - y0) * k2)
+                emit(view(cam), step_ms)
+        elif k == "pan":
+            cam["zoom"] = max(cam["zoom"], 1.25)
+            axis = "cx" if step["direction"] in ("left", "right") else "cy"
+            # "right" moves the view toward the right side of the picture,
+            # from wherever it is now.
+            end = 0.85 if step["direction"] in ("right", "down") else 0.15
+            n = n_frames(step["seconds"])
+            begin = cam[axis]
+            for i in range(1, n + 1):
+                cam[axis] = begin + (end - begin) * _ease(i / n)
+                emit(view(cam), step_ms)
+        elif k == "shake":
+            rnd = random.Random(len(frames))
+            n = n_frames(step["seconds"])
+            zoom = max(cam["zoom"], 1.0 + 0.1 * step["strength"])
+            j = 0.06 * step["strength"] / zoom
+            for i in range(n):
+                fade = 1 - i / n
+                c = dict(cam, zoom=zoom, cx=cam["cx"] + rnd.uniform(-j, j) * fade,
+                         cy=cam["cy"] + rnd.uniform(-j, j) * fade)
+                emit(view(c), step_ms)
+            emit(view(dict(cam, zoom=zoom)), step_ms)
+            cam["zoom"] = zoom
+        elif k == "pulse":
+            n = n_frames(step["seconds"])
+            for i in range(1, n + 1):
+                beat = 0.5 * (1 - math.cos(2 * math.pi * step["beats"] * i / n))
+                emit(view(dict(cam, zoom=cam["zoom"] * (1 + 0.12 * step["strength"] * beat))),
+                     step_ms)
+        elif k == "flash":
+            base = view(cam)
+            flat = Image.new("RGB", base.size, _rgb_hex(step["color"]))
+            n = n_frames(step["seconds"])
+            for i in range(1, n + 1):
+                emit(Image.blend(base, flat, math.sin(math.pi * i / n) ** 2 * 0.9), step_ms)
+        elif k == "transition":
+            a = view(cam)
+            target = step["to"] if step["to"] in pics else "first"
+            b = pics[target]
+            effect = step["effect"]
+            noise = _dissolve_noise(a.size) if effect == "dissolve" else None
+            smoke = _Smoke(a.size, step.get("color", DEFAULT_SMOKE)) if effect == "smoke" else None
+            n = n_frames(step["seconds"])
+            for i in range(1, n):
+                emit(blend(a, b, effect, i / n, noise, smoke), step_ms)
+            emit(b, step_ms)
+            cam = {"pic": target, "zoom": 1.0, "cx": 0.5, "cy": 0.5}
+    if not frames:
+        emit(view(cam), 1000)
+    if loop and (cam["pic"], round(cam["zoom"], 2)) != (start["pic"], round(start["zoom"], 2)):
+        a, b = view(cam), view(start)
+        n = n_frames(0.6)
+        for i in range(1, n):
+            emit(blend(a, b, "crossfade", i / n), step_ms)
+    return frames, durations
+
+
+def _rgb_hex(h: str) -> tuple:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def save_webp(path: str, frames: list, durations: list) -> None:
