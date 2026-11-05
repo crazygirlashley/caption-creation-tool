@@ -149,7 +149,6 @@ _FONT_DIRS = [
     os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
     os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Microsoft\Windows\Fonts"),
 ]
-_FONT_DIR = _FONT_DIRS[0]
 
 _PILL_PRESETS = {
     "Pink":   ("#ffc0cb", "#dd2bbc"),   # (bg, stroke)
@@ -1490,9 +1489,6 @@ def _find_series_part(name: str, part: int, folders: list,
     return max(found)[1] if found else None
 
 
-_CENSOR_STYLES = ("blur", "pixelate", "bar")
-
-
 def _apply_censors(frame: Image.Image, censors: list) -> Image.Image:
     """Blur, pixelate or bar out regions of the picture. Each censor is
     {"x", "y", "w", "h"} (fractions of the picture) plus "style" and, for
@@ -1672,24 +1668,6 @@ def _draw_text_overlay(draw: ImageDraw.ImageDraw,
         _draw_rich(shadow_draw, (pos[0] + ox, pos[1] + oy), text, font,
                    (0, 0, 0, 180), stroke_width, (0, 0, 0, 180), emoji_color=False)
     _draw_rich(draw, pos, text, font, fc, stroke_width, sc)
-
-
-def _draw_centered(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
-                    color: str, ax: int, ay: int, aw: int, ah: int,
-                    padding: int = 0) -> None:
-    if not text.strip():
-        return
-    inner_w = aw - padding * 2
-    lines = _wrap_lines(text, font, inner_w, draw)
-    line_h = draw.textbbox((0, 0), "Ag", font=font)[3] + 2
-    block_h = len(lines) * line_h
-    ty = ay + max(padding, (ah - block_h) // 2)
-    fc = _hex_to_rgb(color)
-    for line in lines:
-        tw = _text_w(draw, line, font)
-        tx = ax + padding + max(0, (inner_w - tw) // 2)
-        _draw_rich(draw, (tx, ty), line, font, fc)
-        ty += line_h
 
 
 def _chat_measure_message(text: str, font: ImageFont.FreeTypeFont,
@@ -3371,10 +3349,6 @@ class CaptionApp:
         self._gif_colors_var.trace_add(
             "write", lambda *_: self._gif_colors_label.config(text=f"{self._gif_colors_var.get()} colors"))
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
-
-    def _row(self, parent, r, label, widget, pady=4):
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=pady)
-        widget.grid(row=r, column=1, sticky="ew", padx=(6, 0), pady=pady)
 
     def _setup_font_autocomplete(self, combo: ttk.Combobox) -> None:
         """Let the user type into a font Combobox, narrowing the dropdown to

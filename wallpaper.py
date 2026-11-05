@@ -16,7 +16,6 @@ from PIL import Image, ImageSequence
 
 import app_paths
 
-MODES = ("fit", "tile", "off")
 # Frames kept from an animated background: a full-window frame costs a few
 # MB as a Tk image, so long animations are thinned out (timing preserved).
 MAX_FRAMES = 40

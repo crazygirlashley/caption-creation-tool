@@ -275,25 +275,6 @@ def da_authorize(client_id: str, open_browser=None) -> dict:
     return tokens
 
 
-def da_ensure_token(client_id: str, open_browser=None) -> str:
-    """Return a valid access token, refreshing or re-authorizing as needed."""
-    tokens = _load_tokens()
-
-    if tokens and time.time() < tokens.get("expires_at", 0):
-        return tokens["access_token"]
-
-    # Try silent refresh
-    if tokens and tokens.get("refresh_token"):
-        try:
-            return _refresh_tokens(client_id, tokens["refresh_token"])
-        except Exception:
-            pass  # fall through to full re-auth
-
-    # Full PKCE flow
-    tokens = da_authorize(client_id, open_browser=open_browser)
-    return tokens["access_token"]
-
-
 def da_has_cached_token() -> bool:
     """Return True if a non-expired token exists in the cache (no network call)."""
     tokens = _load_tokens()
