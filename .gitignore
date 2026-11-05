@@ -40,6 +40,8 @@ themes/*.json
 !themes/Goth.json
 !themes/French Maid.json
 !themes/Basic.json
+# backgrounds copied in by the theme editor for personal themes
+themes/*_background.*
 
 # Local AI writer settings (server address, model, optional API key)
 ai_settings.json
@@ -55,6 +57,9 @@ backgrounds/
 
 # autosaved session (crash recovery) — personal, never committed
 autosave/
+
+# animations made with File → Create Animation (personal)
+animations/
 
 # Source art for tools/build_assets.py (see themes/CREDITS.md)
 tools/theme_art_src/

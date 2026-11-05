@@ -345,6 +345,170 @@ def _apply_layout_styles(style: ttk.Style, c: Optional[dict]) -> None:
         style.configure("CardMuted.TLabel", foreground="#6b6b6b")
 
 
+# ---------------------------------------------------------------------------
+# Making your own themes (Settings → Theme → Theme editor). A custom theme is
+# just another themes/*.json, so it behaves exactly like a built-in one.
+# ---------------------------------------------------------------------------
+
+# Every color role, with the name the theme editor shows for it.
+COLOR_ROLES = (
+    ("bg", "Window background"), ("panel", "Panels & buttons"), ("input_bg", "Text boxes"),
+    ("hover", "Hover"), ("border", "Borders"), ("fg", "Text"), ("muted_fg", "Hints & labels"),
+    ("select_bg", "Selected text"), ("accent", "Accent (main buttons)"),
+    ("accent_fg", "Text on accent"), ("accent_hover", "Accent hover"),
+    ("canvas", "Preview backdrop"), ("canvas_fg", "Preview text"),
+    ("canvas_muted", "Preview hints"),
+)
+
+
+def _rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _hex(rgb) -> str:
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """The color t of the way from a to b."""
+    ra, rb = _rgb(a), _rgb(b)
+    return _hex(x + (y - x) * t for x, y in zip(ra, rb))
+
+
+def luma(color: str) -> float:
+    r, g, b = _rgb(color)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def derive_palette(bg: str, fg: str, accent: str) -> dict:
+    """A whole palette from three colors: the window background, the text
+    and the accent. Light or dark themes both come out readable."""
+    dark = luma(bg) < 128
+    lift = "#ffffff" if not dark else "#000000"   # toward the panels' side
+    panel = mix(bg, "#ffffff", 0.55) if not dark else mix(bg, "#ffffff", 0.07)
+    return {
+        "bg": bg,
+        "panel": panel,
+        "input_bg": mix(bg, "#ffffff", 0.85) if not dark else mix(bg, "#000000", 0.25),
+        "hover": mix(panel, accent, 0.15),
+        "border": mix(bg, fg, 0.3),
+        "fg": fg,
+        "muted_fg": mix(fg, bg, 0.4),
+        "select_bg": mix(accent, bg, 0.55),
+        "accent": accent,
+        "accent_fg": "#ffffff" if luma(accent) < 150 else "#1a1a1a",
+        "accent_hover": mix(accent, lift if dark else "#ffffff", 0.18),
+        "canvas": mix(bg, "#000000", 0.08) if not dark else mix(bg, "#000000", 0.3),
+        "canvas_fg": fg,
+        "canvas_muted": mix(fg, bg, 0.4),
+    }
+
+
+def is_builtin(name: str) -> bool:
+    return name in _CORE_THEME_NAMES
+
+
+def theme_data(name: str) -> dict:
+    """A theme's JSON as stored (colors with defaults filled in, plus its
+    background settings), for editing."""
+    data = {}
+    for fname in os.listdir(_THEMES_DIR) if os.path.isdir(_THEMES_DIR) else ():
+        if fname.lower().endswith(".json"):
+            d = _read_json(os.path.join(_THEMES_DIR, fname)) or {}
+            if (d.get("name") or os.path.splitext(fname)[0]) == name:
+                data = d
+                break
+    if not data and name in get_palettes():
+        data = dict(get_palettes()[name])
+        bg = data.pop("background", None)
+        if isinstance(bg, dict):
+            data.update(background=bg["path"], background_mode=bg["mode"],
+                        background_dim=bg["dim"], background_animate=bg["animate"],
+                        background_scale=bg["scale"])
+    if not all(k in data for k in _REQUIRED_KEYS):
+        data = {**(_read_json(os.path.join(_THEMES_DIR, "Basic.json")) or {}), **data}
+    for key, default in _ACCENT_DEFAULTS.items():
+        data.setdefault(key, default)
+    data.pop("version", None)
+    data.pop("_comment", None)
+    return data
+
+
+def _safe_file_name(name: str) -> str:
+    keep = "".join(c for c in name if c.isalnum() or c in " -_()").strip()
+    return keep or "My theme"
+
+
+def save_custom_theme(data: dict) -> str:
+    """Write a custom theme to themes/<name>.json; a background picture
+    outside themes/ is copied in beside it. Returns the theme's name."""
+    name = str(data.get("name") or "").strip()
+    if not name or is_builtin(name) or name.lower() == "basic":
+        raise ValueError("Pick a name that isn't one of the built-in themes.")
+    os.makedirs(_THEMES_DIR, exist_ok=True)
+    out = {"name": name}
+    for key, _label in COLOR_ROLES:
+        out[key] = data[key]
+    if data.get("font"):
+        out["font"] = data["font"]
+    bg = data.get("background")
+    if bg:
+        src = bg if os.path.isabs(bg) else os.path.join(_THEMES_DIR, bg)
+        if os.path.isfile(src):
+            if os.path.abspath(os.path.dirname(src)) != os.path.abspath(_THEMES_DIR):
+                ext = os.path.splitext(src)[1].lower()
+                dest_name = f"{_safe_file_name(name)}_background{ext}"
+                shutil.copyfile(src, os.path.join(_THEMES_DIR, dest_name))
+                bg = dest_name
+            else:
+                bg = os.path.basename(src)
+            out["background"] = bg
+            for key in ("background_mode", "background_dim", "background_animate",
+                        "background_scale", "background_gap", "background_stagger"):
+                if key in data:
+                    out[key] = data[key]
+    with open(os.path.join(_THEMES_DIR, f"{_safe_file_name(name)}.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2)
+    get_palettes(force_reload=True)
+    return name
+
+
+def delete_custom_theme(name: str) -> None:
+    """Remove a custom theme's JSON (and a background it owns)."""
+    if is_builtin(name):
+        raise ValueError("Built-in themes can't be deleted.")
+    for fname in os.listdir(_THEMES_DIR):
+        path = os.path.join(_THEMES_DIR, fname)
+        if fname.lower().endswith(".json"):
+            d = _read_json(path) or {}
+            if (d.get("name") or os.path.splitext(fname)[0]) == name:
+                bg = d.get("background")
+                os.remove(path)
+                if bg and bg.startswith(f"{_safe_file_name(name)}_background"):
+                    try:
+                        os.remove(os.path.join(_THEMES_DIR, bg))
+                    except OSError:
+                        pass
+    get_palettes(force_reload=True)
+
+
+def preview_palette(name: str, data: dict) -> None:
+    """Show unsaved edits: put `data` in the palette cache under `name`
+    until the next reload (get_palettes(force_reload=True))."""
+    palettes = get_palettes()
+    palette = {key: data[key] for key, _label in COLOR_ROLES}
+    if data.get("font"):
+        palette["font"] = data["font"]
+    bg = _theme_background_from(data)
+    if bg:
+        palette["background"] = bg
+    palettes[name] = palette
+
+
 def _ui_family() -> str:
     try:
         return tkfont.nametofont("TkDefaultFont").cget("family")

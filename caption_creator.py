@@ -19,6 +19,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+import tkinter.font as tkfont
 import traceback
 from typing import Optional
 import webbrowser
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover
     TkinterDnD = None
 
 import ai_writer
+import animate
 import da_client
 import recent_store
 import spellcheck
@@ -210,6 +212,30 @@ def _app_version() -> str:
 
 # Release notes for the "What's new" window: version -> [(section, [(name, text)])].
 _WHATS_NEW = {
+    "1.1.0": [
+        ("Animation", [
+            ("Create Animation", "File → Create Animation brings a still picture to life (slow "
+             "zoom, pan, pulse, shake) or turns one picture into another — crossfade, wipe, "
+             "slide, dissolve, circle reveal, zoom, or a smoke bomb in the color you pick"),
+            ("Keep every 2nd frame", "beside Frames and Speed: a smaller GIF that plays just "
+             "as long"),
+            ("Smarter Fit under…", "when a GIF still won't fit, offers to drop frames or "
+             "shorten it"),
+        ]),
+        ("Text Boxes", [
+            ("Snapping guides", "boxes line up with the picture's center and edges and with "
+             "each other as you drag (hold Alt not to); arrow keys nudge 1 pixel"),
+            ("Saved styles", "save a box's look by name and give it to any box in one click"),
+            ("More control", "copy & paste boxes (even onto another picture), bring to front / "
+             "send to back, Ctrl+D duplicates, right-click for everything"),
+        ]),
+        ("AI & themes", [
+            ("AI looks at your picture", "a picture model describes it so the story fits who "
+             "and what's in it (Settings → AI Writer → Picture model)"),
+            ("Theme Editor", "Settings → Theme → Theme Editor: make your own theme from three "
+             "colors, with your own background picture and font"),
+        ]),
+    ],
     "1.0.0": [
         ("Captions", [
             ("Text Boxes format", "no caption panel: Photoshop-style text boxes on the picture. "
@@ -1814,6 +1840,69 @@ _TB_DEFAULT = {
 }
 _TB_SHAPES = ("box", "speech", "thought")
 
+# Saved box styles (Text tab → Style): the look of a box without its text,
+# place or tail. The text size is kept relative to the picture's height
+# ("size_frac") so a style reads the same on a small or a huge picture.
+_TB_STYLE_KEYS = ("font", "bold", "color", "color2", "align", "outline", "outline_color",
+                  "bg", "bg_opacity", "padding", "radius", "shadow", "shape", "border",
+                  "border_color", "angle")
+
+
+def _tb_style_of(box: dict, pic_h: Optional[int]) -> dict:
+    b = _tb(box)
+    style = {k: b[k] for k in _TB_STYLE_KEYS}
+    style["size"] = float(b["size"])
+    if pic_h:
+        style["size_frac"] = round(float(b["size"]) / pic_h, 5)
+    return style
+
+
+def _tb_apply_style(box: dict, style: dict, pic_h: Optional[int]) -> dict:
+    """Give `box` (in place) the saved look; its text and place are kept."""
+    for k in _TB_STYLE_KEYS:
+        if k in style:
+            box[k] = style[k]
+    if pic_h and style.get("size_frac"):
+        box["size"] = round(max(4.0, min(400.0, float(style["size_frac"]) * pic_h)), 1)
+    elif style.get("size"):
+        box["size"] = float(style["size"])
+    return box
+
+
+# Dragging a box: its edges and center snap to these within this many screen
+# pixels — the picture's edges, an inset margin, its center lines, and the
+# other boxes' edges and centers.
+_TB_SNAP_PX = 7
+_TB_SNAP_MARGIN = 0.03
+
+
+def _snap_targets(origin: float, length: float, others: list) -> list:
+    """Snap lines along one axis: the picture spans origin..origin+length,
+    `others` are the (start, end) spans of the other boxes."""
+    m = _TB_SNAP_MARGIN
+    lines = [origin, origin + length * m, origin + length / 2, origin + length * (1 - m),
+             origin + length]
+    for a, b in others:
+        lines += [a, (a + b) / 2, b]
+    return lines
+
+
+def _snap_shift(span: tuple, targets: list, threshold: float) -> tuple:
+    """(shift, guide lines) that line the span's start, center or end up
+    with the nearest target within `threshold`; (0, []) if none is close."""
+    a, b = span
+    edges = (a, (a + b) / 2, b)
+    best = None
+    for t in targets:
+        for e in edges:
+            if abs(t - e) <= threshold and (best is None or abs(t - e) < abs(best)):
+                best = t - e
+    if best is None:
+        return 0.0, []
+    moved = [e + best for e in edges]
+    guides = sorted({t for t in targets if any(abs(t - e) < 0.5 for e in moved)})
+    return best, guides
+
 
 def _tb(box: dict) -> dict:
     """A text box with every field filled in."""
@@ -2453,9 +2542,11 @@ def _iter_frames_from_path(path: str, kind: str):
         finally:
             reader.close()
     else:
-        img = Image.open(path)
-        for frm in ImageSequence.Iterator(img):
-            yield frm.copy().convert("RGBA")
+        # Closed even when the caller stops early (generator close), so the
+        # source file isn't left locked.
+        with Image.open(path) as img:
+            for frm in ImageSequence.Iterator(img):
+                yield frm.copy().convert("RGBA")
 
 
 # Frames sampled across the animation to pick the shared GIF palette and to
@@ -2510,6 +2601,32 @@ def _retime_delays(durations: list, speed: float) -> list:
         written += delay
         out.append(delay)
     return out
+
+
+def _frame_delay(frame: Image.Image) -> int:
+    """A frame's delay in ms. The frame is loaded first: animated WebP
+    only fills in its timing once a frame is decoded."""
+    frame.load()
+    delay = frame.info.get("duration")
+    return 100 if delay is None else delay
+
+
+def _file_delays(path: str) -> list:
+    with Image.open(path) as img:
+        return [_frame_delay(frm) for frm in ImageSequence.Iterator(img)]
+
+
+def _merge_delays(durations: list, step: int) -> list:
+    """Delays for keeping every `step`th frame: each kept frame is shown for
+    the time of the frames dropped after it, so the length stays the same."""
+    if step <= 1:
+        return list(durations)
+    return [sum(durations[i:i + step]) for i in range(0, len(durations), step)]
+
+
+# "Keep" choices for an animation: every frame, or every 2nd/3rd/4th (a
+# smaller GIF that plays choppier but just as long).
+_FRAME_STEPS = {"All frames": 1, "Every 2nd": 2, "Every 3rd": 3, "Every 4th": 4}
 
 
 def _write_gif(path: str, frames, samples: list, durations,
@@ -2682,6 +2799,8 @@ def _export_worker_main(job_path: str) -> None:
     # controls; absent in older jobs = whole source at normal speed.
     start, end = job.get("trim") or (0, total - 1)
     speed = float(job.get("speed") or 1.0)
+    # Keep every Nth frame (the "Keep" setting); 1 = all.
+    keep = max(1, int(job.get("frame_step") or 1))
     count = end - start + 1
     out_fps = fps * speed
 
@@ -2711,11 +2830,12 @@ def _export_worker_main(job_path: str) -> None:
             frames.close()  # stopping early must still release the decoder
 
     if as_mp4:
-        writer = imageio.get_writer(output_path, fps=out_fps, codec="libx264", quality=8)
+        writer = imageio.get_writer(output_path, fps=out_fps / keep, codec="libx264", quality=8)
         try:
             for i, frame in _trimmed():
-                composited = build_composite(frame, **params, frame_index=i)
-                writer.append_data(_pad_to_macro_block(np.array(composited.convert("RGB"))))
+                if i % keep == 0:
+                    composited = build_composite(frame, **params, frame_index=i)
+                    writer.append_data(_pad_to_macro_block(np.array(composited.convert("RGB"))))
                 _progress(i)
         finally:
             writer.close()
@@ -2729,16 +2849,14 @@ def _export_worker_main(job_path: str) -> None:
             # from the file instead of stretching frame 1's delay across the
             # whole animation, which played variable-timing GIFs at the
             # wrong speed.
-            with Image.open(source_path) as img:
-                durations = [frm.info.get("duration", 100)
-                             for frm in ImageSequence.Iterator(img)]
+            durations = _file_delays(source_path)
         if durations:
-            durations = _retime_delays(durations[start:end + 1], speed)
+            durations = _merge_delays(_retime_delays(durations[start:end + 1], speed), keep)
         # GIF can't show frames faster than 20ms (50fps) — browsers slow
         # shorter delays to 100ms — so an fps-timed source above that keeps
         # every Nth frame, with each one held N frames' worth of time.
-        step = 1 if durations else max(1, math.ceil(out_fps / _GIF_MAX_FPS))
-        wanted = set(_gif_sample_indices(count))
+        step = keep if durations else keep * max(1, math.ceil(out_fps / keep / _GIF_MAX_FPS))
+        wanted = {i * step for i in _gif_sample_indices(math.ceil(count / step))}
         samples = [build_composite(frame, **params, frame_index=i)
                    for i, frame in _trimmed() if i in wanted]
 
@@ -2750,7 +2868,7 @@ def _export_worker_main(job_path: str) -> None:
 
         duration = durations if durations else 1000.0 * step / out_fps
         _write_gif(output_path, _composited(), samples, duration, gif_colors,
-                   dither=kind != "gif")
+                   dither=job.get("dither", kind != "gif"))
     print("\nDone.")
 
 
@@ -2949,6 +3067,7 @@ class CaptionApp:
         self._trim_start_var = tk.IntVar(value=1)
         self._trim_end_var = tk.IntVar(value=1)
         self._speed_var = tk.StringVar(value="1")
+        self._frame_step_var = tk.StringVar(value="All frames")
         self._play_durations: list = []
         self._gif_colors_var = tk.IntVar(value=256)  # 256 = no-op (GIF already tops out at 256/frame)
         self._pad_var = tk.IntVar(value=20)
@@ -3028,6 +3147,8 @@ class CaptionApp:
         self._text_boxes: list = []
         self._tb_sel: Optional[int] = None
         self._tb_drag: Optional[dict] = None
+        self._tb_guides: list = []          # alignment guides shown while dragging
+        self._tb_clipboard: Optional[list] = None   # copied boxes (Ctrl+C / Ctrl+V)
         self._tb_loading = False
 
         # Series: name + part number; numbers the title and finds the
@@ -3074,6 +3195,7 @@ class CaptionApp:
             self._canvas.tag_bind(tag, "<ButtonPress-1>", self._on_pan_press)
             self._canvas.tag_bind(tag, "<B1-Motion>", self._on_pan_drag)
             self._canvas.tag_bind(tag, "<Double-Button-1>", self._tb_double_click)
+            self._canvas.tag_bind(tag, "<Button-3>", self._tb_context_menu)
         self._canvas.bind("<ButtonRelease-1>", self._tb_release, add="+")
         self._canvas.bind("<Key>", self._tb_key)
         for seq, fn in (("<Control-z>", self._tb_undo), ("<Control-y>", self._tb_redo),
@@ -3222,6 +3344,11 @@ class CaptionApp:
                      values=["0.25", "0.5", "0.75", "1", "1.25", "1.5", "2", "3"]).pack(
             side="left", padx=(4, 2))
         ttk.Label(self._trim_row, text="×").pack(side="left")
+        ttk.Label(self._trim_row, text="Keep").pack(side="left", padx=(12, 0))
+        tooltip(ttk.Combobox(self._trim_row, textvariable=self._frame_step_var, width=10,
+                             state="readonly", values=list(_FRAME_STEPS)),
+                "Drop frames for a smaller file: the animation plays just as\n"
+                "long, a little choppier.").pack(side="left", padx=(4, 0))
         self._trim_info = ttk.Label(self._trim_row, text="", foreground="#888")
         self._trim_info.pack(side="left", padx=(10, 0))
 
@@ -3336,7 +3463,8 @@ class CaptionApp:
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._story_mode_var.trace_add("write", lambda *_: self._update_editor_stats())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
-        for v in (self._trim_start_var, self._trim_end_var, self._speed_var):
+        for v in (self._trim_start_var, self._trim_end_var, self._speed_var,
+                  self._frame_step_var):
             v.trace_add("write", lambda *_: self._on_trim_change())
         # _size_var also gets programmatically overwritten by Auto-fit itself
         # (see _collect_render_params) — skip those writes so they don't
@@ -3976,16 +4104,18 @@ class CaptionApp:
         btns.grid(row=0, column=1, sticky="n", padx=(6, 0))
         for i, (label, cmd, tip) in enumerate((
                 ("＋ Add", self._tb_add, "Add a text box (or double-click the picture)"),
-                ("Duplicate", self._tb_duplicate, "Copy the selected box"),
+                ("Duplicate", self._tb_duplicate, "Copy the selected box (Ctrl+D)"),
                 ("Delete", self._tb_delete, "Delete the selected box (Delete key)"))):
             tooltip(ttk.Button(btns, text=label, width=10, command=cmd), tip).grid(
                 row=i, column=0, sticky="ew", pady=1)
         order = ttk.Frame(btns)
         order.grid(row=3, column=0, sticky="ew", pady=1)
-        tooltip(ttk.Button(order, text="▲", width=4, command=lambda: self._tb_reorder(1)),
-                "Bring forward").pack(side="left", expand=True, fill="x")
-        tooltip(ttk.Button(order, text="▼", width=4, command=lambda: self._tb_reorder(-1)),
-                "Send backward").pack(side="left", expand=True, fill="x")
+        for text, cmd, tip in (("⤒", self._tb_to_front, "Bring to front (Ctrl+Shift+])"),
+                               ("▲", lambda: self._tb_reorder(1), "Bring forward (Ctrl+])"),
+                               ("▼", lambda: self._tb_reorder(-1), "Send backward (Ctrl+[)"),
+                               ("⤓", self._tb_to_back, "Send to back (Ctrl+Shift+[)")):
+            tooltip(ttk.Button(order, text=text, width=2, style="Small.TButton", command=cmd),
+                    tip).pack(side="left", expand=True, fill="x")
         history = ttk.Frame(btns)
         history.grid(row=4, column=0, sticky="ew", pady=1)
         tooltip(ttk.Button(history, text="↶", width=4, command=self._tb_undo),
@@ -4015,6 +4145,25 @@ class CaptionApp:
         }
         v = self._tb_vars
         r = 2
+        row = ttk.Frame(f)
+        row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(row, text="Style:").pack(side="left")
+        self._tb_style_var = tk.StringVar()
+        self._tb_style_combo = tooltip(
+            ttk.Combobox(row, textvariable=self._tb_style_var, state="readonly", width=16),
+            "Pick a saved style to give the selected box that look\n"
+            "(font, colors, outline, box or bubble). Its text and place stay.")
+        self._tb_style_combo.pack(side="left", padx=(4, 4), fill="x", expand=True)
+        self._tb_style_combo.bind("<<ComboboxSelected>>",
+                                  lambda _e: self._tb_apply_saved_style(self._tb_style_var.get()))
+        tooltip(ttk.Button(row, text="Save…", style="Small.TButton",
+                           command=self._tb_save_style),
+                "Save the selected box's look as a named style").pack(side="left")
+        tooltip(ttk.Button(row, text="✕", width=2, style="Small.TButton",
+                           command=self._tb_delete_style),
+                "Delete the chosen style").pack(side="left", padx=(2, 0))
+        self._tb_refresh_styles()
+        r += 1
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(row, text="Shape:").pack(side="left")
@@ -4102,9 +4251,10 @@ class CaptionApp:
         ttk.Spinbox(row, from_=0, to=100, width=4, textvariable=v["padding"]).pack(
             side="left", padx=(4, 0))
         r += 1
-        ttk.Label(f, text="On the preview: drag to move · right edge = width · corner = "
-                          "text size · round handle = bubble tail · double-click to add · "
-                          "Delete removes", wraplength=320, justify="left",
+        ttk.Label(f, text="On the preview: drag to move (it snaps into line; hold Alt not "
+                          "to) · arrow keys nudge 1 pixel (Shift = 10) · right edge = width · "
+                          "corner = text size · round handle = bubble tail · double-click to "
+                          "add · right-click for more", wraplength=320, justify="left",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2, sticky="w",
                                              pady=(8, 0))
         self._tb_default_bg: Optional[str] = None   # the last box color picked
@@ -4344,6 +4494,22 @@ class CaptionApp:
         self._face_cache = (key, faces, img.size)
         return faces
 
+    def _ai_picture_key(self) -> Optional[tuple]:
+        """Identifies the picture as framed, so a description is reused
+        only while it still matches what's shown."""
+        if not self._frames:
+            return None
+        return (getattr(self, "_source_path", None), id(self._frames[0]),
+                round(self._safe_float(self._zoom_var), 3),
+                round(self._safe_float(self._pan_x_var), 3),
+                round(self._safe_float(self._pan_y_var), 3))
+
+    def _ai_picture(self) -> Image.Image:
+        """The picture as framed (zoom and pan applied) for the AI to look at."""
+        zoom = max(1.0, self._safe_float(self._zoom_var))
+        return _apply_zoom(self._frames[0], zoom, self._safe_float(self._pan_x_var),
+                           self._safe_float(self._pan_y_var), Image.BILINEAR)
+
     def _tb_off_faces(self, box: dict) -> dict:
         """Move a box (in place) up or down so it doesn't cover a face."""
         faces = self._faces()
@@ -4427,6 +4593,162 @@ class CaptionApp:
         boxes[i], boxes[i + delta] = boxes[i + delta], boxes[i]
         self._tb_select(i + delta)
         self._safe_refresh(debounce_ms=0)
+
+    # Saved box styles, kept in recent.json ("tb_styles": {name: style}).
+    @staticmethod
+    def _tb_styles() -> dict:
+        styles = recent_store.get_setting("tb_styles", {}) or {}
+        return styles if isinstance(styles, dict) else {}
+
+    def _tb_refresh_styles(self) -> None:
+        names = sorted(self._tb_styles(), key=str.lower)
+        self._tb_style_combo.config(values=names)
+        if self._tb_style_var.get() not in names:
+            self._tb_style_var.set("")
+
+    def _tb_pic_h(self) -> Optional[int]:
+        return self._frames[0].size[1] if self._frames else None
+
+    def _tb_apply_saved_style(self, name: str) -> None:
+        style = self._tb_styles().get(name)
+        if style is None:
+            return
+        if self._tb_sel is None:
+            self._status.config(text="Select a text box first, then pick the style.")
+            return
+        self._tb_push_undo()
+        _tb_apply_style(self._text_boxes[self._tb_sel], style, self._tb_pic_h())
+        self._tb_style_var.set(name)
+        self._tb_refresh_panel()
+        self._safe_refresh(debounce_ms=0)
+        self._status.config(text=f"Applied the \"{name}\" style.")
+
+    def _tb_save_style(self) -> None:
+        if self._tb_sel is None:
+            messagebox.showinfo("Save style", "Select the text box whose look you want to "
+                                              "save first.")
+            return
+        name = simpledialog.askstring(
+            "Save style", "Name this style (e.g. the character who speaks this way):",
+            initialvalue=self._tb_style_var.get(), parent=self.root)
+        name = (name or "").strip()[:40]
+        if not name:
+            return
+        styles = dict(self._tb_styles())
+        if name in styles and not messagebox.askyesno(
+                "Save style", f"Replace the saved \"{name}\" style?"):
+            return
+        styles[name] = _tb_style_of(self._text_boxes[self._tb_sel], self._tb_pic_h())
+        recent_store.set_setting("tb_styles", styles)
+        self._tb_refresh_styles()
+        self._tb_style_var.set(name)
+        self._status.config(text=f"Saved the \"{name}\" style.")
+
+    def _tb_delete_style(self) -> None:
+        name = self._tb_style_var.get()
+        styles = dict(self._tb_styles())
+        if name not in styles:
+            self._status.config(text="Choose a style to delete first.")
+            return
+        if not messagebox.askyesno("Delete style", f"Delete the saved \"{name}\" style?"):
+            return
+        del styles[name]
+        recent_store.set_setting("tb_styles", styles)
+        self._tb_refresh_styles()
+
+    def _tb_add_style_menu(self, menu: tk.Menu) -> None:
+        """Apply style ▸ / Save style… entries for the box right-click menu."""
+        styles = sorted(self._tb_styles(), key=str.lower)
+        sub = tk.Menu(menu, tearoff=0)
+        for name in styles:
+            sub.add_command(label=name, command=lambda n=name: self._tb_apply_saved_style(n))
+        menu.add_cascade(label="Apply style", menu=sub,
+                         state="normal" if styles else "disabled")
+        menu.add_command(label="Save style…", command=self._tb_save_style)
+
+    def _tb_move_to(self, dest: int) -> None:
+        """Move the selected box to position `dest` in the drawing order
+        (0 = at the back, drawn first)."""
+        i = self._tb_sel
+        if i is None or i == dest:
+            return
+        self._tb_push_undo()
+        self._text_boxes.insert(dest, self._text_boxes.pop(i))
+        self._tb_select(dest)
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_to_front(self) -> None:
+        self._tb_move_to(len(self._text_boxes) - 1)
+
+    def _tb_to_back(self) -> None:
+        self._tb_move_to(0)
+
+    def _tb_copy(self) -> None:
+        if self._tb_sel is not None:
+            self._tb_clipboard = [json.loads(json.dumps(self._text_boxes[self._tb_sel]))]
+            self._status.config(text="Text box copied — Ctrl+V pastes it, here or on "
+                                     "another picture.")
+
+    def _tb_paste(self) -> None:
+        if not self._tb_clipboard or not self._overlay_mode():
+            return
+        self._tb_push_undo()
+        taken = {(round(float(b.get("x", 0)), 3), round(float(b.get("y", 0)), 3))
+                 for b in self._text_boxes}
+        for src in self._tb_clipboard:
+            box = json.loads(json.dumps(src))
+            # Pasted on top of an existing box (the same picture): step it
+            # down and right so the copy is visible.
+            while (round(float(box.get("x", 0)), 3), round(float(box.get("y", 0)), 3)) in taken:
+                box["x"] = min(0.95, float(box.get("x", 0)) + 0.03)
+                box["y"] = min(0.95, float(box.get("y", 0)) + 0.03)
+                if box["x"] >= 0.95 and box["y"] >= 0.95:
+                    break
+            self._text_boxes.append(box)
+        self._tb_select(len(self._text_boxes) - 1)
+        self._safe_refresh(debounce_ms=0)
+
+    def _tb_context_menu(self, event) -> None:
+        """Right-click on the preview in the Text Boxes format."""
+        if not self._overlay_mode() or not self._cache:
+            return
+        self._canvas.focus_set()
+        idx, _mode = self._tb_hit(event.x, event.y)
+        menu = tk.Menu(self.root, tearoff=0)
+        if idx is not None:
+            self._tb_select(idx)
+            n = len(self._text_boxes)
+            menu.add_command(label="Duplicate", accelerator="Ctrl+D", command=self._tb_duplicate)
+            menu.add_command(label="Copy", accelerator="Ctrl+C", command=self._tb_copy)
+            menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._tb_paste,
+                             state="normal" if self._tb_clipboard else "disabled")
+            menu.add_separator()
+            for label, accel, cmd, ok in (
+                    ("Bring to front", "Ctrl+Shift+]", self._tb_to_front, idx < n - 1),
+                    ("Bring forward", "Ctrl+]", lambda: self._tb_reorder(1), idx < n - 1),
+                    ("Send backward", "Ctrl+[", lambda: self._tb_reorder(-1), idx > 0),
+                    ("Send to back", "Ctrl+Shift+[", self._tb_to_back, idx > 0)):
+                menu.add_command(label=label, accelerator=accel, command=cmd,
+                                 state="normal" if ok else "disabled")
+            menu.add_separator()
+            self._tb_add_style_menu(menu)
+            menu.add_separator()
+            menu.add_command(label="Delete", accelerator="Del", command=self._tb_delete)
+        else:
+            bbox = self._canvas.bbox("img")
+            disp = self._preview_pil_img
+            if bbox and disp is not None:
+                fx = (event.x - bbox[0]) / disp.width
+                fy = (event.y - bbox[1]) / disp.height
+                if 0 <= fx <= 1 and 0 <= fy <= 1:
+                    menu.add_command(label="Add text box here",
+                                     command=lambda: self._tb_add(fx, fy))
+            menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._tb_paste,
+                             state="normal" if self._tb_clipboard else "disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _overlay_mode(self) -> bool:
         return self._formats.get(self._format_var.get(), {}).get("layout") == "overlay"
@@ -4590,10 +4912,31 @@ class CaptionApp:
         self._tb_push_undo()
         box = self._text_boxes[idx]
         disp = self._preview_pil_img
+        rects = self._tb_screen_rects()
+        bbox = self._canvas.bbox("img") or (0, 0, disp.width, disp.height)
+        others = [r for i, r in enumerate(rects) if i != idx]
         self._tb_drag = {"mode": mode, "x": event.x, "y": event.y,
                          "box": dict(_tb(box)), "dw": disp.width, "dh": disp.height,
-                         "rect": self._tb_screen_rects()[idx]}
+                         "rect": rects[idx],
+                         "targets_x": _snap_targets(bbox[0], disp.width,
+                                                    [(r[0], r[2]) for r in others]),
+                         "targets_y": _snap_targets(bbox[1], disp.height,
+                                                    [(r[1], r[3]) for r in others])}
         return True
+
+    def _tb_draw_guides(self, guides: list) -> None:
+        """Dashed lines across the picture where a dragged box lined up."""
+        self._tb_guides = guides
+        c = self._canvas
+        c.delete("tbguide")
+        bbox = c.bbox("img")
+        if not guides or not bbox:
+            return
+        accent = themes.accent(self._theme_name).get("accent", "#ff4f9a")
+        for axis, v in guides:
+            coords = (v, bbox[1], v, bbox[3]) if axis == "x" else (bbox[0], v, bbox[2], v)
+            c.create_line(*coords, fill=accent, dash=(4, 3), tags=("tbguide",))
+        c.tag_raise("tbguide")
 
     def _tb_motion(self, event) -> bool:
         d = self._tb_drag
@@ -4603,16 +4946,20 @@ class CaptionApp:
         start = d["box"]
         dx, dy = event.x - d["x"], event.y - d["y"]
         if d["mode"] == "move":
+            x0, y0, x1, y1 = d["rect"]
+            # Line the box up with the picture and the other boxes (hold Alt
+            # to place it freely); the guides show what it snapped to.
+            guides = []
+            if not event.state & 0x20000:
+                sdx, gx = _snap_shift((x0 + dx, x1 + dx), d["targets_x"], _TB_SNAP_PX)
+                sdy, gy = _snap_shift((y0 + dy, y1 + dy), d["targets_y"], _TB_SNAP_PX)
+                dx, dy = dx + sdx, dy + sdy
+                guides = [("x", v) for v in gx] + [("y", v) for v in gy]
+            self._tb_draw_guides(guides)
+            w = float(start["w"])
+            h_frac = (y1 - y0) / d["dh"]
             x = float(start["x"]) + dx / d["dw"]
             y = float(start["y"]) + dy / d["dh"]
-            # Snap the box's center to the picture's center lines.
-            w = float(start["w"])
-            if abs(x + w / 2 - 0.5) < 0.012:
-                x = 0.5 - w / 2
-            x0, y0, x1, y1 = d["rect"]
-            h_frac = (y1 - y0) / d["dh"]
-            if abs(y + h_frac / 2 - 0.5) < 0.012:
-                y = 0.5 - h_frac / 2
             box["x"] = round(max(-w + 0.02, min(0.98, x)), 4)
             box["y"] = round(max(-h_frac + 0.02, min(0.98, y)), 4)
         elif d["mode"] == "tail":
@@ -4636,6 +4983,8 @@ class CaptionApp:
     def _tb_release(self, _event=None) -> None:
         self._tb_drag = None
         self._cz_drag = None
+        self._tb_guides = []
+        self._canvas.delete("tbguide")
 
     def _tb_double_click(self, event) -> None:
         if not self._overlay_mode() or not self._cache:
@@ -4661,19 +5010,40 @@ class CaptionApp:
         if self._cz_sel is not None and event.keysym in ("Delete", "BackSpace"):
             self._cz_delete()
             return "break"
-        if not self._overlay_mode() or self._tb_sel is None:
+        if not self._overlay_mode():
+            return None
+        ctrl, shift = event.state & 0x4, event.state & 0x1
+        key = event.keysym.lower()
+        if ctrl and key == "v":
+            self._tb_paste()
+            return "break"
+        if self._tb_sel is None:
             return None
         if event.keysym in ("Delete", "BackSpace"):
             self._tb_delete()
             return "break"
-        step = 0.01 if event.state & 0x1 else 0.002   # Shift = bigger nudge
-        moves = {"Left": ("x", -step), "Right": ("x", step), "Up": ("y", -step),
-                 "Down": ("y", step)}
+        if ctrl:
+            actions = {"d": self._tb_duplicate, "c": self._tb_copy,
+                       "x": lambda: (self._tb_copy(), self._tb_delete()),
+                       "bracketright": (self._tb_to_front if shift else
+                                        lambda: self._tb_reorder(1)),
+                       "bracketleft": (self._tb_to_back if shift else
+                                       lambda: self._tb_reorder(-1)),
+                       "braceright": self._tb_to_front, "braceleft": self._tb_to_back}
+            if key in actions:
+                actions[key]()
+                return "break"
+            return None
+        # One pixel of the exported picture per press; Shift = 10 pixels.
+        out_w, out_h = self._cache[0].size if self._cache else (500, 500)
+        px = 10 if shift else 1
+        moves = {"Left": ("x", -px / out_w), "Right": ("x", px / out_w),
+                 "Up": ("y", -px / out_h), "Down": ("y", px / out_h)}
         if event.keysym in moves:
             key, delta = moves[event.keysym]
             self._tb_push_undo(coalesce=(self._tb_sel, "nudge"))
             box = self._text_boxes[self._tb_sel]
-            box[key] = round(float(_tb(box)[key]) + delta, 4)
+            box[key] = round(float(_tb(box)[key]) + delta, 5)
             self._safe_refresh(debounce_ms=0)
             return "break"
         return None
@@ -5007,6 +5377,8 @@ class CaptionApp:
             theme_menu.add_radiobutton(
                 label=label, value=key, variable=self._theme_var,
                 command=lambda k=key: self._set_theme(k))
+        theme_menu.add_separator()
+        theme_menu.add_command(label="Theme Editor…", command=self._theme_editor)
         menu.add_cascade(label="Theme", menu=theme_menu)
         menu.add_separator()
         menu.add_command(label=f"What's New in {_app_version()}…",
@@ -5071,7 +5443,27 @@ class CaptionApp:
         model_box = ttk.Combobox(body, textvariable=model_var, width=30)
         model_box.grid(row=5, column=1, sticky="ew", padx=6)
         status = ttk.Label(body, text="", foreground="#888", wraplength=380)
-        status.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        status.grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(body, text="Picture model:").grid(row=7, column=0, sticky="w", pady=4)
+        vision_var = tk.StringVar(value=settings.get("vision_model") or self._NO_VISION)
+        vision_box = tooltip(ttk.Combobox(body, textvariable=vision_var, width=30),
+                             "A model that can see pictures (Moondream, LLaVA, MiniCPM-V…).\n"
+                             "It describes the picture so the story can match it; the\n"
+                             "writing model above still writes the story.")
+        vision_box.grid(row=7, column=1, sticky="ew", padx=6)
+
+        def _get_vision() -> None:
+            dlg.grab_release()
+            tag = self._ai_vision_setup_dialog()
+            if dlg.winfo_exists():
+                dlg.grab_set()
+                if tag:
+                    vision_var.set(tag)
+                    _refresh_models()
+        ttk.Button(body, text="Get one…", command=_get_vision).grid(row=7, column=2, padx=(0, 6))
+        ttk.Label(body, text="(optional — lets the AI look at your picture)",
+                  foreground="#888").grid(row=8, column=1, columnspan=2, sticky="w", padx=6)
 
         def _refresh_models() -> None:
             status.config(text="Asking the server for its models…")
@@ -5091,6 +5483,7 @@ class CaptionApp:
                     status.config(text=err)
                     return
                 model_box.config(values=models)
+                vision_box.config(values=[self._NO_VISION] + models)
                 if models and model_var.get() not in models:
                     model_var.set(models[0])
                 status.config(text=f"Connected — {len(models)} model(s) available."
@@ -5114,9 +5507,11 @@ class CaptionApp:
         result: list = [None]
 
         def _save() -> None:
+            vision = vision_var.get().strip()
             new = dict(base_url=url_var.get().strip() or ai_writer.DEFAULTS["base_url"],
                        model=model_var.get().strip(), api_key=key_var.get().strip(),
-                       temperature=round(float(temp_var.get()), 2))
+                       temperature=round(float(temp_var.get()), 2),
+                       vision_model="" if vision == self._NO_VISION else vision)
             try:
                 ai_writer.save_settings(new)
             except OSError as e:
@@ -5138,7 +5533,7 @@ class CaptionApp:
                 dlg.grab_set()
 
         btns = ttk.Frame(body)
-        btns.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        btns.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Install a model for me…", command=_auto_setup).pack(side="left")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
         ttk.Button(btns, text="Save", command=_save).pack(side="right", padx=(0, 6))
@@ -5148,34 +5543,64 @@ class CaptionApp:
         self.root.wait_window(dlg)
         return result[0]
 
-    def _ai_setup_dialog(self) -> Optional[dict]:
-        """Offer to install Ollama and download a model. Nothing is
+    _NO_VISION = "(none)"
+
+    def _ai_vision_setup_dialog(self) -> Optional[str]:
+        """Download a picture (vision) model through Ollama. Returns its tag,
+        or None if cancelled."""
+        settings = ai_writer.load_settings()
+        if settings["model"] and settings["base_url"] != ai_writer.PRESETS["Ollama"]:
+            messagebox.showinfo(
+                "Get a picture model",
+                "The one-click download works with Ollama. In your own AI app, download a "
+                "model that can see images (e.g. Moondream, LLaVA or MiniCPM-V), then "
+                "choose it as the Picture model.", parent=self.root)
+            return None
+        new = self._ai_setup_dialog(role="vision_model")
+        return new.get("vision_model") if new else None
+
+    def _ai_setup_dialog(self, role: str = "model") -> Optional[dict]:
+        """Offer to install Ollama and download a model — a writing model,
+        or with role="vision_model" one that describes pictures. Nothing is
         downloaded until the user picks a model and presses Install.
         Returns the new settings on success, else None."""
         ram = ai_writer.total_ram_gb()
         home = os.path.expanduser("~")
         free = ai_writer.free_gb(home)
         needs_install = ai_writer.find_ollama_exe() is None and not ai_writer.ollama_running()
+        vision = role == "vision_model"
+        models = ai_writer.VISION_MODELS if vision else ai_writer.SETUP_MODELS
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("Set up the AI writer")
+        dlg.title("Get a picture model" if vision else "Set up the AI writer")
         dlg.transient(self.root)
         dlg.resizable(False, False)
         body = ttk.Frame(dlg, padding=14)
         body.pack(fill="both", expand=True)
 
-        intro = ("No local AI model was found. Caption Creator can set one up for you:\n\n"
-                 + ("  1. Download and install Ollama (free, open-source; ~1.7 GB download)\n"
-                    "  2. Download the writing model you pick below\n\n"
-                    if needs_install else
-                    "  • Ollama is already installed — just download the model you pick below\n\n")
-                 + "Everything runs on this PC; your prompts and stories never leave it. "
-                   "These models are uncensored, so they will write explicit content.")
+        if vision:
+            intro = ("A picture model looks at your picture and describes it, so the AI "
+                     "writer can write a story that fits it. Caption Creator can set one up:"
+                     "\n\n"
+                     + ("  1. Download and install Ollama (free, open-source; ~1.7 GB download)\n"
+                        "  2. Download the picture model you pick below\n\n"
+                        if needs_install else
+                        "  • Download the picture model you pick below\n\n")
+                     + "It runs on this PC; your pictures never leave it.")
+        else:
+            intro = ("No local AI model was found. Caption Creator can set one up for you:\n\n"
+                     + ("  1. Download and install Ollama (free, open-source; ~1.7 GB download)\n"
+                        "  2. Download the writing model you pick below\n\n"
+                        if needs_install else
+                        "  • Ollama is already installed — just download the model you pick "
+                        "below\n\n")
+                     + "Everything runs on this PC; your prompts and stories never leave it. "
+                       "These models are uncensored, so they will write explicit content.")
         ttk.Label(body, text=intro, wraplength=440, justify="left").pack(anchor="w")
 
         ttk.Label(body, text="Model:").pack(anchor="w", pady=(12, 2))
-        labels = {f"{label}  ({gb:g} GB)": tag for tag, label, gb, _need in ai_writer.SETUP_MODELS}
-        rec = ai_writer.recommended_model(ram)
+        labels = {f"{label}  ({gb:g} GB)": tag for tag, label, gb, _need in models}
+        rec = ai_writer.recommended_model(ram, models)
         choice = tk.StringVar(value=next(k for k, v in labels.items() if v == rec))
         ttk.Combobox(body, textvariable=choice, state="readonly", width=62,
                      values=list(labels)).pack(anchor="w")
@@ -5184,7 +5609,7 @@ class CaptionApp:
 
         def _check_fit(*_a) -> bool:
             tag = labels[choice.get()]
-            _t, _l, gb, need = next(m for m in ai_writer.SETUP_MODELS if m[0] == tag)
+            _t, _l, gb, need = next(m for m in models if m[0] == tag)
             want = gb + (ai_writer.OLLAMA_INSTALL_GB if needs_install else 0) + 1
             notes, ok = [], True
             if free < want:
@@ -5196,7 +5621,10 @@ class CaptionApp:
                              "and will be very slow or may not load.")
             if not notes:
                 notes.append(f"✓ Fits this PC ({ram:.0f} GB RAM, {free:.0f} GB free disk). "
-                             "Without a graphics card, a story takes about a minute to write.")
+                             + ("Without a graphics card, describing a picture takes "
+                                "under a minute." if vision else
+                                "Without a graphics card, a story takes about a minute "
+                                "to write."))
             fit_label.config(text="\n".join(notes), foreground="#888" if ok else "#c0392b")
             return ok
         choice.trace_add("write", _check_fit)
@@ -5232,7 +5660,7 @@ class CaptionApp:
 
         def _install() -> None:
             if not _check_fit() and not messagebox.askyesno(
-                    "Set up the AI writer", "There may not be enough disk space. Try anyway?",
+                    dlg.title(), "There may not be enough disk space. Try anyway?",
                     parent=dlg):
                 return
             tag = labels[choice.get()]
@@ -5241,12 +5669,13 @@ class CaptionApp:
             status.pack(anchor="w", pady=(4, 0))
             cancel = threading.Event()
             state["cancel"] = cancel
-            log.info("AI_SETUP_START  model=%s install_ollama=%s", tag, needs_install)
+            log.info("AI_SETUP_START  model=%s role=%s install_ollama=%s", tag, role,
+                     needs_install)
 
             def _work() -> None:
                 err, settings = None, None
                 try:
-                    settings = ai_writer.setup_ollama(tag, _progress, cancel)
+                    settings = ai_writer.setup_ollama(tag, _progress, cancel, role=role)
                 except ai_writer.SetupCancelled:
                     err = "cancelled"
                 except ai_writer.AIWriterError as e:
@@ -5274,7 +5703,7 @@ class CaptionApp:
                                    "aren't downloaded again.")
             else:
                 status.config(text="")
-                messagebox.showerror("Set up the AI writer", err, parent=dlg)
+                messagebox.showerror(dlg.title(), err, parent=dlg)
 
         def _cancel() -> None:
             if state["cancel"] is not None:
@@ -5621,21 +6050,59 @@ class CaptionApp:
         ttk.Radiobutton(opts, text="Add to end", value="append",
                         variable=mode_var).pack(side="left", padx=(6, 0))
 
-        model_label = ttk.Label(body, text=f"Model: {settings['model']}", foreground="#888")
-        model_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        # The picture: a vision model describes it (editable) and the story
+        # is written to fit.
+        pic = ttk.Frame(body)
+        pic.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        pic.columnconfigure(0, weight=1)
+        look_var = tk.BooleanVar(value=bool(self._frames) and getattr(
+            self, "_ai_look", bool(settings.get("vision_model"))))
+        pic_head = ttk.Frame(pic)
+        pic_head.grid(row=0, column=0, sticky="ew")
+        tooltip(ttk.Checkbutton(pic_head, text="Write to fit the picture", variable=look_var),
+                "A picture model looks at your picture and describes it, and the\n"
+                "story is written to match. Edit the description if it's off.").pack(
+            side="left")
+        describe_btn = ttk.Button(pic_head, text="Describe picture", style="Small.TButton")
+        describe_btn.pack(side="right")
+        pic_box = tk.Text(pic, width=56, height=3, wrap="word", relief="solid", bd=1,
+                          padx=4, pady=4)
+        pic_box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        pic_hint = Placeholder(pic_box, "What's in the picture — filled in by Describe "
+                                        "picture, or type it yourself")
+        cached = getattr(self, "_ai_pic_desc", None)
+        if cached and cached[0] == self._ai_picture_key():
+            pic_box.insert("1.0", cached[1])
+            pic_hint.update()
+
+        def _sync_pic_row(*_a) -> None:
+            on = look_var.get() and bool(self._frames)
+            pic_box.config(state="normal" if on else "disabled")
+            describe_btn.config(state="normal" if self._frames else "disabled")
+        look_var.trace_add("write", _sync_pic_row)
+
+        model_label = ttk.Label(body, foreground="#888")
+        model_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+
+        def _show_models() -> None:
+            text = f"Model: {settings['model']}"
+            if settings.get("vision_model"):
+                text += f"  ·  Picture: {settings['vision_model']}"
+            model_label.config(text=text)
+        _show_models()
 
         def _change_settings() -> None:
             new = self._ai_settings_dialog()
             if new:
                 settings.update(new)
-                model_label.config(text=f"Model: {settings['model']}")
+                _show_models()
         ttk.Button(body, text="Settings…", command=_change_settings).grid(
-            row=3, column=1, sticky="e", pady=(8, 0))
+            row=4, column=1, sticky="e", pady=(8, 0))
 
         status = ttk.Label(body, text="", foreground="#888", wraplength=460)
-        status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        status.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         btns = ttk.Frame(body)
-        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
         gen_btn = ttk.Button(btns, text="Write")
         stop_btn = ttk.Button(btns, text="Stop", state="disabled")
         ttk.Button(btns, text="Close", command=lambda: _close()).pack(side="right")
@@ -5659,8 +6126,7 @@ class CaptionApp:
                 self._schedule_spellcheck()
                 self._sync_editor_to_caption()
             if win.winfo_exists():
-                gen_btn.config(state="normal")
-                stop_btn.config(state="disabled")
+                _busy(False)
                 if err:
                     status.config(text="")
                     messagebox.showerror("Write with AI", err, parent=win)
@@ -5670,6 +6136,67 @@ class CaptionApp:
                                   "another take.")
             self._safe_refresh()
 
+        def _busy(on: bool) -> None:
+            gen_btn.config(state="disabled" if on else "normal")
+            stop_btn.config(state="normal" if on else "disabled")
+            describe_btn.config(state="disabled" if on or not self._frames else "normal")
+
+        def _describe(then=None) -> None:
+            """Ask the picture model for a description, put it in the box,
+            then call `then` (the story run) if given."""
+            if not self._frames:
+                return
+            if not settings.get("vision_model"):
+                tag = self._ai_vision_setup_dialog()
+                if not tag or not win.winfo_exists():
+                    return
+                settings["vision_model"] = tag
+                _show_models()
+            img, key = self._ai_picture(), self._ai_picture_key()
+            _busy(True)
+            status.config(text=f"{settings['vision_model']} is looking at the picture… "
+                               "(the first run can take a while as the model loads)")
+            cancel = threading.Event()
+            state["cancel"] = cancel
+
+            def _work() -> None:
+                err, text = None, ""
+                try:
+                    text = ai_writer.describe_image(img, settings, cancel)
+                except ai_writer.AIWriterError as e:
+                    err = str(e)
+                except Exception as e:
+                    log.exception("AI_DESCRIBE_ERROR")
+                    err = f"Unexpected error: {e}"
+                log.info("AI_DESCRIBE_DONE  model=%s error=%s", settings["vision_model"],
+                         bool(err))
+                self.root.after(0, lambda: _described(text, err, cancel.is_set(), key))
+
+            def _described(text: str, err: Optional[str], cancelled: bool, key) -> None:
+                state["cancel"] = None
+                if not win.winfo_exists():
+                    return
+                _busy(False)
+                if err:
+                    status.config(text="")
+                    messagebox.showerror("Describe picture", err, parent=win)
+                    return
+                if cancelled:
+                    status.config(text="Stopped.")
+                    return
+                pic_box.config(state="normal")
+                pic_box.delete("1.0", "end")
+                pic_box.insert("1.0", text)
+                pic_hint.update()
+                self._ai_pic_desc = (key, text)
+                status.config(text="Described — edit it if anything's wrong.")
+                if then is not None:
+                    then()
+            threading.Thread(target=_work, daemon=True).start()
+
+        describe_btn.config(command=_describe)
+        _sync_pic_row()
+
         def _generate() -> None:
             prompt = prompt_box.get("1.0", "end-1c").strip()
             if not prompt:
@@ -5677,6 +6204,14 @@ class CaptionApp:
                 return
             self._ai_last_prompt = prompt
             self._ai_last_length = length_var.get()
+            self._ai_look = look_var.get()
+            picture = ""
+            if look_var.get() and self._frames:
+                picture = pic_box.get("1.0", "end-1c").strip()
+                if not picture:
+                    _describe(then=_generate)
+                    return
+                self._ai_pic_desc = (self._ai_picture_key(), picture)
             words = ai_writer.LENGTHS.get(length_var.get(), 120)
             # The whole run (clear + every streamed chunk) is one undo step,
             # written into whichever caption editor is showing.
@@ -5688,8 +6223,7 @@ class CaptionApp:
                 target.delete("1.0", "end")
             elif target.get("1.0", "end-1c").strip():
                 target.insert("end-1c", "\n\n")
-            gen_btn.config(state="disabled")
-            stop_btn.config(state="normal")
+            _busy(True)
             state["words"] = 0
             status.config(text=f"Waiting for {settings['model']}… (the first run can "
                                "take a while as the model loads)")
@@ -5699,7 +6233,8 @@ class CaptionApp:
             def _work() -> None:
                 err = None
                 try:
-                    for chunk in ai_writer.stream_story(prompt, words, settings, cancel):
+                    for chunk in ai_writer.stream_story(prompt, words, settings, cancel,
+                                                        picture=picture):
                         self.root.after(0, lambda c=chunk: _append(c))
                 except ai_writer.AIWriterError as e:
                     err = str(e)
@@ -5761,6 +6296,590 @@ class CaptionApp:
         self._canvas.configure(bg=themes.accent(name)["canvas"])
         if getattr(self, "_editor_view", None) is not None:
             self._load_wallpaper()  # re-dim toward the new theme's background
+
+    # ------------------------------------------------------------------
+    # Create Animation — bring a still picture to life, or change one
+    # picture into another (see animate.py). The result is saved as a
+    # lossless animated WebP in animations/ and opened like any GIF.
+    # ------------------------------------------------------------------
+
+    _ANIM_DIR = os.path.join(BASE_DIR, "animations")
+    _SMOKE_PRESETS = ("#ff5fb0", "#b05cc9", "#4f7dff", "#ffffff", "#202024")
+
+    def _create_animation_dialog(self) -> None:
+        if getattr(self, "_anim_win", None) is not None and self._anim_win.winfo_exists():
+            self._anim_win.lift()
+            return
+        # Sensible starting pictures: a before & after pair turns into a
+        # before → after transition; otherwise the open (still) picture.
+        current = self._source_path if self._frames and getattr(self, "_source_path", None) \
+            else None
+        pics = {"a": current, "b": None}
+        mode0 = "still"
+        if current and self._ba_on_var.get() and self._before_path:
+            pics.update(a=self._before_path, b=current)
+            mode0 = "transition"
+
+        win = tk.Toplevel(self.root)
+        self._anim_win = win
+        win.title("Create Animation")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nw")
+        right = ttk.Frame(body)
+        right.grid(row=0, column=1, sticky="n", padx=(16, 0))
+
+        mode_var = tk.StringVar(value=mode0)
+        modes = ttk.Frame(left)
+        modes.pack(anchor="w")
+        ttk.Radiobutton(modes, text="Bring one picture to life", value="still",
+                        variable=mode_var).pack(anchor="w")
+        ttk.Radiobutton(modes, text="Change one picture into another", value="transition",
+                        variable=mode_var).pack(anchor="w")
+
+        picf = ttk.LabelFrame(left, text="Pictures", padding=8)
+        picf.pack(fill="x", pady=(10, 0))
+        names = {}
+
+        def _name(key: str) -> str:
+            p = pics[key]
+            return os.path.basename(p) if p else "(choose one)"
+
+        def _choose(key: str) -> None:
+            path = filedialog.askopenfilename(
+                parent=win, title="Choose a picture",
+                filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
+                           ("All files", "*.*")])
+            if path:
+                pics[key] = path
+                names[key].config(text=_name(key))
+                _schedule()
+
+        def _swap() -> None:
+            pics["a"], pics["b"] = pics["b"], pics["a"]
+            for k in ("a", "b"):
+                names[k].config(text=_name(k))
+            _schedule()
+
+        rows = {}
+        for r, (key, label) in enumerate((("a", "First:"), ("b", "Then:"))):
+            ttk.Label(picf, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            names[key] = ttk.Label(picf, text=_name(key), width=26, style="Muted.TLabel")
+            names[key].grid(row=r, column=1, sticky="w", padx=6)
+            ttk.Button(picf, text="Choose…", style="Small.TButton",
+                       command=lambda k=key: _choose(k)).grid(row=r, column=2)
+            rows[key] = [w for w in picf.grid_slaves(row=r)]
+        swap_btn = tooltip(ttk.Button(picf, text="⇅", width=3, style="Small.TButton",
+                                      command=_swap), "Swap the two pictures")
+        swap_btn.grid(row=0, column=3, rowspan=2, padx=(4, 0))
+
+        # Effect choice — a separate list for each mode.
+        eff = ttk.Frame(left)
+        eff.pack(fill="x", pady=(10, 0))
+        ttk.Label(eff, text="Effect:").pack(side="left")
+        still_var = tk.StringVar(value="Slow zoom in")
+        trans_var = tk.StringVar(value="Crossfade")
+        effect_box = ttk.Combobox(eff, state="readonly", width=22)
+        effect_box.pack(side="left", padx=(6, 0))
+
+        smoke_color = [recent_store.get_setting("anim_smoke_color", animate.DEFAULT_SMOKE)
+                       or animate.DEFAULT_SMOKE]
+        smoke_row = ttk.Frame(left)
+        ttk.Label(smoke_row, text="Smoke color:").pack(side="left")
+        smoke_btn = tk.Button(smoke_row, width=4, relief="groove", bg=smoke_color[0])
+        smoke_btn.pack(side="left", padx=(6, 8))
+
+        def _set_smoke(color: str) -> None:
+            smoke_color[0] = color
+            smoke_btn.config(bg=color, activebackground=color)
+            recent_store.set_setting("anim_smoke_color", color)
+            _schedule()
+
+        def _pick_smoke() -> None:
+            picked = colorchooser.askcolor(color=smoke_color[0], title="Smoke color",
+                                           parent=win)[1]
+            if picked:
+                _set_smoke(picked)
+        smoke_btn.config(command=_pick_smoke)
+        for c in self._SMOKE_PRESETS:
+            # A thin outline so the black and white presets show on any theme.
+            tk.Button(smoke_row, width=2, relief="flat", bg=c, activebackground=c,
+                      highlightthickness=1, highlightbackground="#8a8a8a",
+                      command=lambda col=c: _set_smoke(col)).pack(side="left", padx=1)
+
+        # Options for each mode.
+        still_opts = ttk.Frame(left)
+        length_var = tk.DoubleVar(value=3.0)
+        strength_var = tk.DoubleVar(value=0.5)
+        bounce_var = tk.BooleanVar(value=True)
+        face_var = tk.BooleanVar(value=True)
+        r = ttk.Frame(still_opts)
+        r.pack(anchor="w", pady=2)
+        ttk.Label(r, text="Length:").pack(side="left")
+        ttk.Spinbox(r, from_=1, to=6, increment=0.5, width=5, textvariable=length_var).pack(
+            side="left", padx=(6, 2))
+        ttk.Label(r, text="s").pack(side="left")
+        ttk.Label(r, text="Strength:").pack(side="left", padx=(14, 4))
+        ttk.Scale(r, from_=0.0, to=1.0, variable=strength_var, length=110).pack(side="left")
+        bounce_check = tooltip(
+            ttk.Checkbutton(still_opts, text="Play forwards, then back (loops smoothly)",
+                            variable=bounce_var),
+            "Otherwise the GIF jumps back to the start when it loops.")
+        bounce_check.pack(anchor="w", pady=2)
+        ttk.Checkbutton(still_opts, text="Zoom toward the face", variable=face_var).pack(
+            anchor="w", pady=2)
+
+        trans_opts = ttk.Frame(left)
+        hold_a_var = tk.DoubleVar(value=1.0)
+        change_var = tk.DoubleVar(value=1.5)
+        hold_b_var = tk.DoubleVar(value=1.5)
+        loop_var = tk.BooleanVar(value=True)
+        r = ttk.Frame(trans_opts)
+        r.pack(anchor="w", pady=2)
+        for label, var, lo, hi in (("Show first", hold_a_var, 0.2, 10),
+                                   ("Change", change_var, 0.3, 4),
+                                   ("Show second", hold_b_var, 0.2, 10)):
+            ttk.Label(r, text=label + ":").pack(side="left")
+            ttk.Spinbox(r, from_=lo, to=hi, increment=0.25, width=5, textvariable=var).pack(
+                side="left", padx=(4, 2))
+            ttk.Label(r, text="s").pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(trans_opts, text="Change back afterwards (loops smoothly)",
+                        variable=loop_var).pack(anchor="w", pady=2)
+
+        fps_row = ttk.Frame(left)
+        fps_row.pack(fill="x", pady=(6, 0), side="bottom")
+        ttk.Label(fps_row, text="Smoothness:").pack(side="left")
+        fps_var = tk.StringVar(value="12 frames/s")
+        tooltip(ttk.Combobox(fps_row, textvariable=fps_var, state="readonly", width=12,
+                             values=["8 frames/s", "10 frames/s", "12 frames/s",
+                                     "15 frames/s", "20 frames/s"]),
+                "More frames per second plays smoother but makes a bigger GIF.").pack(
+            side="left", padx=(6, 0))
+
+        # Preview (small, plays in a loop) on the right.
+        canvas_bg = themes.accent(self._theme_name)
+        holder = tk.Frame(right, width=330, height=250, bg=canvas_bg["canvas"])
+        holder.pack_propagate(False)
+        holder.pack()
+        preview = tk.Label(holder, bg=canvas_bg["canvas"], fg=canvas_bg["canvas_fg"])
+        preview.pack(expand=True, fill="both")
+        info = ttk.Label(right, style="Muted.TLabel", text="")
+        info.pack(anchor="w", pady=(6, 0))
+        state = {"gen": 0, "job": None, "play": None, "frames": [], "durs": [], "i": 0,
+                 "imgs": [], "busy": False}
+
+        def _fps() -> float:
+            return float(fps_var.get().split()[0])
+
+        def _num(var: tk.Variable, default: float, lo: float, hi: float) -> float:
+            try:
+                return max(lo, min(hi, float(var.get())))
+            except (tk.TclError, ValueError):
+                return default
+
+        def _settings() -> Optional[dict]:
+            """Everything needed to make the animation, or None if a picture
+            is missing."""
+            mode = mode_var.get()
+            if not pics["a"] or (mode == "transition" and not pics["b"]):
+                return None
+            if mode == "still":
+                return dict(mode=mode, a=pics["a"],
+                            effect=animate.STILL_EFFECTS[still_var.get()],
+                            label=still_var.get(), seconds=_num(length_var, 3, 1, 6),
+                            strength=_num(strength_var, 0.5, 0, 1), bounce=bounce_var.get(),
+                            face=face_var.get(), fps=_fps())
+            return dict(mode=mode, a=pics["a"], b=pics["b"],
+                        effect=animate.TRANSITIONS[trans_var.get()], label=trans_var.get(),
+                        hold_a=_num(hold_a_var, 1, 0.2, 10), seconds=_num(change_var, 1.5, 0.3, 4),
+                        hold_b=_num(hold_b_var, 1.5, 0.2, 10), loop_back=loop_var.get(),
+                        color=smoke_color[0], fps=_fps())
+
+        def _layout(*_a) -> None:
+            transition = mode_var.get() == "transition"
+            for w in rows["b"]:
+                w.grid() if transition else w.grid_remove()
+            swap_btn.grid() if transition else swap_btn.grid_remove()
+            if transition:
+                effect_box.config(textvariable=trans_var, values=list(animate.TRANSITIONS))
+                still_opts.pack_forget()
+                trans_opts.pack(anchor="w", pady=(8, 0), after=eff)
+                if animate.TRANSITIONS[trans_var.get()] in animate.COLORED:
+                    smoke_row.pack(anchor="w", pady=(8, 0), after=eff)
+                else:
+                    smoke_row.pack_forget()
+            else:
+                effect_box.config(textvariable=still_var, values=list(animate.STILL_EFFECTS))
+                trans_opts.pack_forget()
+                smoke_row.pack_forget()
+                still_opts.pack(anchor="w", pady=(8, 0), after=eff)
+                looping = animate.STILL_EFFECTS[still_var.get()] in ("pulse", "shake")
+                bounce_check.config(state="disabled" if looping else "normal")
+            _schedule()
+
+        def _schedule(*_a) -> None:
+            if state["job"]:
+                win.after_cancel(state["job"])
+            state["job"] = win.after(350, _make_preview)
+
+        def _play() -> None:
+            state["play"] = None
+            if not win.winfo_exists() or not state["imgs"]:
+                return
+            i = state["i"] % len(state["imgs"])
+            preview.config(image=state["imgs"][i])
+            state["i"] = i + 1
+            state["play"] = win.after(max(20, state["durs"][i]), _play)
+
+        def _make_preview() -> None:
+            state["job"] = None
+            s = _settings()
+            if s is None:
+                if state["play"]:
+                    win.after_cancel(state["play"])
+                    state["play"] = None
+                preview.config(image="", text="Choose the picture(s)\nto see a preview")
+                state["imgs"] = []
+                info.config(text="")
+                create_btn.config(state="disabled")
+                return
+            create_btn.config(state="normal")
+            state["gen"] += 1
+            gen = state["gen"]
+            info.config(text="Making a preview…")
+
+            def _work() -> None:
+                try:
+                    frames, durs = _render(s, max_side=320)
+                    err = None
+                except Exception as e:
+                    log.exception("ANIM_PREVIEW_ERROR")
+                    frames, durs, err = [], [], str(e)
+                self.root.after(0, lambda: _show(gen, frames, durs, err))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _show(gen: int, frames: list, durs: list, err: Optional[str]) -> None:
+            if gen != state["gen"] or not win.winfo_exists():
+                return
+            if err:
+                info.config(text=f"Couldn't make it: {err}")
+                return
+            # Show a new image before dropping the old ones: the label must
+            # never point at a PhotoImage that's been freed.
+            imgs = [ImageTk.PhotoImage(f) for f in frames]
+            preview.config(image=imgs[0], text="")
+            state["imgs"] = imgs
+            state["durs"] = durs
+            state["i"] = 0
+            info.config(text=f"{len(frames)} frames · {sum(durs) / 1000:.1f}s per loop")
+            if state["play"] is None:
+                _play()
+
+        def _render(s: dict, max_side: int = animate.MAX_SIDE) -> tuple:
+            """Runs off the Tk thread."""
+            with Image.open(s["a"]) as im:
+                a = animate.prepare(im, max_side)
+            if s["mode"] == "still":
+                focus = (0.5, 0.5)
+                if s["face"] and s["effect"] in ("zoom_in", "zoom_out", "pulse"):
+                    try:
+                        faces = web_lookup.find_faces(a)
+                    except Exception:
+                        faces = None
+                    if faces:
+                        x0, y0, x1, y1 = faces[0]
+                        focus = ((x0 + x1) / 2, (y0 + y1) / 2)
+                return animate.still_frames(a, s["effect"], s["seconds"], s["fps"],
+                                            s["strength"], focus, s["bounce"], max_side)
+            with Image.open(s["b"]) as im:
+                b = animate.prepare(im, max_side * 2)
+            return animate.transition_frames(a, b, s["effect"], s["hold_a"], s["seconds"],
+                                             s["hold_b"], s["fps"], s["loop_back"],
+                                             s["color"], max_side)
+
+        def _create() -> None:
+            s = _settings()
+            if s is None or state["busy"]:
+                return
+            state["busy"] = True
+            create_btn.config(state="disabled")
+            info.config(text="Making the animation…")
+
+            def _work() -> None:
+                path, err = None, None
+                try:
+                    frames, durs = _render(s)
+                    stem = os.path.splitext(os.path.basename(s["a"]))[0]
+                    if s["mode"] == "transition":
+                        stem += " to " + os.path.splitext(os.path.basename(s["b"]))[0]
+                    base = _safe_filename(f"{stem} - {s['label']}")[:120] or "animation"
+                    path = os.path.join(self._ANIM_DIR, base + ".webp")
+                    n = 2
+                    while os.path.exists(path):
+                        path = os.path.join(self._ANIM_DIR, f"{base} ({n}).webp")
+                        n += 1
+                    animate.save_webp(path, frames, durs)
+                    log.info("ANIMATION_CREATED  %s  frames=%d", os.path.basename(path),
+                             len(frames))
+                except Exception as e:
+                    log.exception("ANIMATION_ERROR")
+                    err = str(e)
+                self.root.after(0, lambda: _done(path, err))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _done(path: Optional[str], err: Optional[str]) -> None:
+            state["busy"] = False
+            if err:
+                if win.winfo_exists():
+                    create_btn.config(state="normal")
+                    info.config(text="")
+                messagebox.showerror("Create Animation", f"Couldn't make the animation: {err}",
+                                     parent=win if win.winfo_exists() else self.root)
+                return
+            _close()
+            self._load_source(path, generated=True)
+            self._status.config(text=self._status.cget("text") + "  •  made with Create "
+                                                                  "Animation")
+
+        def _close() -> None:
+            state["gen"] += 1
+            for key in ("job", "play"):
+                if state[key]:
+                    win.after_cancel(state[key])
+            self._anim_win = None
+            win.destroy()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        create_btn = ttk.Button(btns, text="Create", style="Accent.TButton", command=_create)
+        ttk.Button(btns, text="Close", command=_close).pack(side="right")
+        create_btn.pack(side="right", padx=(0, 6))
+        ttk.Label(body, style="Muted.TLabel", wraplength=560, justify="left",
+                  text="The animation opens as your picture, ready for a caption — save it "
+                       "as a GIF as usual.").grid(row=2, column=0, columnspan=2, sticky="w",
+                                                  pady=(10, 0))
+
+        for var in (still_var, trans_var, mode_var):
+            var.trace_add("write", _layout)
+        for var in (length_var, strength_var, bounce_var, face_var, hold_a_var, change_var,
+                    hold_b_var, loop_var, fps_var):
+            var.trace_add("write", _schedule)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        _layout()
+
+    # ------------------------------------------------------------------
+    # Theme editor — make or change a personal theme (themes/<name>.json),
+    # previewed live on the whole app while editing
+    # ------------------------------------------------------------------
+
+    _THEME_PREVIEW = "​Editing theme"   # never a real theme's name
+
+    def _theme_editor(self) -> None:
+        if getattr(self, "_theme_win", None) is not None and self._theme_win.winfo_exists():
+            self._theme_win.lift()
+            return
+        prev = self._theme_name
+        base = "Basic" if prev == "basic" else prev
+        data = themes.theme_data(base)
+        editing_own = not themes.is_builtin(base) and base != "Basic"
+        original_name = base if editing_own else None
+        data["name"] = base if editing_own else f"My {base}"
+
+        win = tk.Toplevel(self.root)
+        self._theme_win = win
+        win.title("Theme Editor")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+
+        top = ttk.Frame(body)
+        top.pack(fill="x")
+        ttk.Label(top, text="Name:").pack(side="left")
+        name_var = tk.StringVar(value=data["name"])
+        ttk.Entry(top, textvariable=name_var, width=28).pack(side="left", padx=(6, 0))
+        ttk.Label(body, style="Muted.TLabel", wraplength=440, justify="left",
+                  text=f"Starting from {base}. Changes show on the whole app as you "
+                       "make them; Save keeps them as your own theme.").pack(
+            anchor="w", pady=(6, 8))
+
+        swatches: dict = {}     # color key -> its swatch buttons (quick and full)
+        pending = {"job": None}
+
+        def _preview() -> None:
+            pending["job"] = None
+            if not win.winfo_exists():
+                return
+            themes.preview_palette(self._THEME_PREVIEW, data)
+            self._theme_name = self._THEME_PREVIEW
+            self._apply_theme(self._THEME_PREVIEW)
+
+        def _changed() -> None:
+            for key, btns in swatches.items():
+                for btn in btns:
+                    btn.config(bg=data[key], activebackground=data[key])
+            if pending["job"]:
+                self.root.after_cancel(pending["job"])
+            pending["job"] = self.root.after(120, _preview)
+
+        def _pick(key: str, label: str) -> None:
+            picked = colorchooser.askcolor(color=data[key], title=label, parent=win)[1]
+            if picked:
+                data[key] = picked
+                _changed()
+
+        def _swatch(parent, key: str, label: str) -> tk.Button:
+            btn = tk.Button(parent, width=4, relief="groove", bg=data[key],
+                            activebackground=data[key], command=lambda: _pick(key, label))
+            swatches.setdefault(key, []).append(btn)
+            return btn
+
+        quick = ttk.LabelFrame(body, text="Quick colors", padding=8)
+        quick.pack(fill="x")
+        for key, label in (("bg", "Background"), ("fg", "Text"), ("accent", "Accent")):
+            ttk.Label(quick, text=label + ":").pack(side="left")
+            _swatch(quick, key, label).pack(side="left", padx=(4, 12))
+
+        def _derive() -> None:
+            data.update(themes.derive_palette(data["bg"], data["fg"], data["accent"]))
+            _changed()
+        tooltip(ttk.Button(quick, text="Make the rest from these", command=_derive,
+                           style="Small.TButton"),
+                "Pick the other colors to match these three\n"
+                "(panels, borders, hover, hints, the preview area…)").pack(side="right")
+
+        allc = ttk.LabelFrame(body, text="All colors", padding=8)
+        allc.pack(fill="x", pady=(8, 0))
+        for i, (key, label) in enumerate(themes.COLOR_ROLES):
+            r, c = divmod(i, 2)
+            ttk.Label(allc, text=label).grid(row=r, column=c * 2, sticky="w", padx=(0, 6),
+                                             pady=2)
+            _swatch(allc, key, label).grid(row=r, column=c * 2 + 1, sticky="w",
+                                           padx=(0, 18), pady=2)
+
+        picf = ttk.LabelFrame(body, text="Background picture", padding=8)
+        picf.pack(fill="x", pady=(8, 0))
+        bg_label = ttk.Label(picf, style="Muted.TLabel", width=30)
+
+        def _show_bg() -> None:
+            ref = data.get("background")
+            bg_label.config(text=os.path.basename(ref) if ref else "(none)")
+
+        def _choose_bg() -> None:
+            path = filedialog.askopenfilename(
+                parent=win, title="Background picture",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp"), ("All files", "*.*")])
+            if path:
+                data["background"] = path
+                data.setdefault("background_mode", "tile")
+                mode_var.set(data["background_mode"])
+                _show_bg()
+                _changed()
+
+        def _clear_bg() -> None:
+            data.pop("background", None)
+            _show_bg()
+            _changed()
+        ttk.Button(picf, text="Choose…", style="Small.TButton", command=_choose_bg).grid(
+            row=0, column=0, sticky="w")
+        ttk.Button(picf, text="None", style="Small.TButton", command=_clear_bg).grid(
+            row=0, column=1, sticky="w", padx=(4, 8))
+        bg_label.grid(row=0, column=2, sticky="w")
+        mode_var = tk.StringVar(value=data.get("background_mode", "fit"))
+        modes = ttk.Frame(picf)
+        modes.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        for text, value in (("Fill", "fit"), ("Repeat", "tile")):
+            ttk.Radiobutton(modes, text=text, value=value, variable=mode_var).pack(
+                side="left", padx=(0, 8))
+        ttk.Label(modes, text="Fade:").pack(side="left", padx=(8, 4))
+        dim_var = tk.DoubleVar(value=float(data.get("background_dim", 0.0)))
+        ttk.Scale(modes, from_=0.0, to=0.85, variable=dim_var, length=140).pack(side="left")
+
+        def _on_bg_opts(*_a) -> None:
+            data["background_mode"] = mode_var.get()
+            data["background_dim"] = round(self._safe_float(dim_var), 2)
+            if data.get("background"):
+                _changed()
+        mode_var.trace_add("write", _on_bg_opts)
+        dim_var.trace_add("write", _on_bg_opts)
+        _show_bg()
+
+        fontf = ttk.Frame(body)
+        fontf.pack(fill="x", pady=(8, 0))
+        ttk.Label(fontf, text="App font:").pack(side="left")
+        default_font = "(app default)"
+        font_var = tk.StringVar(value=data.get("font") or default_font)
+        font_box = ttk.Combobox(fontf, textvariable=font_var, width=28, state="readonly",
+                                values=[default_font] + sorted(set(tkfont.families(self.root)),
+                                                               key=str.lower))
+        font_box.pack(side="left", padx=(6, 0))
+
+        def _on_font(_e=None) -> None:
+            f = font_var.get()
+            if f == default_font:
+                data.pop("font", None)
+            else:
+                data["font"] = f
+            _changed()
+        font_box.bind("<<ComboboxSelected>>", _on_font)
+
+        def _finish(apply_name: Optional[str]) -> None:
+            if pending["job"]:
+                self.root.after_cancel(pending["job"])
+            themes.get_palettes(force_reload=True)
+            self._theme_win = None
+            win.destroy()
+            name = apply_name or prev
+            self._theme_name = name
+            self._theme_var.set(name)
+            themes.save_theme(name)
+            self._apply_theme(name)
+
+        def _save() -> None:
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showinfo("Theme Editor", "Give your theme a name.", parent=win)
+                return
+            if themes.is_builtin(name) or name.lower() == "basic":
+                messagebox.showinfo("Theme Editor",
+                                    f"\"{name}\" is a built-in theme. Pick another name, so "
+                                    "updates to the app can't overwrite yours.", parent=win)
+                return
+            exists = name in themes.get_palettes(force_reload=False) and name != original_name
+            if exists and not messagebox.askyesno(
+                    "Theme Editor", f"Replace your theme \"{name}\"?", parent=win):
+                return
+            try:
+                saved = themes.save_custom_theme(dict(data, name=name))
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Theme Editor", f"Couldn't save the theme: {e}",
+                                     parent=win)
+                return
+            log.info("THEME_SAVED  name=%s", saved)
+            _finish(saved)
+
+        def _delete() -> None:
+            if not messagebox.askyesno("Theme Editor",
+                                       f"Delete your theme \"{original_name}\"?", parent=win):
+                return
+            try:
+                themes.delete_custom_theme(original_name)
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Theme Editor", f"Couldn't delete it: {e}", parent=win)
+                return
+            _finish(themes.DEFAULT_THEME)
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(14, 0))
+        if original_name:
+            ttk.Button(btns, text="Delete theme", command=_delete).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=lambda: _finish(None)).pack(side="right")
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=_save).pack(
+            side="right", padx=(0, 6))
+        win.protocol("WM_DELETE_WINDOW", lambda: _finish(None))
 
     # ------------------------------------------------------------------
     # Aardvark Cafe prompt
@@ -6755,16 +7874,16 @@ class CaptionApp:
 
         if choice == "placeholder":
             first = next(iter(ImageSequence.Iterator(img)))
+            self._durations.append(_frame_delay(first))
             self._frames.append(first.copy().convert("RGBA"))
-            self._durations.append(first.info.get("duration", 100))
             self._deferred_path = path
             self._deferred_kind = "gif"
             self._deferred_total_frames = n_frames
             return True
 
         for frm in ImageSequence.Iterator(img):
+            self._durations.append(_frame_delay(frm))
             self._frames.append(frm.copy().convert("RGBA"))
-            self._durations.append(frm.info.get("duration", 100))
         return True
 
     def _load_video_frames(self, path: str, force_full: bool = False) -> bool:
@@ -6889,11 +8008,21 @@ class CaptionApp:
             return 1.0
         return max(0.1, min(10.0, value)) if value > 0 else 1.0
 
+    def _frame_step(self) -> int:
+        """Keep every Nth frame (the Keep setting); 1 = all of them."""
+        return _FRAME_STEPS.get(self._frame_step_var.get(), 1) if self._is_anim else 1
+
+    def _set_frame_step(self, step: int) -> None:
+        self._frame_step_var.set(next((k for k, v in _FRAME_STEPS.items() if v == step),
+                                      "All frames"))
+
     def _effective_durations(self) -> list:
-        """Per-frame delays (ms) of the trimmed, retimed animation — only
-        meaningful when every frame is loaded (not deferred)."""
+        """Per-frame delays (ms) of the trimmed, retimed animation, after
+        dropping frames per the Keep setting — only meaningful when every
+        frame is loaded (not deferred)."""
         first, last = self._trim_range()
-        return _retime_delays(self._durations[first:last + 1], self._speed())
+        return _merge_delays(_retime_delays(self._durations[first:last + 1], self._speed()),
+                             self._frame_step())
 
     def _update_trim_controls(self, reset: bool = False) -> None:
         """Show Frames/Speed for animated sources; on a new file, reset to
@@ -6910,6 +8039,7 @@ class CaptionApp:
                 self._trim_start_var.set(1)
                 self._trim_end_var.set(total)
                 self._speed_var.set("1")
+                self._frame_step_var.set("All frames")
             finally:
                 self._trim_updating = False
         if not self._trim_row.winfo_manager():
@@ -6925,7 +8055,8 @@ class CaptionApp:
             seconds = count / fps if fps else 0
         else:
             seconds = sum(self._effective_durations()) / 1000
-        self._trim_info.config(text=f"{count} frames · {seconds:.1f}s")
+        kept = math.ceil(count / self._frame_step())
+        self._trim_info.config(text=f"{kept} frames · {seconds:.1f}s")
 
     def _on_trim_change(self) -> None:
         if getattr(self, "_trim_updating", False) or not self._is_anim:
@@ -6995,7 +8126,7 @@ class CaptionApp:
         self._load_source(path)
 
     def _load_source(self, path: str, *, is_temp_download: bool = False,
-                      source_url: Optional[str] = None) -> None:
+                      source_url: Optional[str] = None, generated: bool = False) -> None:
         """Load path (any file on disk — a local pick from _open(), or a
         temp file downloaded by _web_lookup()) as the current source image/
         GIF/video, replacing whatever was previously loaded. source_url is
@@ -7035,6 +8166,9 @@ class CaptionApp:
 
         ext = os.path.splitext(path)[1].lower()
         self._is_video = ext == ".mp4"
+        # Made here by Create Animation: smooth, full-color frames (not a
+        # dithered GIF), so they're scaled and dithered like a video's.
+        self._source_generated = generated
 
         if self._is_video:
             if not self._load_video_frames(path):
@@ -7051,7 +8185,7 @@ class CaptionApp:
             self._is_anim = is_anim or ext == ".gif"
 
             if self._is_anim:
-                if not self._load_gif_frames(path):
+                if not self._load_gif_frames(path, force_full=generated):
                     self._status.config(text="No file loaded")
                     return
             else:
@@ -7567,6 +8701,10 @@ class CaptionApp:
             "gif_colors": gif_colors,
             "trim": list(self._trim_range()),
             "speed": self._speed(),
+            "frame_step": self._frame_step(),
+            # Generated animations have smooth gradients (crossfades), which
+            # need dithering in the GIF; real GIF sources are dithered already.
+            "dither": self._is_video or getattr(self, "_source_generated", False),
         }
         job_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, encoding="utf-8")
@@ -8001,7 +9139,8 @@ class CaptionApp:
             caption_side=self._side_var.get(),
             auto_size=self._auto_size_var.get(),
             frame_size=self._frames[0].size if self._frames else None,
-            source_is_gif=self._is_anim and not self._is_video,
+            source_is_gif=(self._is_anim and not self._is_video
+                           and not getattr(self, "_source_generated", False)),
             scale_overlays=self._scale_overlays_var.get(),
             font_family=self._font_var.get(),
             page_bg=self._page_bg_color,
@@ -8229,9 +9368,10 @@ class CaptionApp:
             return
         path, kind = self._deferred_path, self._deferred_kind
         first, last = self._trim_range()
-        total = last - first + 1
+        step = self._frame_step()
+        total = math.ceil((last - first + 1) / step)
         as_mp4 = self._is_video
-        fps = self._export_fps() * self._speed()
+        fps = self._export_fps() * self._speed() / step
         gif_colors = _resolve_gif_colors(raw)
         sample_n = min(_DEFERRED_SIZE_SAMPLE_FRAMES, total)
 
@@ -8240,14 +9380,14 @@ class CaptionApp:
                 kwargs, _size = _resolve_composite_kwargs(raw)
                 src = []
                 for i, frame in enumerate(_iter_frames_from_path(path, kind)):
-                    if i < first:
+                    if i < first or (i - first) % step:
                         continue
                     if len(src) >= sample_n:
                         break
                     src.append(frame)
                 if not src:
                     return
-                sample = [build_composite(frame, **kwargs, frame_index=i)
+                sample = [build_composite(frame, **kwargs, frame_index=i * step)
                           for i, frame in enumerate(src)]
                 sample_bytes = _estimate_anim_bytes(sample, as_mp4, fps, None, gif_colors)
                 size_bytes = round(sample_bytes / len(sample) * total)
@@ -8292,14 +9432,16 @@ class CaptionApp:
         cancel = self._build_cancel
         first, last = self._trim_range()
         speed = self._speed()
-        # Snapshot (trimmed) so the thread doesn't see file reloads.
-        frames = self._frames[first:last + 1]
+        step = self._frame_step()
+        # Snapshot (trimmed, and thinned per Keep) so the thread doesn't see
+        # file reloads.
+        frames = self._frames[first:last + 1][::step]
         play_durations = self._effective_durations()
         # Snapshot the other pieces the size-estimate encode below needs, for
         # the same reason — Tk state isn't safe to read from the background
         # thread once it starts.
         as_mp4 = self._is_video
-        fps = self._export_fps() * speed
+        fps = self._export_fps() * speed / step
         durations = play_durations if (play_durations and not as_mp4) else None
         gif_colors = _resolve_gif_colors(raw)
 
@@ -8319,7 +9461,7 @@ class CaptionApp:
                     log.debug("GIF_BUILD_CANCELLED  frame=%d", i)
                     return
                 try:
-                    results.append(build_composite(f, **kwargs, frame_index=i))
+                    results.append(build_composite(f, **kwargs, frame_index=i * step))
                 except Exception:
                     log.exception("FRAME_BUILD_ERROR  frame=%d", i)
                     return
@@ -9064,6 +10206,7 @@ class CaptionApp:
         else:
             recent.add_command(label="(none yet)", state="disabled")
         menu.add_cascade(label="Recent Files", menu=recent)
+        menu.add_command(label="Create Animation…", command=self._create_animation_dialog)
         menu.add_separator()
         menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
                          command=self._open_project)
@@ -9372,6 +10515,7 @@ class CaptionApp:
                 "watermark_height": self._watermark_height_var.get(),
                 "trim": [first + 1, last + 1] if self._is_anim else None,
                 "speed": self._speed() if self._is_anim else 1.0,
+                "frame_step": self._frame_step(),
                 "inline_styling": self._markup_var.get(),
                 "dialogue_color": self._dialogue_color if self._dialogue_on_var.get() else None,
                 "auto_contrast": self._auto_contrast_var.get(),
@@ -9542,6 +10686,7 @@ class CaptionApp:
                     self._trim_start_var.set(int(data["trim"][0]))
                     self._trim_end_var.set(int(data["trim"][1]))
                 self._speed_var.set(f"{float(data.get('speed', 1.0)):g}")
+                self._set_frame_step(int(data.get("frame_step") or 1))
             finally:
                 self._trim_updating = False
             self._update_trim_info()
@@ -9707,36 +10852,41 @@ class CaptionApp:
         deferred_path, deferred_kind = self._deferred_path, self._deferred_kind
         first, last = self._trim_range()
         speed = self._speed()
-        total = last - first + 1
-        frames = (None if deferred_path
-                  else self._frames[first:last + 1][:_GIF_SIZE_SAMPLE_FRAMES])
-        durations = None if deferred_path else self._effective_durations()
+        step0 = self._frame_step()
+        count = last - first + 1
+        # Enough frames to sample from after thinning to every 4th.
+        n_src = _GIF_SIZE_SAMPLE_FRAMES * 4
+        frames = None if deferred_path else self._frames[first:last + 1][:n_src]
+        base_durations = (None if deferred_path else
+                          _retime_delays(self._durations[first:last + 1], speed))
         fps = self._export_fps() * speed
         fw, fh = raw["frame_size"]
         current_pct = raw["output_size_pct"] if raw["output_override"] else None
         target = limit * 0.95  # headroom for sampling error
 
-        def _search() -> Optional[tuple]:
-            src = frames
-            src_durations = durations
+        def _search() -> dict:
+            """{"fit": (pct, colors, step)} when quality settings alone get
+            under the cap; else {"drop": (pct, colors, step) or None,
+            "shorten": frames to keep} — the two ways left, for the user."""
+            src, src_durations = frames, base_durations
             if src is None:
                 src = []
                 for i, f in enumerate(_iter_frames_from_path(deferred_path, deferred_kind)):
                     if i < first:
                         continue
-                    if len(src) >= _GIF_SIZE_SAMPLE_FRAMES:
+                    if len(src) >= n_src:
                         break
                     src.append(f)
-                with Image.open(deferred_path) as img:
-                    src_durations = _retime_delays(
-                        [frm.info.get("duration", 100)
-                         for frm in ImageSequence.Iterator(img)][first:last + 1], speed)
+                src_durations = _retime_delays(_file_delays(deferred_path)[first:last + 1],
+                                               speed)
 
-            def size_at(pct: int, colors: int) -> int:
+            def size_at(pct: int, colors: int, step: int = step0, frames_n: int = count) -> int:
                 kwargs, _ = _resolve_composite_kwargs(
                     dict(raw, output_override=True, output_size_pct=pct))
-                return _sampled_gif_bytes(src, kwargs, src_durations, fps,
-                                          colors if colors < 256 else None, total)
+                durs = _merge_delays(src_durations, step) if src_durations else None
+                return _sampled_gif_bytes(src[::step], kwargs, durs, fps / step,
+                                          colors if colors < 256 else None,
+                                          math.ceil(frames_n / step))
 
             hi = current_pct
             if hi is None:
@@ -9750,11 +10900,25 @@ class CaptionApp:
                         best, lo = mid, mid + 1
                     else:
                         hi = mid - 1
-                return best, 256
+                return {"fit": (best, 256, step0)}
             for colors in (128, 96, 64, 48, 32):
                 if size_at(0, colors) <= target:
-                    return 0, colors
-            return None
+                    return {"fit": (0, colors, step0)}
+            # Still too big: drop frames (whole clip, choppier) or shorten it
+            # (smooth, less of it). Work out both so the user can choose.
+            drop = None
+            for step in range(step0 + 1, 5):
+                for colors in (256, 128, 64, 32):
+                    if size_at(0, colors, step) <= target:
+                        drop = (0, colors, step)
+                        break
+                if drop:
+                    break
+            full = size_at(0, 32)
+            keep = max(2, int(count * target / max(1, full) * 0.97))
+            while keep > 2 and size_at(0, 32, step0, keep) > target:
+                keep = int(keep * 0.9)
+            return {"drop": drop, "shorten": min(keep, count - 1)}
 
         def _run() -> None:
             try:
@@ -9772,22 +10936,81 @@ class CaptionApp:
                 messagebox.showerror(f"Fit under {cap}", "Couldn't work out smaller settings — "
                                      "see caption_creator_crash.log.")
                 return
-            if result is None:
+            if "fit" not in result:
                 self._size_est_label.config(text=base_text)
-                messagebox.showinfo(
-                    f"Fit under {cap}",
-                    "Even at the smallest output size (1280×720) with 32 colors this "
-                    f"GIF is still over {cap}.\n\nUse Frames … to … under the preview to "
-                    f"keep a shorter part of it, then press Fit under {cap} again.")
-                return
-            pct, colors = result
-            log.info("FIT_DA_LIMIT  pct=%d colors=%d", pct, colors)
+                choice = self._fit_fallback_choice(cap, result["drop"], result["shorten"],
+                                                   first, count)
+                if choice == "drop":
+                    pct, colors, step = result["drop"]
+                elif choice == "shorten":
+                    pct, colors, step = 0, 32, step0
+                    self._trim_end_var.set(first + result["shorten"])
+                else:
+                    return
+            else:
+                pct, colors, step = result["fit"]
+            log.info("FIT_DA_LIMIT  pct=%d colors=%d step=%d", pct, colors, step)
             self._set_output_override(pct)
             if colors < 256:
                 self._set_gif_compress(colors)
+            if step != step0:
+                self._set_frame_step(step)
             self._size_est_label.config(text="Est. size: recalculating…", foreground="#888")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _fit_fallback_choice(self, cap: str, drop: Optional[tuple], keep: int,
+                             first: int, count: int) -> str:
+        """Even the smallest size at 32 colors is over the cap: ask whether
+        to drop frames or shorten the clip. Returns "drop", "shorten" or
+        "cancel"."""
+        durs = (None if self._deferred_path else
+                _retime_delays(self._durations[first:first + count], self._speed()))
+        fps = self._export_fps() * self._speed()
+
+        def secs(n: int) -> float:
+            return sum(durs[:n]) / 1000 if durs else n / fps
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Fit under {cap}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, wraplength=420, justify="left",
+                  text=f"Even at the smallest size (1280×720) with 32 colors, this GIF is "
+                       f"still over {cap}. Two ways to get it under:").pack(anchor="w")
+        result = ["cancel"]
+
+        def _pick(v: str) -> None:
+            result[0] = v
+            dlg.destroy()
+
+        options = ttk.Frame(body)
+        options.pack(anchor="w", fill="x", pady=(10, 0))
+        if drop:
+            _pct, colors, step = drop
+            nth = {2: "2nd", 3: "3rd", 4: "4th"}[step]
+            ttk.Button(options, text="Drop frames", style="Accent.TButton",
+                       command=lambda: _pick("drop")).grid(row=0, column=0, sticky="ew",
+                                                           pady=3)
+            ttk.Label(options, wraplength=300, justify="left",
+                      text=f"Keep every {nth} frame ({colors} colors). Plays all "
+                           f"{secs(count):.1f}s, a little choppier.").grid(
+                row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Button(options, text="Shorten it", command=lambda: _pick("shorten")).grid(
+            row=1, column=0, sticky="ew", pady=3)
+        ttk.Label(options, wraplength=300, justify="left",
+                  text=f"Keep the first {keep} frames ({secs(keep):.1f}s of "
+                       f"{secs(count):.1f}s), smooth. You can move the Frames range "
+                       "afterwards to keep a different part.").grid(
+            row=1, column=1, sticky="w", padx=(10, 0))
+        ttk.Button(body, text="Cancel", command=lambda: _pick("cancel")).pack(
+            anchor="e", pady=(12, 0))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("cancel"))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result[0]
 
     def _card_bg(self) -> str:
         bg = self._style.lookup("Card.TFrame", "background")
@@ -9855,6 +11078,8 @@ class CaptionApp:
                                   tags=("img",))
         if self._text_boxes and self._overlay_mode():
             self._tb_draw_selection()
+            if self._tb_drag:
+                self._tb_draw_guides(self._tb_guides)
         if self._censors:
             self._cz_draw()
 

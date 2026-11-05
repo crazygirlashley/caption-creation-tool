@@ -36,6 +36,9 @@ DEFAULTS = {
     "model": "",
     "api_key": "",
     "temperature": 0.9,
+    # A model that can see pictures (e.g. Moondream, LLaVA), used only to
+    # describe the caption's picture; "" = don't look at the picture.
+    "vision_model": "",
 }
 
 # label -> approximate word target. Caption panels hold a paragraph or
@@ -110,11 +113,76 @@ def _unreachable_msg(base_url: str) -> str:
             "model, then check the address under ⚙ Settings → AI Writer.")
 
 
-def build_messages(prompt: str, words: int) -> list:
+def build_messages(prompt: str, words: int, picture: str = "") -> list:
+    """`picture` is a description of the caption's image, if there is one,
+    so the story can match who and what is in it."""
+    user = prompt.strip()
+    if picture.strip():
+        user = (f"The caption's picture shows: {picture.strip()}\n\n"
+                "Write the story to fit that picture — the person in it is the one "
+                f"the story is about, as they look by the end.\n\n{user}")
     return [
         {"role": "system", "content": SYSTEM_PROMPT.format(words=words)},
-        {"role": "user", "content": prompt.strip()},
+        {"role": "user", "content": user},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Looking at the picture: a vision model describes it, and the description
+# goes into the writer's prompt. The writing model itself needn't see, so any
+# uncensored text model still does the writing.
+# ---------------------------------------------------------------------------
+
+DESCRIBE_PROMPT = (
+    "Describe this picture for a fiction writer, in 3 to 5 plain sentences. "
+    "Cover the person or people (apparent gender presentation, hair, makeup, "
+    "body, clothing or lingerie, pose, facial expression), what they seem to be "
+    "doing, and the setting and mood. This is an adult art community and the "
+    "people shown are adults; describe nudity or sexual content matter-of-factly "
+    "if present. Don't guess names or ages, and don't add opinions or warnings."
+)
+
+# Vision models offered for one-click download through Ollama:
+# (tag, label, download GB, RAM GB needed)
+VISION_MODELS = [
+    ("moondream", "Moondream 2 — small and quick, short descriptions", 1.7, 4),
+    ("llava:7b", "LLaVA 7B — more detail", 4.7, 10),
+    ("minicpm-v", "MiniCPM-V 8B — the most detail, needs a strong PC", 5.5, 12),
+]
+
+_DESCRIBE_MAX_SIDE = 768
+
+
+def image_data_url(img) -> str:
+    """A PIL image as a JPEG data: URL, shrunk to what vision models use."""
+    import base64
+    import io
+    im = img.convert("RGB")
+    im.thumbnail((_DESCRIBE_MAX_SIDE, _DESCRIBE_MAX_SIDE))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=88)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def describe_image(img, settings: dict, cancel: Optional[threading.Event] = None) -> str:
+    """A short description of a PIL image from settings["vision_model"]."""
+    model = (settings.get("vision_model") or "").strip()
+    if not model:
+        raise AIWriterError("No picture model is set — choose one under "
+                            "⚙ Settings → AI Writer → Picture model.")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": DESCRIBE_PROMPT},
+        {"type": "image_url", "image_url": {"url": image_data_url(img)}},
+    ]}]
+    try:
+        text = "".join(_stream_chat(messages, 300, dict(settings, model=model), cancel,
+                                    timeout=240, temperature=0.2))
+    except AIWriterError as e:
+        if "image" in str(e).lower() or "vision" in str(e).lower() or "400" in str(e):
+            raise AIWriterError(f"{model} couldn't read the picture — it may not be a model "
+                                f"that can see images.\n\n{e}") from None
+        raise
+    return " ".join(text.split())
 
 
 class _ThinkFilter:
@@ -204,9 +272,9 @@ def stream_edit(text: str, instruction: str, words: int, settings: dict,
 
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
-                 timeout: float = 300.0) -> Iterator[str]:
+                 timeout: float = 300.0, picture: str = "") -> Iterator[str]:
     """Yield the story text as it streams from POST /chat/completions."""
-    yield from _stream_chat(build_messages(prompt, words), int(words * 2.5) + 200,
+    yield from _stream_chat(build_messages(prompt, words, picture), int(words * 2.5) + 200,
                             settings, cancel, timeout=timeout)
 
 
@@ -325,10 +393,11 @@ def total_ram_gb() -> float:
     return 0.0
 
 
-def recommended_model(ram_gb: float) -> str:
+def recommended_model(ram_gb: float, models: Optional[list] = None) -> str:
     """Largest offered model this much RAM runs comfortably."""
-    fitting = [tag for tag, _label, _gb, need in SETUP_MODELS if ram_gb >= need]
-    return fitting[-1] if fitting else SETUP_MODELS[0][0]
+    models = models or SETUP_MODELS
+    fitting = [tag for tag, _label, _gb, need in models if ram_gb >= need]
+    return fitting[-1] if fitting else models[0][0]
 
 
 def find_ollama_exe() -> Optional[str]:
@@ -510,9 +579,10 @@ def pull_model(name: str, progress: ProgressFn, cancel: Optional[threading.Event
 
 
 def setup_ollama(model: str, progress: ProgressFn,
-                 cancel: Optional[threading.Event] = None) -> dict:
+                 cancel: Optional[threading.Event] = None, role: str = "model") -> dict:
     """Install Ollama if needed, start it, pull `model`, then save and
-    return AI writer settings pointing at it."""
+    return AI writer settings using it as `role` ("model" for writing,
+    "vision_model" for describing pictures)."""
     if not ollama_running():
         exe = find_ollama_exe()
         if exe is None:
@@ -543,7 +613,8 @@ def setup_ollama(model: str, progress: ProgressFn,
     installed = ollama_models()
     if model not in installed and f"{model}:latest" not in installed:
         pull_model(model, progress, cancel)
-    settings = dict(load_settings(), base_url=PRESETS["Ollama"], model=model, api_key="")
+    settings = dict(load_settings(), base_url=PRESETS["Ollama"], api_key="")
+    settings[role] = model
     save_settings(settings)
     progress("Ready.", 1.0)
     return settings
