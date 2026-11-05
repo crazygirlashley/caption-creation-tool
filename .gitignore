@@ -55,3 +55,6 @@ backgrounds/
 
 # autosaved session (crash recovery) — personal, never committed
 autosave/
+
+# Source art for tools/build_assets.py (see themes/CREDITS.md)
+tools/theme_art_src/
