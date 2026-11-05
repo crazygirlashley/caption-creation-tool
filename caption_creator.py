@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover
 import ai_writer
 import animate
 import comfy_client
+import content_rules
 import da_client
 import recent_store
 import spellcheck
@@ -233,6 +234,13 @@ _WHATS_NEW = {
             ("Saved styles", "save a box's look by name and give it to any box in one click"),
             ("More control", "copy & paste boxes (even onto another picture), bring to front / "
              "send to back, Ctrl+D duplicates, right-click for everything"),
+        ]),
+        ("Find Online", [
+            ("Filters", "GIFs only, and Mature to include or skip explicit results"),
+            ("More sources", "with Mature on: xgroovy.com and porngifs.com, alongside "
+             "sex.com — all marked 🔞 MATURE"),
+            ("Search ideas", "your AI reads the story and suggests searches for how the "
+             "character looks"),
         ]),
         ("AI & themes", [
             ("AI looks at your picture", "a picture model describes it so the story fits who "
@@ -3766,6 +3774,10 @@ class CaptionApp:
                 try:
                     for chunk in ai_writer.stream_edit(story, instruction, words, settings, cancel):
                         self.root.after(0, lambda c=chunk: box.winfo_exists() and box.insert("end", c))
+                except ai_writer.ContentBlocked as e:
+                    err = str(e)
+                    # Don't leave any of a blocked reply behind.
+                    self.root.after(0, lambda: box.winfo_exists() and box.delete("1.0", "end"))
                 except ai_writer.AIWriterError as e:
                     err = str(e)
                 except Exception as e:
@@ -5600,7 +5612,8 @@ class CaptionApp:
                         "  • Ollama is already installed — just download the model you pick "
                         "below\n\n")
                      + "Everything runs on this PC; your prompts and stories never leave it. "
-                       "These models are uncensored, so they will write explicit content.")
+                       "These models are uncensored, so they will write explicit adult "
+                       "content (never anything involving minors — the app blocks it).")
         ttk.Label(body, text=intro, wraplength=440, justify="left").pack(anchor="w")
 
         ttk.Label(body, text="Model:").pack(anchor="w", pady=(12, 2))
@@ -6122,10 +6135,17 @@ class CaptionApp:
             state["words"] += chunk.count(" ")
             status.config(text=f"Writing… ~{state['words']} words")
 
-        def _finish(err: Optional[str], cancelled: bool) -> None:
+        def _finish(err: Optional[str], cancelled: bool, blocked: bool = False) -> None:
             state["cancel"] = None
             target = state.get("target") or self._text_box
             if target.winfo_exists():
+                if blocked:
+                    # Take back whatever of the blocked reply was written
+                    # (the run is one undo step), restoring the caption.
+                    try:
+                        target.edit_undo()
+                    except tk.TclError:
+                        pass
                 target.edit_separator()
                 target.config(autoseparators=True)
                 self._schedule_spellcheck()
@@ -6194,7 +6214,10 @@ class CaptionApp:
                 pic_box.insert("1.0", text)
                 pic_hint.update()
                 self._ai_pic_desc = (key, text)
-                status.config(text="Described — edit it if anything's wrong.")
+                status.config(text=(
+                    "The picture model thinks this person may be under 18, so the story "
+                    "will be kept non-sexual." if ai_writer.picture_may_show_minor(text)
+                    else "Described — edit it if anything's wrong."))
                 if then is not None:
                     then()
             threading.Thread(target=_work, daemon=True).start()
@@ -6236,19 +6259,21 @@ class CaptionApp:
             state["cancel"] = cancel
 
             def _work() -> None:
-                err = None
+                err, blocked = None, False
                 try:
                     for chunk in ai_writer.stream_story(prompt, words, settings, cancel,
                                                         picture=picture):
                         self.root.after(0, lambda c=chunk: _append(c))
+                except ai_writer.ContentBlocked as e:
+                    err, blocked = str(e), True
                 except ai_writer.AIWriterError as e:
                     err = str(e)
                 except Exception as e:
                     log.exception("AI_WRITER_ERROR")
                     err = f"Unexpected error: {e}"
-                log.info("AI_WRITER_DONE  model=%s cancelled=%s error=%s",
-                         settings["model"], cancel.is_set(), bool(err))
-                self.root.after(0, lambda: _finish(err, cancel.is_set()))
+                log.info("AI_WRITER_DONE  model=%s cancelled=%s error=%s blocked=%s",
+                         settings["model"], cancel.is_set(), bool(err), blocked)
+                self.root.after(0, lambda: _finish(err, cancel.is_set(), blocked))
 
             threading.Thread(target=_work, daemon=True).start()
 
@@ -6520,7 +6545,8 @@ class CaptionApp:
         def _show_comfy() -> None:
             cfg = self._comfy_settings()
             wf = os.path.basename(cfg["workflow"]) if cfg["workflow"] else "no workflow yet"
-            comfy_status.config(text=f"ComfyUI at {cfg['url']} · {wf}")
+            mode = "explicit allowed" if cfg["allow_explicit"] else "suggestive only"
+            comfy_status.config(text=f"ComfyUI at {cfg['url']} · {wf} · {mode}")
 
         def _comfy_setup() -> None:
             self._comfy_settings_dialog(parent=win)
@@ -6768,7 +6794,8 @@ class CaptionApp:
                     info.config(text="Describe the motion first.")
                     return
                 self._anim_last_comfy = s["prompt"]
-                s.update(url=cfg["url"], workflow=cfg["workflow"])
+                s.update(url=cfg["url"], workflow=cfg["workflow"],
+                         explicit=cfg["allow_explicit"])
             state["busy"] = True
             cancel = threading.Event()
             state["cancel"] = cancel
@@ -6785,9 +6812,11 @@ class CaptionApp:
                             if s[key]:
                                 with Image.open(s[key]) as im:
                                     pictures.append(animate.prepare(im, 1536))
+                        minor = self._comfy_age_check(pictures, s["prompt"], _progress, cancel)
                         frames, durs, notes = comfy_client.generate(
                             s["url"], s["workflow"], pictures, s["prompt"], _progress, cancel,
-                            match_shape=s["match"])
+                            match_shape=s["match"], allow_explicit=s["explicit"],
+                            minor_subject=minor)
                         log.info("COMFY_DONE  frames=%d  %s", len(frames), "; ".join(notes))
                         # Keep it a sensible size for captioning.
                         frames = [animate.prepare(f) for f in frames]
@@ -6867,9 +6896,26 @@ class CaptionApp:
             cancel = threading.Event()
             state["plan_cancel"] = cancel
 
+            paths = [p for p in (pics["a"], pics["b"]) if p]
+
             def _work() -> None:
                 steps, err = None, None
                 try:
+                    if content_rules.is_sexual(text) and settings.get("vision_model"):
+                        # Sexual animation only of adults: the picture model
+                        # looks first (non-sexual moves are fine for anyone).
+                        for path in paths:
+                            with Image.open(path) as im:
+                                pic = animate.prepare(im, 768)
+                            try:
+                                minor = ai_writer.looks_underage(pic, settings, cancel)
+                            except ai_writer.ContentBlocked:
+                                raise
+                            except ai_writer.AIWriterError:
+                                minor = False      # couldn't check; camera moves only
+                            if minor:
+                                raise ai_writer.ContentBlocked(content_rules.message(
+                                    "it's sexual, and the picture may show someone under 18"))
                     raw = ai_writer.plan_animation(text, animate.PLAN_GUIDE, has_second,
                                                    settings, cancel)
                     steps = animate.normalize_plan(raw, has_second)
@@ -6926,7 +6972,48 @@ class CaptionApp:
         cfg = recent_store.get_setting("comfy", {}) or {}
         wf = cfg.get("workflow") or ""
         return {"url": cfg.get("url") or comfy_client.DEFAULT_URL,
-                "workflow": wf if wf and os.path.isfile(wf) else ""}
+                "workflow": wf if wf and os.path.isfile(wf) else "",
+                "allow_explicit": bool(cfg.get("allow_explicit", False))}
+
+    @staticmethod
+    def _comfy_age_check(pictures: list, prompt: str, progress,
+                         cancel: Optional[threading.Event]) -> Optional[bool]:
+        """The picture model's look at who's in the picture(s) before AI
+        video is made: True if someone may be under 18, False if they all
+        look adult, None if it couldn't check. Non-sexual motion is made for
+        anyone; a sexual description needs the check, and is refused (by
+        raising comfy_client.ComfyError) when someone may be under 18.
+        Explicit content is only let through for checked adults (see
+        comfy_client.generate). Runs off the Tk thread."""
+        sexual = content_rules.is_sexual(prompt)
+        settings = ai_writer.load_settings()
+        if not settings.get("vision_model"):
+            if sexual:
+                raise comfy_client.ComfyError(
+                    "A sexual description needs the picture model to check the picture first "
+                    "(that everyone in it looks 18 or older). Choose one under ⚙ Settings → AI "
+                    "Writer Settings → Picture model. Non-sexual motion works without it.")
+            return None
+        progress("Checking the picture…")
+        minor = False
+        for pic in pictures:
+            try:
+                minor = minor or ai_writer.looks_underage(pic, settings, cancel)
+            except ai_writer.AIWriterError as e:
+                if cancel is not None and cancel.is_set():
+                    raise comfy_client.ComfyError("cancelled") from None
+                if sexual:
+                    raise comfy_client.ComfyError(
+                        "The picture model couldn't check the picture, and sexual AI video "
+                        f"isn't made without that check.\n\n{e}") from None
+                return None
+        if minor and sexual:
+            log.info("COMFY_REFUSED  sexual description, picture may show a minor")
+            raise comfy_client.ComfyError(
+                "This can't be made: the picture model thinks someone in this picture may be "
+                "under 18, and the description is sexual. Non-sexual motion (walking, turning, "
+                "smiling…) is fine.")
+        return minor
 
     def _comfy_settings_dialog(self, parent=None) -> None:
         parent = parent or self.root
@@ -6959,6 +7046,18 @@ class CaptionApp:
         wf_label.grid(row=2, column=1, sticky="w", padx=6)
         status = ttk.Label(body, wraplength=470, justify="left", text="")
         status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        explicit_var = tk.BooleanVar(value=cfg["allow_explicit"])
+        content = ttk.Frame(body)
+        content.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(content, text="Allow explicit content (porn)",
+                        variable=explicit_var).pack(anchor="w")
+        ttk.Label(content, style="Muted.TLabel", wraplength=470, justify="left", text=(
+            "Off: videos are kept erotic and suggestive — explicit sex and genitals are "
+            "added to the workflow's negative prompt. On: your model may make explicit "
+            "videos, once the picture model has checked everyone in the picture looks 18 "
+            "or older. Sexual videos of anyone who may be under 18 are never made; "
+            "non-sexual motion is fine for anyone.")).pack(
+            anchor="w", pady=(2, 0))
 
         def _choose_wf() -> None:
             path = filedialog.askopenfilename(parent=dlg, title="ComfyUI workflow (API format)",
@@ -7009,7 +7108,8 @@ class CaptionApp:
                                          parent=dlg)
                     return
             recent_store.set_setting("comfy", {"url": url_var.get().strip()
-                                               or comfy_client.DEFAULT_URL, "workflow": wf})
+                                               or comfy_client.DEFAULT_URL, "workflow": wf,
+                                               "allow_explicit": explicit_var.get()})
             dlg.destroy()
 
         btns = ttk.Frame(body)
@@ -8587,7 +8687,7 @@ class CaptionApp:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Find Online — Barnorama + AcidCow + sex.com")
+        win.title("Find Online — Barnorama + AcidCow (Mature: sex.com, xgroovy, porngifs)")
         if not hasattr(self, "_wl_single_var"):
             self._wl_single_var = tk.BooleanVar(value=True)
         # Load the face detector now (~1s) rather than on the first preview.
@@ -8618,15 +8718,54 @@ class CaptionApp:
         search_btn.pack(side="left")
         ttk.Checkbutton(search_row, text="Single person only", variable=self._wl_single_var,
                         command=self._wl_apply_filter_all).pack(side="left", padx=(10, 0))
+        if not hasattr(self, "_wl_gif_var"):
+            self._wl_gif_var = tk.BooleanVar(
+                value=bool(recent_store.get_setting("wl_gifs_only", False)))
+            self._wl_mature_var = tk.BooleanVar(
+                value=bool(recent_store.get_setting("wl_mature", True)))
+
+        def _filters_changed() -> None:
+            recent_store.set_setting("wl_gifs_only", self._wl_gif_var.get())
+            recent_store.set_setting("wl_mature", self._wl_mature_var.get())
+            _show_notice()
+            if self._wl_query_var.get().strip():
+                self._wl_run_search(1)
+        tooltip(ttk.Checkbutton(search_row, text="GIFs only", variable=self._wl_gif_var,
+                                command=_filters_changed),
+                "Show only animated GIFs").pack(side="left", padx=(10, 0))
+        tooltip(ttk.Checkbutton(search_row, text="Mature", variable=self._wl_mature_var,
+                                command=_filters_changed),
+                "On: also search the explicit (porn) sites — sex.com, xgroovy.com and\n"
+                "porngifs.com — and show explicit posts; their results are marked 🔞 MATURE.\n"
+                "Off: skip them — sexy, not explicit.").pack(side="left", padx=(10, 0))
         self._wl_query_var = query_var
+
+        # AI search ideas from the story (ai_writer.suggest_searches).
+        ideas_row = ttk.Frame(win, padding=(8, 0, 8, 4))
+        ideas_row.pack(side="top", fill="x")
+        ideas_btn = tooltip(ttk.Button(ideas_row, text="✨ Search ideas from the story",
+                                       style="Small.TButton"),
+                            "Your AI writer reads the story and suggests searches for how\n"
+                            "the main character looks by the end.")
+        ideas_btn.pack(side="left")
+        ideas_box = ttk.Frame(ideas_row)
+        ideas_box.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ideas_btn.config(command=lambda: self._wl_suggest(ideas_btn, ideas_box))
 
         status_lbl = ttk.Label(win, text="", foreground="#888", padding=(8, 2), wraplength=820,
                                justify="left")
         status_lbl.pack(side="top", anchor="w")
         self._wl_status_lbl = status_lbl
-        ttk.Label(win, text="🔞 Results come from adult websites and may be explicit.",
-                  style="Muted.TLabel", padding=(8, 0)).pack(side="top", anchor="w",
-                                                             before=status_lbl)
+        notice = ttk.Label(win, style="Muted.TLabel", padding=(8, 0))
+        notice.pack(side="top", anchor="w", before=status_lbl)
+
+        def _show_notice() -> None:
+            notice.config(text=(
+                "🔞 Results come from adult websites and may be explicit."
+                if self._wl_mature_var.get() else
+                "🔞 Mature off: explicit sites and posts are skipped (judged by their titles, "
+                "so a revealing picture can still slip through)."))
+        _show_notice()
 
         nav_row = ttk.Frame(win, padding=8)
         nav_row.pack(side="bottom", fill="x")
@@ -8662,10 +8801,64 @@ class CaptionApp:
         if default_query:
             self._wl_run_search(1)
 
+    def _wl_suggest(self, button: ttk.Button, box: ttk.Frame) -> None:
+        """Ask the AI writer for search ideas from the story; show them as
+        buttons that each run that search."""
+        story = self._get_caption_text().strip()
+        if not story:
+            self._wl_status_lbl.config(text="Write (or paste) the story first — the search "
+                                            "ideas come from it.", foreground="#888")
+            return
+        settings = self._ensure_ai_ready()
+        if not settings or not self._wl_win:
+            return
+        button.config(state="disabled")
+        self._wl_status_lbl.config(text=f"{settings['model']} is reading the story…",
+                                   foreground="#888")
+
+        def _work() -> None:
+            ideas, err = [], None
+            try:
+                ideas = ai_writer.suggest_searches(story, settings)
+            except ai_writer.AIWriterError as e:
+                err = str(e)
+            except Exception as e:
+                log.exception("WL_SUGGEST_ERROR")
+                err = f"Unexpected error: {e}"
+            self.root.after(0, lambda: _done(ideas, err))
+
+        def _done(ideas: list, err: Optional[str]) -> None:
+            if not self._wl_win or not box.winfo_exists():
+                return
+            button.config(state="normal")
+            for w in box.winfo_children():
+                w.destroy()
+            if err or not ideas:
+                self._wl_status_lbl.config(text=err or "The AI didn't suggest anything usable "
+                                                       "— try again.", foreground="#c0392b")
+                return
+            for q in ideas:
+                ttk.Button(box, text=q, style="Small.TButton",
+                           command=lambda s=q: self._wl_search_for(s)).pack(side="left",
+                                                                             padx=(0, 4))
+            self._wl_status_lbl.config(text="Click an idea to search for it.",
+                                       foreground="#888")
+            self._wl_search_for(ideas[0])
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _wl_run_search(self, page: int) -> None:
         query = self._wl_query_var.get().strip()
         if not query:
             return
+        if web_lookup.is_blocked_query(query):
+            self._wl_status_lbl.config(
+                text="This search can't be run: Find Online searches adult websites, so it "
+                     "never searches for minors or anything school-age.", foreground="#c0392b")
+            return
+        self._wl_filters = {"gifs": self._wl_gif_var.get(),
+                            "mature": self._wl_mature_var.get()}
+        filters = self._wl_filters
         recent_store.add("searches", query)
         self._wl_page = page
         for w in self._wl_results_frame.winfo_children():
@@ -8695,7 +8888,8 @@ class CaptionApp:
             posts_seen = 0
             pending = []
             try:
-                for batch in web_lookup.search_stream(query, page):
+                for batch in web_lookup.search_stream(query, page, gifs_only=filters["gifs"],
+                                                      mature=filters["mature"]):
                     if token is not self._wl_search_token:
                         return
                     for post in batch:
@@ -8737,9 +8931,12 @@ class CaptionApp:
         except Exception:
             log.exception("WEB_LOOKUP_GALLERY_ERROR  %s", post["url"])
             return 0
+        if getattr(self, "_wl_filters", {}).get("gifs"):
+            items = [i for i in items if i["gif"]]
         if items and token is self._wl_search_token:
-            self.root.after(0, lambda t=post["title"], it=items, pu=post["url"]:
-                            self._wl_add_post_block(t, it, pu, token))
+            self.root.after(0, lambda t=post["title"], it=items, pu=post["url"],
+                            m=post.get("mature", False):
+                            self._wl_add_post_block(t, it, pu, token, mature=m))
         return len(items)
 
     def _wl_search_alive(self, token: object) -> bool:
@@ -8774,11 +8971,14 @@ class CaptionApp:
         self._wl_next_btn.config(state="normal")
         if image_count:
             self._wl_status_lbl.config(text="Click an image to use it.")
+        elif getattr(self, "_wl_filters", {}).get("gifs"):
+            self._wl_status_lbl.config(text="No GIFs found in the matching posts — try Next, "
+                                            "or turn off GIFs only.")
         else:
             self._wl_status_lbl.config(text="No images found in the matching posts.")
 
     def _wl_add_post_block(self, post_title: str, items: list, post_url: str,
-                            token: object) -> None:
+                            token: object, mature: bool = False) -> None:
         """Render one matching post as a title header followed by a
         horizontal strip of its own image thumbnails. Grouping by post
         makes it obvious which thumbnails come from the same article.
@@ -8789,6 +8989,10 @@ class CaptionApp:
         if not self._wl_search_alive(token):
             return
         header = ttk.Frame(self._wl_results_frame)
+        if mature:
+            # Explicit (porn) sources are labelled as such.
+            tk.Label(header, text="🔞 MATURE", bg="#c0392b", fg="white", padx=4,
+                     font=("TkDefaultFont", 8, "bold")).pack(side="left", padx=(0, 6))
         header_label = ttk.Label(header, text=post_title, foreground="#555",
                                  wraplength=680, justify="left",
                                  font=("TkDefaultFont", 9, "bold"))
@@ -11480,7 +11684,10 @@ def _confirm_adult(root: tk.Tk) -> bool:
         "Caption Creator is made for adult (NSFW) caption art and is intended for a "
         "mature audience.\n\n"
         "• Find Online searches adult websites and can show explicit images.\n"
-        "• The AI writer and assistant can write sexually explicit stories.\n\n"
+        "• The AI writer and assistant can write sexually explicit stories, and AI "
+        "video can be set to allow explicit content.\n"
+        "• Nothing involving minors or childlike characters is ever made — the AI "
+        "features refuse it.\n\n"
         "Please continue only if you are 18 or older (or the age of majority where you "
         "live) and viewing adult content is legal for you."
     )).pack(anchor="w", pady=(10, 16))

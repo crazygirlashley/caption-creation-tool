@@ -1,5 +1,6 @@
-"""Online image/GIF lookup — search Barnorama + AcidCow and pull a source
-file from a result.
+"""Online image/GIF lookup — search Barnorama + AcidCow (and, with Mature
+on, the explicit sites sex.com, xgroovy.com and porngifs.com) and pull a
+source file from a result.
 
 Tuned for what Find Online is used for — photos of one attractive person:
 both sources are searched in parallel (results stream in per source),
@@ -41,6 +42,7 @@ import re
 import tempfile
 import threading
 import urllib.parse
+from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -49,6 +51,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import app_paths
+import content_rules
 
 _BARNORAMA_BASE = "https://www.barnorama.com"
 _ACIDCOW_BASE = "https://acidcow.com"
@@ -413,7 +416,7 @@ _SEXCOM_GROUPS: dict = {}
 _sexcom_lock = threading.Lock()
 
 
-def _search_sexcom(query: str, page: int) -> list:
+def _search_sexcom(query: str, page: int, gifs_only: bool = False) -> list:
     terms = query.lower().split()
     male = set(_SYNONYM_GROUPS[1])
     gender = set().union(*_SYNONYM_GROUPS[:2])
@@ -424,7 +427,8 @@ def _search_sexcom(query: str, page: int) -> list:
         return []
     orientation = "gay" if any(t in male for t in terms) else "straight"
     posts = []
-    for kind, label in (("pictures", "pictures"), ("gifs", "GIFs")):
+    kinds = (("gifs", "GIFs"),) if gifs_only else (("pictures", "pictures"), ("gifs", "GIFs"))
+    for kind, label in kinds:
         resp = _SESSION.get(_SEXCOM_API.format(kind=kind), timeout=_TIMEOUT, params={
             "search": term, "sexual-orientation": orientation, "order": "likeCount",
             "page": page, "limit": _SEXCOM_PAGE_SIZE})
@@ -442,12 +446,169 @@ def _search_sexcom(query: str, page: int) -> list:
         if not items:
             continue
         key = f"sexcom:{kind}:{term}:{orientation}:{page}"
-        with _sexcom_lock:
-            _SEXCOM_GROUPS[key] = items
-            while len(_SEXCOM_GROUPS) > 50:
-                _SEXCOM_GROUPS.pop(next(iter(_SEXCOM_GROUPS)))
+        _store_group(key, items)
         posts.append({"title": f"sex.com {label}: {term} ({len(items)})", "url": key,
-                      "thumb_url": items[0]["thumb"]})
+                      "thumb_url": items[0]["thumb"], "mature": True})
+    return posts
+
+
+def _store_group(key: str, items: list) -> None:
+    """Keep a pseudo-post's items (sources whose results are single images or
+    GIFs, not gallery posts) for fetch_gallery()."""
+    with _sexcom_lock:
+        _SEXCOM_GROUPS[key] = items
+        while len(_SEXCOM_GROUPS) > 80:
+            _SEXCOM_GROUPS.pop(next(iter(_SEXCOM_GROUPS)))
+
+
+# ---------------------------------------------------------------------------
+# Mature sources (searched only with Mature on)
+#
+# xgroovy.com: /gifs/search/<q>/<page>/ lists GIFs — really short MP4s, which
+# the app opens like GIFs — as <div class="gif-wrap" data-full=… (1080p MP4)
+# data-poster=…> with the title in the item's .title-link; /photos/search/
+# <q>/<page>/ lists albums (.list-albums .item a) whose pages show their own
+# pictures at contents/albums/main/420x999/<bucket>/<album id>/<n>.jpg, the
+# full size being the same path under contents/albums/sources/.
+#
+# porngifs.com: no free-text search; it browses ~950 tags. GET
+# /ajax/scrolldown?loadcount=<offset>&tag=<tag> returns 20 [{"src": id}] at a
+# time, each GIF at cdn.porngifs.com/img/<id> (no titles, no thumbnails). A
+# query's words are matched to its tag list (read once from the home page).
+# (wetgifs.com, also asked for, is a parked domain with no content.)
+# ---------------------------------------------------------------------------
+
+_XGROOVY = "https://xgroovy.com"
+_PORNGIFS = "https://porngifs.com"
+_PORNGIFS_CDN = "https://cdn.porngifs.com/img/"
+_PORNGIFS_PER_TAG = 20
+_porngifs_tags: Optional[set] = None
+_porngifs_lock = threading.Lock()
+
+
+def _search_xgroovy_gifs(query: str, page: int) -> list:
+    q = urllib.parse.quote(query.strip().lower())
+    url = f"{_XGROOVY}/gifs/search/{q}/" + (f"{page}/" if page > 1 else "")
+    resp = _SESSION.get(url, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items = []
+    for wrap in soup.select("div.gif-wrap[data-full]"):
+        item_div = wrap.find_parent("div", class_="item") or wrap.parent
+        link = item_div.select_one("a.title-link") if item_div else None
+        title = (link.get("title") or link.get_text(strip=True)) if link else ""
+        if _is_excluded_title(title):
+            continue
+        items.append({"url": wrap["data-full"], "thumb": wrap.get("data-poster") or "",
+                      "gif": True})
+    items = [i for i in items if i["thumb"]]
+    if not items:
+        return []
+    key = f"xgroovy:gifs:{query.lower()}:{page}"
+    _store_group(key, items)
+    return [{"title": f"xgroovy GIFs: {query} ({len(items)})", "url": key,
+             "thumb_url": items[0]["thumb"], "mature": True}]
+
+
+def _search_xgroovy_photos(query: str, page: int) -> list:
+    q = urllib.parse.quote(query.strip().lower())
+    url = f"{_XGROOVY}/photos/search/{q}/" + (f"{page}/" if page > 1 else "")
+    resp = _SESSION.get(url, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    posts = []
+    for item in soup.select(".list-albums .item"):
+        a = item.select_one("a[href*='/photos/']")
+        title_el = item.select_one(".title")
+        if not a:
+            continue
+        title = title_el.get_text(strip=True) if title_el else "(untitled)"
+        if _is_excluded_title(title):
+            continue
+        img = item.select_one("img")
+        posts.append({"title": f"xgroovy: {title}", "url": a["href"],
+                      "thumb_url": img.get("src", "") if img else "", "mature": True})
+    return posts
+
+
+def _fetch_gallery_xgroovy(album_url: str) -> list:
+    m = re.search(r"/photos/(\d+)/", album_url)
+    if not m:
+        return []
+    album_id = m.group(1)
+    resp = _SESSION.get(album_url, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    thumbs = re.findall(r"https://photos\.xgroovy\.com/contents/albums/main/\d+x\d+/\d+/"
+                        + album_id + r"/\d+\.(?:jpg|jpeg|png|webp|gif)", resp.text)
+    items, seen = [], set()
+    for t in thumbs:
+        if t in seen:
+            continue
+        seen.add(t)
+        full = re.sub(r"/albums/main/\d+x\d+/", "/albums/sources/", t)
+        items.append(_gallery_item(full, t))
+    return items
+
+
+def _porngifs_tag_set() -> set:
+    """porngifs.com's tags, read from its home page once per run."""
+    global _porngifs_tags
+    with _porngifs_lock:
+        if _porngifs_tags is None:
+            resp = _SESSION.get(_PORNGIFS + "/", timeout=_TIMEOUT)
+            resp.raise_for_status()
+            _porngifs_tags = {urllib.parse.unquote(t).strip().lower()
+                              for t in re.findall(r'href="/tag/([^"]+)"', resp.text)}
+        return _porngifs_tags
+
+
+def _porngifs_tags_for(query: str) -> list:
+    """The site's tags that match the query: the whole phrase, then each
+    word or a synonym of it (e.g. "redhead" → "ginger")."""
+    tags = _porngifs_tag_set()
+    q = " ".join(query.lower().split())
+    picked = [q] if q in tags else []
+    for word in q.split():
+        group = next((g for g in _SYNONYM_GROUPS if word in g), {word})
+        for cand in [word] + sorted(group - {word}):
+            for form in (cand, cand.rstrip("s"), cand + "s"):
+                if form in tags and form not in picked:
+                    picked.append(form)
+                    break
+            else:
+                continue
+            break
+    # Many of its tags are performers' names; like everywhere else here,
+    # real people aren't searched for.
+    return [t for t in picked if not content_rules.mentions_minor(t)
+            and not _is_celebrity_title(t)][:2]
+
+
+def _search_porngifs(query: str, page: int) -> list:
+    posts = []
+    for tag in _porngifs_tags_for(query):
+        items = []
+        for offset in ((page - 1) * 2 * 20, (page - 1) * 2 * 20 + 20):
+            resp = _SESSION.get(_PORNGIFS + "/ajax/scrolldown", timeout=_TIMEOUT,
+                                params={"loadcount": offset, "tag": tag},
+                                headers={"X-Requested-With": "XMLHttpRequest",
+                                         "Referer": _PORNGIFS + "/"})
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                break
+            for d in data:
+                src = str(d.get("src") or "").strip()
+                if src.isdigit():
+                    url = _PORNGIFS_CDN + src
+                    items.append({"url": url, "thumb": url, "gif": True})
+        items = items[:_PORNGIFS_PER_TAG]
+        if not items:
+            continue
+        key = f"porngifs:{tag}:{page}"
+        _store_group(key, items)
+        posts.append({"title": f"porngifs.com: {tag} ({len(items)})", "url": key,
+                      "thumb_url": items[0]["thumb"], "mature": True})
     return posts
 
 
@@ -505,13 +666,34 @@ def search(query: str, page: int = 1) -> list:
     return _rank_results(results, query)
 
 
-def search_stream(query: str, page: int = 1):
+# Post titles that say the post is explicit; hidden when mature results are
+# off. (sex.com, a porn site, is skipped entirely then.) Title-based only —
+# there's no on-device nudity detector — so it's a filter, not a guarantee.
+_EXPLICIT_TITLE = re.compile(
+    r"\b(?:nsfw|nudes?|naked|nudity|topless|bottomless|porn\w*|xxx|sex|sexual|explicit|"
+    r"pussy|pussies|tits|titties|boobs|nipples?|hentai|onlyfans|uncensored|18\+)\b", re.I)
+
+
+def is_blocked_query(query: str) -> bool:
+    """Find Online searches adult websites, so a search that refers to a
+    minor in any way is never run."""
+    return content_rules.mentions_minor(query) or _is_minor_title(query)
+
+
+def is_explicit_title(title: str) -> bool:
+    return bool(_EXPLICIT_TITLE.search(title))
+
+
+def search_stream(query: str, page: int = 1, gifs_only: bool = False,
+                  mature: bool = True):
     """Like search(), but yields each source's new (deduplicated, ranked)
     results as soon as that source answers — Barnorama replies in under a
     second while AcidCow's search takes ~5s server-side, so callers can show
-    the fast results without waiting on the slow ones."""
+    the fast results without waiting on the slow ones. gifs_only asks
+    sex.com for GIFs only (the gallery sites are filtered per image by the
+    caller); mature=False skips sex.com and drops explicit titles."""
     query = query.strip()
-    if not query:
+    if not query or is_blocked_query(query):
         return
     # Both sites match multi-word searches as a phrase-ish full-text query,
     # so "brunette woman" returned a handful of off-topic posts while
@@ -524,17 +706,24 @@ def search_stream(query: str, page: int = 1):
         gender = set().union(*_SYNONYM_GROUPS[:2])
         distinctive = next((t for t in terms if t.lower() not in gender), terms[0])
         queries.append(distinctive)
-    jobs = [(src, q) for q in queries for src in (_search_barnorama, _search_acidcow)]
-    jobs.append((_search_sexcom, query))  # picks its own single term
+    jobs = [(src, (q, page)) for q in queries for src in (_search_barnorama, _search_acidcow)]
+    if mature:
+        # Mature-only sources (explicit sites).
+        jobs.append((_search_sexcom, (query, page, gifs_only)))  # picks its own single term
+        jobs.append((_search_xgroovy_gifs, (query, page)))
+        jobs.append((_search_porngifs, (query, page)))
+        if not gifs_only:
+            jobs.append((_search_xgroovy_photos, (query, page)))
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = [pool.submit(src, q, page) for src, q in jobs]
+        futures = [pool.submit(src, *args) for src, args in jobs]
         for fut in concurrent.futures.as_completed(futures):
             try:
                 batch = fut.result()
             except (requests.RequestException, ValueError):
                 continue
-            new = [r for r in batch if r["url"] not in seen]
+            new = [r for r in batch if r["url"] not in seen
+                   and (mature or not is_explicit_title(r["title"]))]
             seen.update(r["url"] for r in new)
             if new:
                 yield _rank_results(new, query)
@@ -596,12 +785,14 @@ def fetch_gallery(post_url: str) -> list:
     """Return the images embedded in a post as [{"url", "thumb", "gif"}],
     in page order. Dispatches on post_url's host, since Barnorama and
     AcidCow need different selectors."""
-    if post_url.startswith("sexcom:"):
+    if post_url.startswith(("sexcom:", "xgroovy:", "porngifs:")):
         with _sexcom_lock:
             return list(_SEXCOM_GROUPS.get(post_url, []))
     host = urllib.parse.urlparse(post_url).netloc
     if "acidcow.com" in host:
         return _fetch_gallery_acidcow(post_url)
+    if "xgroovy.com" in host:
+        return _fetch_gallery_xgroovy(post_url)
     return _fetch_gallery_barnorama(post_url)
 
 
@@ -724,8 +915,13 @@ def download_to_tempfile(url: str) -> str:
     """Download url's bytes to a new temp file named with the URL's own
     extension (falls back to .jpg for anything unrecognized), so callers can
     hand the path straight to Image.open()/imageio without guessing format."""
-    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
-    if ext not in _IMG_EXTS:
+    # Some hosts end file URLs with a slash (xgroovy's ".../123_1080p_gif.mp4/");
+    # an extensionless one from porngifs' CDN is a GIF.
+    path = urllib.parse.urlparse(url).path.rstrip("/")
+    ext = os.path.splitext(path)[1].lower()
+    if url.startswith(_PORNGIFS_CDN):
+        ext = ".gif"
+    elif ext not in _IMG_EXTS + (".mp4",):
         ext = ".jpg"
     data = download_bytes(url)
     tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)

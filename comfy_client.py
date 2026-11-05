@@ -29,6 +29,8 @@ from typing import Callable, Optional
 import requests
 from PIL import Image, ImageSequence
 
+import content_rules
+
 DEFAULT_URL = "http://127.0.0.1:8188"
 
 _VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".avi")
@@ -122,14 +124,17 @@ def _sorted_ids(ids) -> list:
 
 
 def fill_workflow(wf: dict, images: list, prompt: str, negative: str = "",
-                  size: Optional[tuple] = None, seed: Optional[int] = None) -> tuple:
+                  size: Optional[tuple] = None, seed: Optional[int] = None,
+                  safety: str = "") -> tuple:
     """A copy of `wf` with the uploaded image name(s), the description and a
     new seed filled in; with `size` (w, h), width/height inputs are set to
-    that shape at the workflow's own pixel count. Returns (workflow, notes)
-    where notes says what was filled (shown to the user)."""
+    that shape at the workflow's own pixel count. `safety` terms are added
+    to the negative prompt (see content_rules.video_negative). Returns
+    (workflow, notes) where notes says what was filled (shown to the user)."""
     wf = json.loads(json.dumps(wf))
     notes = []
-    placeholders = {"%prompt%": prompt, "%negative%": negative,
+    neg_text = ", ".join(t for t in (negative, safety) if t)
+    placeholders = {"%prompt%": prompt, "%negative%": neg_text,
                     "%image%": images[0] if images else "",
                     "%image2%": images[1] if len(images) > 1 else (images[0] if images else "")}
     used = set()
@@ -165,6 +170,17 @@ def fill_workflow(wf: dict, images: list, prompt: str, negative: str = "",
         notes.append(f"description → {wf[node_id]['class_type']} (node {node_id})")
     else:
         notes.append("description → %prompt%")
+    if safety and "%negative%" not in used:
+        node_id = _text_node_for(wf, "negative")
+        if node_id is not None:
+            key = "text" if isinstance(wf[node_id]["inputs"].get("text"), str) else "prompt"
+            old = wf[node_id]["inputs"][key].strip().rstrip(",")
+            wf[node_id]["inputs"][key] = f"{old}, {safety}" if old else safety
+            notes.append("safety terms → negative prompt")
+        else:
+            notes.append("no negative prompt found for the safety terms")
+    elif safety:
+        notes.append("safety terms → %negative%")
     rnd = random.Random(seed)
     for node in wf.values():
         for key in ("seed", "noise_seed"):
@@ -361,8 +377,19 @@ def to_frames(files: list, fps: float) -> tuple:
 
 def generate(base: str, workflow_path: str, pictures: list, prompt: str,
              progress: ProgressFn, cancel: Optional[threading.Event] = None,
-             match_shape: bool = True) -> tuple:
-    """The whole job: returns (frames, durations_ms, notes)."""
+             match_shape: bool = True, allow_explicit: bool = False,
+             minor_subject: Optional[bool] = None) -> tuple:
+    """The whole job: returns (frames, durations_ms, notes).
+    minor_subject is the picture model's age check: True (someone may be
+    under 18), False (adults) or None (not checked). A sexual description is
+    refused for a possible minor; explicit content is only let through for
+    checked adults with `allow_explicit`, and otherwise steered away from in
+    the negative prompt (content_rules)."""
+    why = content_rules.blocked_reason(prompt, minor_context=bool(minor_subject))
+    if why:
+        raise ComfyError(content_rules.message(why))
+    safety = content_rules.video_negative(allow_explicit and minor_subject is False,
+                                          minor_subject=bool(minor_subject))
     wf = load_workflow(workflow_path)
     check(base)
     progress("Sending the picture to ComfyUI…")
@@ -370,7 +397,8 @@ def generate(base: str, workflow_path: str, pictures: list, prompt: str,
     names = [upload_image(base, p, f"caption_creator_{tag}_{i + 1}.png")
              for i, p in enumerate(pictures)]
     filled, notes = fill_workflow(wf, names, prompt,
-                                  size=pictures[0].size if match_shape else None)
+                                  size=pictures[0].size if match_shape else None,
+                                  safety=safety)
     prompt_id = queue(base, filled, uuid.uuid4().hex)
     progress("Queued in ComfyUI…")
     outputs = wait(base, prompt_id, progress, cancel)

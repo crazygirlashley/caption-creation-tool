@@ -18,6 +18,7 @@ from typing import Callable, Iterator, Optional
 
 import requests
 
+import content_rules
 from app_paths import BASE_DIR
 
 SETTINGS_PATH = os.path.join(BASE_DIR, "ai_settings.json")
@@ -56,15 +57,49 @@ SYSTEM_PROMPT = (
     "panel. Turn the user's prompt into a vivid, immersive story told in the "
     "point of view and tense the prompt asks for (default: the main "
     "character's first-person POV). Keep the user's key beats, names and any "
-    "quoted lines, ending on the line or twist the prompt gives. Explicit "
-    "adult content is allowed when the prompt calls for it. All characters "
-    "are adults. Aim for about {words} words. Output only the story text — "
-    "no title, no preamble, no notes or disclaimers, no markdown."
+    "quoted lines, ending on the line or twist the prompt gives. Aim for about "
+    "{words} words. Output only the story text — no title, no preamble, no notes "
+    "or disclaimers, no markdown.\n\n" + content_rules.WRITING_RULES.replace("{", "{{")
+    .replace("}", "}}")
 )
 
 
 class AIWriterError(Exception):
     """A user-presentable failure (unreachable server, bad model, ...)."""
+
+
+class ContentBlocked(AIWriterError):
+    """A request or reply crossed the content rules (see content_rules)."""
+
+
+def check_request(*texts: str, minor_context: bool = False) -> None:
+    """Refuse a request that crosses the content rules before it's sent.
+    minor_context: the picture may show someone under 18."""
+    why = content_rules.blocked_reason("\n".join(t or "" for t in texts), minor_context)
+    if why:
+        raise ContentBlocked(content_rules.message(why))
+
+
+def _guarded(chunks: Iterator[str], minor_context: bool = False) -> Iterator[str]:
+    """Pass a reply through, stopping it if it crosses the content rules (an
+    uncensored model can ignore its instructions). Checks a window that
+    overlaps chunk boundaries, so terms split across chunks are still caught."""
+    tail = ""
+    for chunk in chunks:
+        tail = (tail + chunk)[-400:]
+        why = content_rules.blocked_reason(tail, minor_context)
+        if why:
+            if why.startswith("it's "):
+                why = "the AI's reply is " + why[5:]
+            elif why.startswith("it "):
+                why = "the AI's reply " + why[3:]
+            raise ContentBlocked(content_rules.message(why))
+        yield chunk
+
+
+def picture_may_show_minor(picture: str) -> bool:
+    """A picture description (describe_image) flagged as maybe under 18."""
+    return picture.strip().upper().startswith(content_rules.MINOR_MARK)
 
 
 def load_settings() -> dict:
@@ -118,9 +153,14 @@ def build_messages(prompt: str, words: int, picture: str = "") -> list:
     so the story can match who and what is in it."""
     user = prompt.strip()
     if picture.strip():
+        note = ""
+        if picture_may_show_minor(picture):
+            picture = picture.strip()[len(content_rules.MINOR_MARK):].strip()
+            note = (" The person in the picture may be under 18, so the story must be "
+                    "completely non-sexual.")
         user = (f"The caption's picture shows: {picture.strip()}\n\n"
                 "Write the story to fit that picture — the person in it is the one "
-                f"the story is about, as they look by the end.\n\n{user}")
+                f"the story is about, as they look by the end.{note}\n\n{user}")
     return [
         {"role": "system", "content": SYSTEM_PROMPT.format(words=words)},
         {"role": "user", "content": user},
@@ -137,9 +177,11 @@ DESCRIBE_PROMPT = (
     "Describe this picture for a fiction writer, in 3 to 5 plain sentences. "
     "Cover the person or people (apparent gender presentation, hair, makeup, "
     "body, clothing or lingerie, pose, facial expression), what they seem to be "
-    "doing, and the setting and mood. This is an adult art community and the "
-    "people shown are adults; describe nudity or sexual content matter-of-factly "
-    "if present. Don't guess names or ages, and don't add opinions or warnings."
+    "doing, and the setting and mood. This is an adult art community; describe "
+    "nudity or sexual content matter-of-factly if present. Don't guess names or "
+    "exact ages, and don't add opinions or warnings. But if anyone in the picture "
+    "looks like they could be under 18, start your reply with \"MINOR:\" and describe "
+    "them without any sexual detail."
 )
 
 # Vision models offered for one-click download through Ollama:
@@ -175,14 +217,46 @@ def describe_image(img, settings: dict, cancel: Optional[threading.Event] = None
         {"type": "image_url", "image_url": {"url": image_data_url(img)}},
     ]}]
     try:
-        text = "".join(_stream_chat(messages, 300, dict(settings, model=model), cancel,
-                                    timeout=240, temperature=0.2))
+        text = "".join(_guarded(_stream_chat(messages, 300, dict(settings, model=model),
+                                             cancel, timeout=240, temperature=0.2)))
     except AIWriterError as e:
+        if isinstance(e, ContentBlocked):
+            raise
         if "image" in str(e).lower() or "vision" in str(e).lower() or "400" in str(e):
             raise AIWriterError(f"{model} couldn't read the picture — it may not be a model "
                                 f"that can see images.\n\n{e}") from None
         raise
-    return " ".join(text.split())
+    text = " ".join(text.split())
+    if text.upper().startswith("MINOR"):
+        # Keep the flag in one standard form at the front; stories about
+        # this picture are then kept non-sexual (see stream_story).
+        rest = text[5:].lstrip(" :.-—")
+        text = f"{content_rules.MINOR_MARK} {rest or 'a young person'}"
+    return text
+
+
+AGE_CHECK_PROMPT = (
+    "Look at the people in this picture. Does anyone in it look like a child or a "
+    "teenager, or otherwise possibly under 18? Answer with exactly one word: YES or NO."
+)
+
+
+def looks_underage(img, settings: dict, cancel: Optional[threading.Event] = None) -> bool:
+    """Ask the picture model whether anyone in the picture may be under 18
+    (used before making AI video from it). Raises AIWriterError if there's no
+    picture model or it can't be reached."""
+    model = (settings.get("vision_model") or "").strip()
+    if not model:
+        raise AIWriterError("No picture model is set.")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": AGE_CHECK_PROMPT},
+        {"type": "image_url", "image_url": {"url": image_data_url(img)}},
+    ]}]
+    reply = "".join(_stream_chat(messages, 400, dict(settings, model=model), cancel,
+                                 timeout=240, temperature=0.0)).strip().upper()
+    # Anything but a clear NO counts as a yes: better to refuse an adult's
+    # picture by mistake than to animate a minor's.
+    return not reply.startswith("NO")
 
 
 class _ThinkFilter:
@@ -229,9 +303,9 @@ EDIT_SYSTEM_PROMPT = (
     "(gender transformation) captions: an image paired with a short story "
     "panel. Revise the text the user sends as instructed: {instruction} "
     "Unless the instruction says otherwise, keep the point of view, tense, "
-    "names, any quoted dialogue, emoji and the ending line. Explicit adult "
-    "content is allowed. All characters are adults. Output only the revised "
-    "text — no title, preamble, notes, quotation marks around it, or markdown."
+    "names, any quoted dialogue, emoji and the ending line. Output only the revised "
+    "text — no title, preamble, notes, quotation marks around it, or markdown.\n\n"
+    + content_rules.WRITING_RULES.replace("{", "{{").replace("}", "}}")
 )
 
 # key -> (menu label, instruction; {words} is the target length)
@@ -260,14 +334,15 @@ def edit_instruction(action: str, words: int, custom: str = "") -> str:
 def stream_edit(text: str, instruction: str, words: int, settings: dict,
                 cancel: Optional[threading.Event] = None) -> Iterator[str]:
     """Yield a revised version of text as it streams."""
+    check_request(text, instruction)
     messages = [
         {"role": "system", "content": EDIT_SYSTEM_PROMPT.format(instruction=instruction)},
         {"role": "user", "content": text.strip()},
     ]
     # Grammar fixes should stay faithful, so they run cooler.
     temperature = 0.3 if "Fix only spelling" in instruction else None
-    yield from _stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
-                            settings, cancel, temperature=temperature)
+    yield from _guarded(_stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
+                                     settings, cancel, temperature=temperature))
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +391,7 @@ def plan_animation(description: str, guide: str, has_second: bool, settings: dic
                    cancel: Optional[threading.Event] = None):
     """Ask the writing model for a storyboard; returns the parsed JSON
     (normalize it with animate.normalize_plan before playing it)."""
+    check_request(description)
     pictures = ('"first" and "second" (the second is usually the "after")' if has_second
                 else 'only "first" (transitions go back to the same picture)')
     messages = [
@@ -330,12 +406,63 @@ def plan_animation(description: str, guide: str, has_second: bool, settings: dic
     return parse_plan(text)
 
 
+# ---------------------------------------------------------------------------
+# Search ideas for Find Online, from the story: what the main character looks
+# like (by the end — these are transformation stories), as short queries the
+# adult image sites' search boxes handle well.
+# ---------------------------------------------------------------------------
+
+SEARCH_SYSTEM_PROMPT = (
+    "You help find a photo or GIF on adult image websites to go with a caption story. "
+    "Read the story and suggest {n} different short image searches (1 to 3 words each) "
+    "for the main character as they look at the END of the story: hair color, body "
+    "type, clothing or outfit, setting, pose or mood. Use plain descriptive words those "
+    "sites use (e.g. \"blonde bimbo\", \"redhead lingerie\", \"curvy maid\"), never names. "
+    "The person searched for is always an adult: never use words for minors or school "
+    "ages. Order them best first. Output only a JSON array of strings."
+)
+
+
+def suggest_searches(story: str, settings: dict, n: int = 6,
+                     cancel: Optional[threading.Event] = None) -> list:
+    """Short image-search queries for the story's main character. Queries
+    that refer to minors in any way are dropped (Find Online searches adult
+    sites); returns [] if nothing usable came back."""
+    story = story.strip()
+    if not story:
+        raise AIWriterError("Write (or paste) the story first — the search ideas come "
+                            "from it.")
+    if len(story) > 6000:
+        story = story[:3000] + "\n…\n" + story[-3000:]   # the start and the ending
+    messages = [{"role": "system", "content": SEARCH_SYSTEM_PROMPT.format(n=n)},
+                {"role": "user", "content": story}]
+    text = "".join(_stream_chat(messages, 300, settings, cancel, timeout=180,
+                                temperature=0.5))
+    try:
+        raw = parse_plan(text)
+    except AIWriterError:
+        raise AIWriterError("The AI didn't reply with search ideas. Try again.") from None
+    if isinstance(raw, dict):
+        raw = next((v for v in raw.values() if isinstance(v, list)), [])
+    out = []
+    for q in raw if isinstance(raw, list) else []:
+        q = " ".join(str(q).replace('"', "").split()[:4]).strip().lower()
+        if q and q not in out and not content_rules.mentions_minor(q):
+            out.append(q)
+    return out[:n]
+
+
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
                  timeout: float = 300.0, picture: str = "") -> Iterator[str]:
-    """Yield the story text as it streams from POST /chat/completions."""
-    yield from _stream_chat(build_messages(prompt, words, picture), int(words * 2.5) + 200,
-                            settings, cancel, timeout=timeout)
+    """Yield the story text as it streams from POST /chat/completions. A
+    picture flagged as maybe showing a minor keeps the story non-sexual: a
+    sexual request is refused and a reply that turns sexual is stopped."""
+    minor = picture_may_show_minor(picture)
+    check_request(prompt, picture, minor_context=minor)
+    yield from _guarded(_stream_chat(build_messages(prompt, words, picture),
+                                     int(words * 2.5) + 200, settings, cancel,
+                                     timeout=timeout), minor_context=minor)
 
 
 def _stream_chat(messages: list, max_tokens: int, settings: dict,
