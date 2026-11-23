@@ -219,6 +219,20 @@ def _app_version() -> str:
 
 # Release notes for the "What's new" window: version -> [(section, [(name, text)])].
 _WHATS_NEW = {
+    "1.1.1": [
+        ("Find Online", [
+            ("No text", "a new filter (on by default) hides pictures that already have text "
+             "on them — captions, meme text, promo overlays — so you get clean bases. A small "
+             "corner watermark is allowed"),
+            ("More sources", "Wikimedia Commons, and with Mature on, redgifs and pornpics"),
+            ("Celebrities", "only big-name celebrities are filtered out now — models, "
+             "performers and everyone else come through"),
+        ]),
+        ("AI writing", [
+            ("Stays in the story", "AI-written stories no longer talk about \"the woman in "
+             "the picture\" — they describe her directly"),
+        ]),
+    ],
     "1.1.0": [
         ("Animation", [
             ("Create Animation", "File → Create Animation brings a still picture to life (slow "
