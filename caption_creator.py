@@ -234,9 +234,11 @@ _WHATS_NEW = {
              "shorten it"),
         ]),
         ("Comics & layout", [
-            ("Comic Strip", "File → Comic Strip lays out several pictures as comic panels — "
-             "in a row, a column or a grid — with narration boxes, speech bubbles that point "
-             "at faces, and a title. GIF panels keep playing"),
+            ("Comic Strip", "File → Comic Strip turns several pictures into a comic: a strip, "
+             "a grid or a comic-page layout (big panel + small ones, splash panels, manga "
+             "page…), wide or tall with the Vertical switch. Crop each panel, and switch its "
+             "caption and speech bubble on or off — bubbles point at faces. GIF panels keep "
+             "playing"),
             ("Vertical switch", "one switch under the format turns any format vertical "
              "(caption below the picture) — no more separate (Vertical) formats"),
             ("Themed formats", "Goth, Bimbo, Sissy, Magic and Hypno — each with its own "
@@ -7156,9 +7158,9 @@ class CaptionApp:
     # captions and speech bubbles. Results go in comics/ (gitignored) and
     # open as the current picture, like Create Animation's.
     _COMIC_DIR = os.path.join(BASE_DIR, "comics")
-    _COMIC_OPT_KEYS = ("layout", "columns", "shape", "panel_width", "gutter", "border",
-                       "border_color", "page_bg", "caption_bg", "caption_place", "text_scale",
-                       "font", "faces")
+    _COMIC_OPT_KEYS = ("layout", "vertical", "columns", "shape", "panel_width", "gutter",
+                       "border", "border_color", "page_bg", "caption_bg", "caption_place",
+                       "text_scale", "font", "faces")
 
     def _comic_dialog(self) -> None:
         if getattr(self, "_comic_win", None) is not None and self._comic_win.winfo_exists():
@@ -7168,6 +7170,11 @@ class CaptionApp:
         opts = {k: saved.get(k, comic.DEFAULTS.get(k)) for k in self._COMIC_OPT_KEYS}
         opts["font"] = opts.get("font") or "Arial"
         opts["faces"] = True if opts.get("faces") is None else bool(opts["faces"])
+        if opts["layout"] in ("Row", "Column"):     # before page layouts existed
+            opts["vertical"] = opts["layout"] == "Column"
+            opts["layout"] = "Strip"
+        opts["vertical"] = bool(opts.get("vertical"))
+        opts["caption_place"] = comic._place(opts["caption_place"] or "")
         # Panels survive closing the window for the rest of the session.
         panels = getattr(self, "_comic_panels", None)
         if panels is None:
@@ -7209,6 +7216,8 @@ class CaptionApp:
                         lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta // 120, "units"))
         thumbs: dict = {}
+        sw_bg = (ttk.Style(win).lookup("TFrame", "background")
+                 or themes.classic_colors(self._theme_name)["bg"])
         state = {"gen": 0, "job": None, "play": None, "imgs": [], "durs": [], "i": 0,
                  "busy": False}
 
@@ -7253,34 +7262,67 @@ class CaptionApp:
             row_widgets.clear()
             if not panels:
                 ttk.Label(rows_frame, style="Muted.TLabel", justify="left",
-                          text="Add pictures to make panels — they're shown left to right,\n"
-                               "top to bottom, in this order.").pack(anchor="w", pady=20,
-                                                                      padx=8)
+                          text="Add pictures to make panels (choose several at once) —\n"
+                               "they fill the layout in this order.").pack(anchor="w", pady=20,
+                                                                          padx=8)
             for i, p in enumerate(panels):
                 row = ttk.Frame(rows_frame, padding=(0, 4))
                 row.pack(fill="x")
                 img = _thumb(p["path"])
                 tk.Label(row, image=img, text="" if img else "?", width=64, height=64,
-                         bg="#777777").grid(row=0, column=0, rowspan=3, sticky="n")
+                         bg="#777777").grid(row=0, column=0, rowspan=4, sticky="n")
                 ttk.Label(row, text=f"{i + 1}. {os.path.basename(p['path'])[:34]}",
                           style="Muted.TLabel").grid(row=0, column=1, columnspan=3,
                                                      sticky="w", padx=6)
+                # Caption / Bubble switches and Crop.
+                tools = ttk.Frame(row)
+                tools.grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=(2, 0))
+                cap_on = tk.BooleanVar(value=p.get("caption_on", True))
+                bub_on = tk.BooleanVar(value=p.get("bubble_on", True))
+                tooltip(ToggleSwitch(tools, "Caption", cap_on, bg=sw_bg),
+                        "Show a narration caption on this panel").pack(side="left")
+                tooltip(ToggleSwitch(tools, "Bubble", bub_on, bg=sw_bg),
+                        "Show a speech bubble on this panel").pack(side="left", padx=(12, 0))
+                tooltip(ttk.Button(tools, text="✂ Crop…", style="Small.TButton",
+                                   command=lambda i=i: _crop(i)),
+                        "Choose the part of the picture this panel shows").pack(
+                    side="left", padx=(14, 0))
+                if p.get("crop"):
+                    ttk.Label(tools, text="cropped", style="Muted.TLabel").pack(
+                        side="left", padx=(6, 0))
                 cap = tk.Text(row, width=34, height=2, wrap="word", relief="solid", bd=1,
                               padx=3, pady=2, undo=True)
                 cap.insert("1.0", p.get("caption", ""))
-                cap.grid(row=1, column=1, columnspan=3, sticky="we", padx=6, pady=(2, 2))
                 Placeholder(cap, "Caption (narration box)")
                 says = ttk.Entry(row, width=24)
                 says.insert(0, p.get("bubble", ""))
-                says.grid(row=2, column=1, sticky="we", padx=(6, 2))
                 tooltip(says, "What they say — a speech bubble. Leave empty for none.")
                 place = ttk.Combobox(row, values=list(comic.BUBBLE_PLACES), width=11,
                                      state="readonly")
                 place.set(p.get("bubble_place") or "Auto")
-                place.grid(row=2, column=2, sticky="w")
                 tooltip(place, "Where the speech bubble goes. Auto keeps it off the face.")
+
+                def _show_fields(*_a, p=p, cap=cap, says=says, place=place,
+                                 cap_on=cap_on, bub_on=bub_on) -> None:
+                    p["caption_on"], p["bubble_on"] = cap_on.get(), bub_on.get()
+                    if cap_on.get():
+                        cap.grid(row=2, column=1, columnspan=3, sticky="we", padx=6,
+                                 pady=(2, 2))
+                    else:
+                        cap.grid_remove()
+                    if bub_on.get():
+                        says.grid(row=3, column=1, sticky="we", padx=(6, 2))
+                        place.grid(row=3, column=2, sticky="w")
+                    else:
+                        says.grid_remove()
+                        place.grid_remove()
+                _show_fields()
+                for var in (cap_on, bub_on):
+                    var.trace_add("write", _show_fields)
+                    var.trace_add("write", _schedule)
+                row._vars = (cap_on, bub_on)      # keep them alive with the row
                 btns = ttk.Frame(row)
-                btns.grid(row=0, column=4, rowspan=3, sticky="ne", padx=(4, 0))
+                btns.grid(row=0, column=4, rowspan=4, sticky="ne", padx=(4, 0))
                 for txt, tip, cmd in (("▲", "Move earlier", lambda i=i: _move(i, -1)),
                                       ("▼", "Move later", lambda i=i: _move(i, 1)),
                                       ("✕", "Remove this panel", lambda i=i: _remove(i))):
@@ -7291,6 +7333,11 @@ class CaptionApp:
                 place.bind("<<ComboboxSelected>>", lambda _e: _schedule())
                 row_widgets.append((cap, says, place))
             count.config(text=f"{len(panels)} panel{'s' if len(panels) != 1 else ''}")
+            # Page layouts that fit this many panels.
+            fits = comic.layouts_for(len(panels))
+            layout_box.config(values=fits)
+            if v["layout"].get() not in fits:
+                v["layout"].set("Strip")
 
         def _add_files() -> None:
             paths = filedialog.askopenfilenames(
@@ -7328,7 +7375,8 @@ class CaptionApp:
         look.pack(fill="x", pady=(10, 0))
         v = {
             "layout": tk.StringVar(value=opts["layout"] if opts["layout"] in comic.LAYOUTS
-                                   else "Row"),
+                                   else "Strip"),
+            "vertical": tk.BooleanVar(value=opts["vertical"]),
             "columns": tk.IntVar(value=int(opts["columns"] or 2)),
             "shape": tk.StringVar(value=opts["shape"] if opts["shape"] in comic.SHAPES
                                   else "Portrait 3:4"),
@@ -7353,14 +7401,23 @@ class CaptionApp:
             side="left", padx=(6, 0), fill="x", expand=True)
         r1 = ttk.Frame(look)
         r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="Panels:").pack(side="left")
+        ttk.Label(r1, text="Layout:").pack(side="left")
         layout_box = ttk.Combobox(r1, textvariable=v["layout"], values=list(comic.LAYOUTS),
-                                  width=8, state="readonly")
+                                  width=12, state="readonly")
+        tooltip(layout_box, "Strip and Grid fit any number of panels; the page layouts\n"
+                            "(big panel + small ones, splash panels…) appear when you\n"
+                            "have the right number of pictures.")
         layout_box.pack(side="left", padx=(6, 4))
         cols_lbl = ttk.Label(r1, text="columns:")
         cols_spin = ttk.Spinbox(r1, from_=1, to=6, width=3, textvariable=v["columns"])
-        ttk.Label(r1, text="Shape:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(r1, textvariable=v["shape"], values=list(comic.SHAPES), width=19,
+        vert_sw = ToggleSwitch(r1, "Vertical", v["vertical"], bg=sw_bg)
+        tooltip(vert_sw.label, "Off: a wide page read left to right.\n"
+                               "On: a tall page read top to bottom.")
+        vert_sw.pack(side="left", padx=(12, 0))
+        r1b = ttk.Frame(look)
+        r1b.pack(fill="x", pady=2)
+        ttk.Label(r1b, text="Panel shape:").pack(side="left")
+        ttk.Combobox(r1b, textvariable=v["shape"], values=list(comic.SHAPES), width=19,
                      state="readonly").pack(side="left", padx=(6, 0))
         r2 = ttk.Frame(look)
         r2.pack(fill="x", pady=2)
@@ -7434,6 +7491,7 @@ class CaptionApp:
 
         def _layout_ui(*_a) -> None:
             if v["layout"].get() == "Grid":
+                cols_lbl.config(text="rows:" if v["vertical"].get() else "columns:")
                 cols_lbl.pack(side="left", after=layout_box)
                 cols_spin.pack(side="left", padx=(4, 0), after=cols_lbl)
             else:
@@ -7469,7 +7527,8 @@ class CaptionApp:
             faces_on = ro.pop("faces")
             if preview_w:
                 # Same layout at preview scale: shrink the panels and gaps.
-                cols, _rows = comic.grid_shape(len(snap), ro["layout"], ro["columns"])
+                cols, _rows = comic.grid_shape(len(snap), ro["layout"], ro["columns"],
+                                               ro["vertical"])
                 full_w = cols * (ro["panel_width"] + 2 * ro["border"]) + (cols + 1) * ro["gutter"]
                 k = min(1.0, preview_w / max(1, full_w))
                 ro["panel_width"] = max(60, int(ro["panel_width"] * k))
@@ -7495,6 +7554,31 @@ class CaptionApp:
                         p["face"] = (x0 * iw, y0 * ih, x1 * iw, y1 * ih)
                         p["focus"] = ((x0 + x1) / 2, (y0 + y1) / 2)
             return seqs
+
+        def _crop(i: int) -> None:
+            """Pick the part of panel i's picture to show, in the panel's own
+            shape (as the current layout draws it)."""
+            _pull_text()
+            snap, _faces_on, ro, fonts = _job(_options())
+            try:
+                with Image.open(snap[0]["path"]) as im:
+                    first = im.size
+                geo = comic.layout_geometry(snap, dict(comic.DEFAULTS, **ro), fonts, first)
+                _x, _y, w, h = geo["boxes"][i]
+                b = ro["border"]
+                aspect = max(1, w - 2 * b) / max(1, h - 2 * b)
+            except (OSError, IndexError):
+                aspect = 1.0
+            result = self._comic_crop_dialog(win, panels[i]["path"], aspect,
+                                             panels[i].get("crop"))
+            if result is None:
+                return
+            if result == "reset":
+                panels[i].pop("crop", None)
+            else:
+                panels[i]["crop"] = result
+            _rebuild_rows()
+            _schedule()
 
         def _make_preview() -> None:
             state["job"] = None
@@ -7651,6 +7735,7 @@ class CaptionApp:
             var.trace_add("write", _schedule)
         title_var.trace_add("write", _schedule)
         v["layout"].trace_add("write", _layout_ui)
+        v["vertical"].trace_add("write", _layout_ui)
         holder.bind("<Configure>", lambda _e: _schedule())
         win.protocol("WM_DELETE_WINDOW", _close)
         _layout_ui()
@@ -7659,7 +7744,152 @@ class CaptionApp:
 
     @staticmethod
     def _comic_new_panel(path: str) -> dict:
-        return {"path": path, "caption": "", "bubble": "", "bubble_place": "Auto"}
+        return {"path": path, "caption": "", "bubble": "", "bubble_place": "Auto",
+                "caption_on": True, "bubble_on": True}
+
+    def _comic_crop_dialog(self, parent: tk.Misc, path: str, aspect: float,
+                           crop: Optional[tuple]):
+        """A crop box locked to the panel's shape (aspect = width / height)
+        over the picture: drag it to move, drag a corner to resize, scroll
+        to zoom. Returns (x0, y0, x1, y1) as fractions, "reset" for the
+        whole picture, or None if cancelled."""
+        try:
+            with Image.open(path) as im:
+                im.seek(0)
+                src = im.convert("RGB")
+        except OSError as e:
+            messagebox.showerror("Crop", f"Couldn't open the picture: {e}", parent=parent)
+            return None
+        iw, ih = src.size
+        view = src.copy()
+        view.thumbnail((760, 540), Image.LANCZOS)
+        k = view.width / iw                        # picture px -> screen px
+        photo = ImageTk.PhotoImage(view)
+
+        def _full_box() -> list:
+            """The largest box of this shape, centered (picture pixels)."""
+            w = min(iw, ih * aspect)
+            h = w / aspect
+            return [(iw - w) / 2, (ih - h) / 2, (iw + w) / 2, (ih + h) / 2]
+
+        if crop:
+            x0, y0, x1, y1 = crop
+            cx, cy = (x0 + x1) / 2 * iw, (y0 + y1) / 2 * ih
+            w = max(16.0, (x1 - x0) * iw)
+            h = w / aspect
+            box = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+        else:
+            box = _full_box()
+
+        dlg = tk.Toplevel(parent)
+        dlg.title("Crop panel")
+        dlg.transient(parent)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack()
+        ttk.Label(frm, style="Muted.TLabel",
+                  text="Drag the box to move it, drag a corner to resize, scroll to zoom. "
+                       "The box has the panel's shape.").pack(anchor="w", pady=(0, 6))
+        cv = tk.Canvas(frm, width=view.width, height=view.height, highlightthickness=0,
+                       cursor="fleur")
+        cv.pack()
+        cv.create_image(0, 0, image=photo, anchor="nw")
+        cv._photo = photo
+        result = {"value": None}
+        drag = {"mode": None}
+
+        def _clamp() -> None:
+            w, h = box[2] - box[0], box[3] - box[1]
+            if w > iw or h > ih:
+                s = min(iw / w, ih / h)
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                w, h = w * s, h * s
+                box[:] = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+            dx = -box[0] if box[0] < 0 else (iw - box[2] if box[2] > iw else 0)
+            dy = -box[1] if box[1] < 0 else (ih - box[3] if box[3] > ih else 0)
+            box[:] = [box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy]
+
+        def _draw() -> None:
+            cv.delete("ui")
+            x0, y0, x1, y1 = (v * k for v in box)
+            W, H = view.width, view.height
+            for r in ((0, 0, W, y0), (0, y1, W, H), (0, y0, x0, y1), (x1, y0, W, y1)):
+                cv.create_rectangle(*r, fill="#000000", stipple="gray50", width=0,
+                                    tags="ui")
+            cv.create_rectangle(x0, y0, x1, y1, outline="#ffffff", width=2, tags="ui")
+            for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+                cv.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="#ffffff",
+                                    outline="#000000", tags="ui")
+
+        def _press(e) -> None:
+            x0, y0, x1, y1 = (v * k for v in box)
+            corners = {(0, 0): (x1, y1), (1, 0): (x0, y1), (0, 1): (x1, y0), (1, 1): (x0, y0)}
+            for (cxi, cyi), anchor in corners.items():
+                hx, hy = (x1 if cxi else x0), (y1 if cyi else y0)
+                if abs(e.x - hx) <= 9 and abs(e.y - hy) <= 9:
+                    drag.update(mode="resize", anchor=(anchor[0] / k, anchor[1] / k))
+                    return
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                drag.update(mode="move", last=(e.x, e.y))
+            else:
+                drag["mode"] = None
+
+        def _motion(e) -> None:
+            if drag["mode"] == "move":
+                dx, dy = (e.x - drag["last"][0]) / k, (e.y - drag["last"][1]) / k
+                drag["last"] = (e.x, e.y)
+                box[:] = [box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy]
+            elif drag["mode"] == "resize":
+                ax, ay = drag["anchor"]
+                px, py = e.x / k, e.y / k
+                w = max(abs(px - ax), abs(py - ay) * aspect, 16)
+                # Keep inside the picture on the side being dragged.
+                w = min(w, (iw - ax) if px >= ax else ax, ((ih - ay) if py >= ay else ay) * aspect)
+                h = w / aspect
+                x0 = ax if px >= ax else ax - w
+                y0 = ay if py >= ay else ay - h
+                box[:] = [x0, y0, x0 + w, y0 + h]
+            else:
+                return
+            _clamp()
+            _draw()
+
+        def _wheel(e) -> None:
+            s = 0.9 if e.delta > 0 else 1 / 0.9
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            w = max(16.0, (box[2] - box[0]) * s)
+            h = w / aspect
+            box[:] = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+            _clamp()
+            _draw()
+
+        def _finish(value) -> None:
+            result["value"] = value
+            dlg.destroy()
+
+        cv.bind("<ButtonPress-1>", _press)
+        cv.bind("<B1-Motion>", _motion)
+        cv.bind("<MouseWheel>", _wheel)
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(8, 0))
+        tooltip(ttk.Button(btns, text="Whole picture", command=lambda: _finish("reset")),
+                "No crop: the panel shows as much of the picture as fits").pack(side="left")
+        ttk.Button(btns, text="Cancel", command=lambda: _finish(None)).pack(side="right")
+        ttk.Button(btns, text="Done", style="Accent.TButton",
+                   command=lambda: _finish((box[0] / iw, box[1] / ih,
+                                            box[2] / iw, box[3] / ih))).pack(
+            side="right", padx=(0, 6))
+        dlg.bind("<Escape>", lambda _e: _finish(None))
+        dlg.bind("<Return>", lambda _e: _finish((box[0] / iw, box[1] / ih,
+                                                 box[2] / iw, box[3] / ih)))
+        _clamp()
+        _draw()
+        dlg._crop_api = (_press, _motion, _wheel)   # lets a test drive it
+        self._comic_crop_win = dlg
+        dlg.grab_set()
+        dlg.wait_window()
+        self._comic_crop_win = None
+        return result["value"]
 
     def _comic_face(self, path: str) -> Optional[tuple]:
         """The largest face in a picture's first frame, as fractions

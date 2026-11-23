@@ -17,13 +17,66 @@ def _still(color="#336699", size=(400, 300)):
 
 class ComicLayoutTests(unittest.TestCase):
     def test_grid_shape(self):
-        self.assertEqual(comic.grid_shape(4, "Row"), (4, 1))
-        self.assertEqual(comic.grid_shape(3, "Column"), (1, 3))
+        self.assertEqual(comic.grid_shape(4, "Strip"), (4, 1))
+        self.assertEqual(comic.grid_shape(3, "Strip", vertical=True), (1, 3))
+        self.assertEqual(comic.grid_shape(3, "Row"), (3, 1))          # older setting
         self.assertEqual(comic.grid_shape(5, "Grid", 2), (2, 3))
         self.assertEqual(comic.grid_shape(2, "Grid", 4), (2, 1))
 
+    def test_templates_cover_their_grid(self):
+        for name, (gc, gr, rects, _kx, _ky) in comic.TEMPLATES.items():
+            cells = set()
+            for x, y, w, h in rects:
+                for cx in range(x, x + w):
+                    for cy in range(y, y + h):
+                        self.assertNotIn((cx, cy), cells, name)   # no overlaps
+                        cells.add((cx, cy))
+            self.assertEqual(len(cells), gc * gr, name)            # no holes
+
+    def test_layouts_for_counts(self):
+        self.assertIn("Big + 2", comic.layouts_for(3))
+        self.assertNotIn("Big + 2", comic.layouts_for(4))
+        self.assertIn("Manga page", comic.layouts_for(6))
+        self.assertEqual(comic.layouts_for(1)[:2], ["Strip", "Grid"])
+
+    def test_wrong_count_falls_back_to_strip(self):
+        self.assertEqual(comic.slots(2, "Big + 2")[2], [(0, 0, 1, 1), (1, 0, 1, 1)])
+
+    def test_vertical_flips_layout(self):
+        opts = dict(layout="Big + 2", shape="Square", panel_width=100, gutter=10, border=2)
+        wide = comic.render([{}] * 3, [_still()] * 3, opts)[0][0]
+        tall = comic.render([{}] * 3, [_still()] * 3, dict(opts, vertical=True))[0][0]
+        self.assertGreater(wide.width, wide.height)
+        self.assertGreater(tall.height, tall.width)
+        self.assertEqual(wide.size, tall.size[::-1])
+
+    def test_switches_hide_text(self):
+        img = Image.new("RGB", (300, 300), "#000000")
+        on = comic.render_panel(img, {"caption": "Narration", "bubble": "Hello!"},
+                                (300, 300), dict(comic.DEFAULTS), comic._default_font)
+        off = comic.render_panel(img, {"caption": "Narration", "bubble": "Hello!",
+                                       "caption_on": False, "bubble_on": False},
+                                 (300, 300), dict(comic.DEFAULTS), comic._default_font)
+        self.assertGreater(len(on.getcolors(1 << 16)), 1)
+        self.assertEqual(off.getcolors(1 << 16), [(90000, (0, 0, 0))])
+
+    def test_crop_shows_the_chosen_part(self):
+        img = Image.new("RGB", (400, 200), "black")
+        img.paste("white", (300, 0, 400, 200))
+        cell = comic.render_panel(img, {"crop": (0.75, 0.0, 1.0, 0.5)}, (100, 100),
+                                  dict(comic.DEFAULTS), comic._default_font)
+        self.assertEqual(cell.getcolors(1 << 16), [(10000, (255, 255, 255))])
+
+    def test_caption_band_below_picture(self):
+        img = Image.new("RGB", (300, 300), "#000000")
+        cell = comic.render_panel(img, {"caption": "Below"}, (300, 300),
+                                  dict(comic.DEFAULTS, caption_place="Below the picture"),
+                                  comic._default_font)
+        self.assertEqual(cell.getpixel((150, 295)), (255, 255, 255))   # page color band
+        self.assertEqual(cell.getpixel((150, 10)), (0, 0, 0))
+
     def test_still_strip_size(self):
-        opts = dict(layout="Row", shape="Square", panel_width=100, gutter=10, border=2)
+        opts = dict(layout="Strip", shape="Square", panel_width=100, gutter=10, border=2)
         frames, durs = comic.render([{}, {}], [_still(), _still()], opts)
         self.assertEqual(len(frames), 1)
         self.assertEqual(durs, [0])
@@ -31,17 +84,17 @@ class ComicLayoutTests(unittest.TestCase):
         self.assertEqual(frames[0].size, (2 * 104 + 30, 104 + 20))
 
     def test_title_and_below_captions_add_height(self):
-        base = dict(layout="Row", shape="Square", panel_width=200, gutter=10, border=2)
+        base = dict(layout="Strip", shape="Square", panel_width=200, gutter=10, border=2)
         plain = comic.render([{}], [_still()], base)[0][0]
         titled = comic.render([{"caption": "Below it"}], [_still()],
                               dict(base, title="Title", caption_place="Below the panel"))[0][0]
-        self.assertGreater(titled.height, plain.height)
+        self.assertGreater(titled.height, plain.height)   # the title (band is inside)
         self.assertEqual(titled.width, plain.width)
 
     def test_grid_centers_last_row(self):
         geo = comic.layout_geometry([{}] * 3, dict(comic.DEFAULTS, layout="Grid", columns=2),
                                     comic._default_font, (400, 300))
-        (x0, _), (x1, _), (x2, _) = geo["spots"]
+        (x0, *_), (x1, *_), (x2, *_) = geo["boxes"]
         self.assertGreater(x2, x0)
         self.assertLess(x2, x1)
 

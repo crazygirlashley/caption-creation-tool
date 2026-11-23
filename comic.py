@@ -1,5 +1,6 @@
-"""Comic strip builder: several pictures laid out as comic panels, each with
-an optional narration caption and speech bubble, plus an optional title.
+"""Comic strip builder: several pictures laid out as comic panels (a strip,
+a grid or a comic-page template, wide or tall), each cropped as you like,
+with an optional narration caption and speech bubble, plus a title.
 
 Pure Pillow (no Tk) so it can run off the UI thread and be tested. A GIF or
 animated WebP panel keeps playing: the strip then animates, every panel
@@ -12,8 +13,6 @@ from typing import Callable, Optional
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
 
-# Panel arrangement.
-LAYOUTS = ("Row", "Column", "Grid")
 # Panel shape (width / height); None = the first picture's own shape.
 SHAPES = {
     "Square": 1.0,
@@ -24,11 +23,12 @@ SHAPES = {
     "Like the first picture": None,
 }
 # Where a panel's narration caption goes.
-CAPTION_PLACES = ("Inside, top", "Inside, bottom", "Below the panel")
+CAPTION_PLACES = ("Inside, top", "Inside, bottom", "Below the picture")
 BUBBLE_PLACES = ("Auto", "Top left", "Top right", "Bottom left", "Bottom right")
 
 DEFAULTS = {
-    "layout": "Row",
+    "layout": "Strip",
+    "vertical": False,
     "columns": 2,
     "shape": "Portrait 3:4",
     "panel_width": 480,
@@ -95,15 +95,69 @@ def load_panel_frames(path: str, max_side: int = 1600) -> list:
 # Geometry
 # ---------------------------------------------------------------------------
 
-def grid_shape(n: int, layout: str, columns: int = 2) -> tuple:
-    """(columns, rows) for n panels."""
+# Page templates, drawn wide (reading left to right): (columns, rows,
+# [(x, y, w, h) in grid units], units per normal panel across, down). The
+# Vertical switch flips a layout on its diagonal, so the same template
+# makes a tall page read top to bottom.
+TEMPLATES = {
+    "Big + 2": (3, 2, [(0, 0, 2, 2), (2, 0, 1, 1), (2, 1, 1, 1)], 1, 1),
+    "2 over 1": (2, 2, [(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 2, 1)], 1, 1),
+    "1 over 2": (2, 2, [(0, 0, 2, 1), (0, 1, 1, 1), (1, 1, 1, 1)], 1, 1),
+    "Big + 3": (3, 3, [(0, 0, 2, 3), (2, 0, 1, 1), (2, 1, 1, 1), (2, 2, 1, 1)], 1, 1),
+    "Splash + 3": (3, 2, [(0, 0, 3, 1), (0, 1, 1, 1), (1, 1, 1, 1), (2, 1, 1, 1)], 1, 1),
+    "3 + splash": (3, 2, [(0, 0, 1, 1), (1, 0, 1, 1), (2, 0, 1, 1), (0, 1, 3, 1)], 1, 1),
+    "Big + 4": (4, 2, [(0, 0, 2, 2), (2, 0, 1, 1), (3, 0, 1, 1), (2, 1, 1, 1),
+                       (3, 1, 1, 1)], 1, 1),
+    "2 over 3": (6, 2, [(0, 0, 3, 1), (3, 0, 3, 1), (0, 1, 2, 1), (2, 1, 2, 1),
+                        (4, 1, 2, 1)], 2, 1),
+    "Wide middle": (2, 3, [(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 2, 1), (0, 2, 1, 1),
+                           (1, 2, 1, 1)], 1, 1),
+    "Splash + 4": (4, 2, [(0, 0, 4, 1), (0, 1, 1, 1), (1, 1, 1, 1), (2, 1, 1, 1),
+                          (3, 1, 1, 1)], 1, 1),
+    "Manga page": (2, 4, [(0, 0, 2, 1), (0, 1, 1, 1), (1, 1, 1, 1), (0, 2, 1, 2),
+                          (1, 2, 1, 1), (1, 3, 1, 1)], 1, 1),
+}
+# Always offered, for any number of panels.
+GENERIC_LAYOUTS = ("Strip", "Grid")
+LAYOUTS = GENERIC_LAYOUTS + tuple(TEMPLATES)
+
+
+def layouts_for(n: int) -> list:
+    """The layouts that fit n panels: Strip and Grid, plus every template
+    with exactly n panels."""
+    return list(GENERIC_LAYOUTS) + [k for k, t in TEMPLATES.items() if len(t[2]) == n]
+
+
+def slots(n: int, layout: str, columns: int = 2, vertical: bool = False) -> tuple:
+    """(grid columns, grid rows, [(x, y, w, h)], kx, ky) for n panels. A
+    template with a different panel count falls back to Strip."""
     n = max(1, n)
-    if layout == "Column":
-        return 1, n
+    layout = {"Row": "Strip", "Column": "Strip"}.get(layout, layout)
     if layout == "Grid":
         cols = max(1, min(n, int(columns)))
-        return cols, math.ceil(n / cols)
-    return n, 1
+        rows = math.ceil(n / cols)
+        # Half-panel units, so a short last row can sit centered.
+        rects = []
+        for i in range(n):
+            r, c = divmod(i, cols)
+            in_row = min(cols, n - r * cols)
+            offset = cols - in_row
+            rects.append((offset + 2 * c, r, 2, 1))
+        gc, gr, kx, ky = 2 * cols, rows, 2, 1
+    elif layout in TEMPLATES and len(TEMPLATES[layout][2]) == n:
+        gc, gr, rects, kx, ky = TEMPLATES[layout]
+    else:
+        gc, gr, rects, kx, ky = n, 1, [(i, 0, 1, 1) for i in range(n)], 1, 1
+    if vertical:
+        gc, gr, kx, ky = gr, gc, ky, kx
+        rects = [(y, x, h, w) for x, y, w, h in rects]
+    return gc, gr, list(rects), kx, ky
+
+
+def grid_shape(n: int, layout: str, columns: int = 2, vertical: bool = False) -> tuple:
+    """(panels across, panels down) — roughly, for sizing a preview."""
+    gc, gr, _rects, kx, ky = slots(n, layout, columns, vertical)
+    return max(1, round(gc / kx)), max(1, round(gr / ky))
 
 
 def panel_size(opts: dict, first_size: Optional[tuple]) -> tuple:
@@ -113,6 +167,11 @@ def panel_size(opts: dict, first_size: Optional[tuple]) -> tuple:
         ratio = (first_size[0] / first_size[1]) if first_size and first_size[1] else 1.0
     ratio = max(0.3, min(3.5, ratio))
     return w, max(60, int(round(w / ratio)))
+
+
+def _place(place: str) -> str:
+    """Caption place, accepting the older "Below the panel"."""
+    return "Below the picture" if place == "Below the panel" else place
 
 
 def cover_crop(img: Image.Image, size: tuple, focus: tuple = (0.5, 0.5),
@@ -199,7 +258,7 @@ def _draw_lines(draw: ImageDraw.ImageDraw, lines: list, font, x: float, y: float
 
 
 def caption_block_height(text: str, fonts: FontLoader, width: int, base: int) -> int:
-    """Height of a "Below the panel" caption for this panel width."""
+    """Height of a "Below the picture" caption band for this panel width."""
     if not text.strip():
         return 0
     pad = max(4, base // 2)
@@ -313,20 +372,50 @@ def _text_base(opts: dict, size: tuple) -> int:
     return max(10, int(min(size) / 13 * float(opts.get("text_scale", 1.0))))
 
 
+def crop_view(crop: Optional[tuple], img_size: tuple, size: tuple) -> tuple:
+    """(focus, zoom) for cover_crop that shows the crop box (fractions of
+    the picture) in a panel of this size."""
+    if not crop:
+        return (0.5, 0.5), 1.0
+    x0, y0, x1, y1 = crop
+    iw, ih = img_size
+    cw, ch = max(1.0, (x1 - x0) * iw), max(1.0, (y1 - y0) * ih)
+    tw, th = size
+    base = max(tw / iw, th / ih)
+    want = max(tw / cw, th / ch)
+    return ((x0 + x1) / 2, (y0 + y1) / 2), max(1.0, want / base)
+
+
+def _panel_text(panel: dict, key: str) -> str:
+    """A panel's caption or bubble text, or "" when its switch is off."""
+    if not panel.get(f"{key}_on", True):
+        return ""
+    return panel.get(key, "") or ""
+
+
 def render_panel(img: Image.Image, panel: dict, size: tuple, opts: dict,
                  fonts: FontLoader) -> Image.Image:
-    """One panel picture: cropped to the panel, with its inside caption and
+    """One panel at its slot size (inside the border): the picture cropped
+    to fit, its caption (inside, or in a band below the picture) and its
     speech bubble."""
-    focus = panel.get("focus") or (0.5, 0.5)
-    zoom = float(panel.get("zoom", 1.0) or 1.0)
-    cell = cover_crop(img, size, focus, zoom)
-    base = _text_base(opts, size)
-    place = panel.get("caption_place") or opts["caption_place"]
-    caption = panel.get("caption", "")
+    # One text size for the whole page (render sets it from a normal panel).
+    base = opts.get("_base") or _text_base(opts, size)
+    place = _place(panel.get("caption_place") or opts["caption_place"])
+    caption = _panel_text(panel, "caption")
+    band = 0
+    if caption.strip() and place == "Below the picture":
+        band = min(int(size[1] * 0.5), caption_block_height(caption, fonts, size[0], base))
+    pic_size = (size[0], max(20, size[1] - band))
+    if panel.get("crop"):
+        focus, zoom = crop_view(panel["crop"], img.size, pic_size)
+    else:
+        focus = panel.get("focus") or (0.5, 0.5)
+        zoom = float(panel.get("zoom", 1.0) or 1.0)
+    pic = cover_crop(img, pic_size, focus, zoom)
     avoid_top = avoid_bottom = 0
     if caption.strip() and place.startswith("Inside"):
         where = "top" if place.endswith("top") else "bottom"
-        used = draw_caption_box(cell, caption, fonts, where, opts, base)
+        used = draw_caption_box(pic, caption, fonts, where, opts, base)
         # The bubble sits clear of the caption box.
         if where == "top":
             avoid_top = used
@@ -335,51 +424,56 @@ def render_panel(img: Image.Image, panel: dict, size: tuple, opts: dict,
     face = None
     if panel.get("face") is not None:
         fx0, fy0, fx1, fy1 = panel["face"]
-        ax, ay = _map_point((fx0, fy0), img.size, size, focus, zoom)
-        bx, by = _map_point((fx1, fy1), img.size, size, focus, zoom)
+        ax, ay = _map_point((fx0, fy0), img.size, pic_size, focus, zoom)
+        bx, by = _map_point((fx1, fy1), img.size, pic_size, focus, zoom)
         chin = ((ax + bx) / 2, by)
-        if 0 <= chin[0] <= size[0] and 0 <= chin[1] <= size[1]:
+        if 0 <= chin[0] <= pic_size[0] and 0 <= chin[1] <= pic_size[1]:
             face = (ax, ay, bx, by)
-    draw_bubble(cell, panel.get("bubble", ""), fonts, panel.get("bubble_place", "Auto"),
+    draw_bubble(pic, _panel_text(panel, "bubble"), fonts, panel.get("bubble_place", "Auto"),
                 face, opts, base, avoid_top, avoid_bottom)
+    if not band:
+        return pic
+    cell = Image.new("RGB", size, opts["page_bg"])
+    cell.paste(pic, (0, 0))
+    draw = ImageDraw.Draw(cell)
+    border = max(1, int(opts["border"]))
+    draw.rectangle((0, pic_size[1], size[0], pic_size[1] + border - 1),
+                   fill=opts["border_color"])
+    pad = max(4, base // 2)
+    font, lines = _fit_text(caption, fonts, size[0] - 2 * pad, band - 2 * pad, base)
+    text_h = len(lines) * _line_h(font)
+    _draw_lines(draw, lines, font, pad, pic_size[1] + (band - text_h) / 2, size[0] - 2 * pad,
+                opts.get("below_fg", opts["title_color"]))
     return cell
 
 
 def layout_geometry(panels: list, opts: dict, fonts: FontLoader,
                     first_size: Optional[tuple]) -> dict:
-    """Sizes and positions: {"size", "cell", "below", "title", "title_h",
-    "spots": [(x, y)]}."""
-    cols, rows = grid_shape(len(panels), opts["layout"], opts["columns"])
+    """Page size and each panel's box: {"size", "boxes": [(x, y, w, h)]
+    (outer, border included), "title_font", "title_lines", "base"}."""
+    gc, gr, rects, kx, ky = slots(len(panels), opts["layout"], opts["columns"],
+                                  opts.get("vertical", False))
     cw, ch = panel_size(opts, first_size)
     g, b = int(opts["gutter"]), int(opts["border"])
     base = _text_base(opts, (cw, ch))
-    below = 0
-    if opts["caption_place"] == "Below the panel" or any(
-            p.get("caption_place") == "Below the panel" for p in panels):
-        below = max((caption_block_height(p.get("caption", ""), fonts, cw, base)
-                     for p in panels
-                     if (p.get("caption_place") or opts["caption_place"]) == "Below the panel"),
-                    default=0)
+    # One grid unit's pitch: a normal panel is kx units wide, ky tall.
+    unit_w = (cw + 2 * b + g) / kx
+    unit_h = (ch + 2 * b + g) / ky
+    page_w = int(round(gc * unit_w + g))
     title = opts.get("title", "").strip()
-    page_w = cols * (cw + 2 * b) + (cols + 1) * g
     title_font, title_lines, title_h = None, [], 0
     if title:
         title_font, title_lines = _fit_text(title, fonts, page_w - 2 * g, ch * 0.5,
                                             int(base * 1.8), bold=True)
         title_h = len(title_lines) * _line_h(title_font) + g
-    cell_h = ch + 2 * b + below
-    page_h = title_h + rows * cell_h + (rows + 1) * g
-    spots = []
-    for i in range(len(panels)):
-        r, c = divmod(i, cols)
-        spots.append((g + c * (cw + 2 * b + g), title_h + g + r * (cell_h + g)))
-    # Center a short last row of a grid.
-    last = len(panels) % cols
-    if opts["layout"] == "Grid" and last and rows > 1:
-        shift = (cols - last) * (cw + 2 * b + g) // 2
-        spots[-last:] = [(x + shift, y) for x, y in spots[-last:]]
-    return dict(size=(page_w, page_h), cell=(cw, ch), below=below, base=base,
-                title_font=title_font, title_lines=title_lines, title_h=title_h, spots=spots)
+    page_h = int(round(title_h + gr * unit_h + g))
+    boxes = []
+    for x, y, w, h in rects:
+        bx = int(round(g + x * unit_w))
+        by = int(round(title_h + g + y * unit_h))
+        boxes.append((bx, by, int(round(w * unit_w - g)), int(round(h * unit_h - g))))
+    return dict(size=(page_w, page_h), boxes=boxes, base=base, title_font=title_font,
+                title_lines=title_lines, title_h=title_h)
 
 
 def _timeline(sequences: list) -> tuple:
@@ -411,11 +505,12 @@ def _index_at(seq: list, t: float) -> int:
 def render(panels: list, sequences: list, opts: Optional[dict] = None,
            fonts: Optional[FontLoader] = None,
            progress: Optional[Callable[[str], None]] = None) -> tuple:
-    """The strip: (frames, durations in ms). One frame (duration 0) when
+    """The comic: (frames, durations in ms). One frame (duration 0) when
     every panel is a still.
 
-    panels: [{"caption", "caption_place", "bubble", "bubble_place",
-    "focus": (fx, fy), "zoom", "face": (x0, y0, x1, y1) in source pixels}]
+    panels: [{"caption", "caption_on", "caption_place", "bubble", "bubble_on",
+    "bubble_place", "crop": (x0, y0, x1, y1) fractions, "focus": (fx, fy),
+    "zoom", "face": (x0, y0, x1, y1) in source pixels}]
     sequences: for each panel, load_panel_frames()'s [(image, delay)].
     """
     if not panels or len(panels) != len(sequences):
@@ -424,7 +519,7 @@ def render(panels: list, sequences: list, opts: Optional[dict] = None,
     fonts = fonts or _default_font
     first_size = sequences[0][0][0].size
     geo = layout_geometry(panels, opts, fonts, first_size)
-    cw, ch = geo["cell"]
+    opts["_base"] = geo["base"]
     b = int(opts["border"])
 
     page = Image.new("RGB", geo["size"], opts["page_bg"])
@@ -433,26 +528,17 @@ def render(panels: list, sequences: list, opts: Optional[dict] = None,
         _draw_lines(draw, geo["title_lines"], geo["title_font"], opts["gutter"],
                     opts["gutter"] * 0.6, geo["size"][0] - 2 * opts["gutter"],
                     opts["title_color"])
-    for i, (panel, (x, y)) in enumerate(zip(panels, geo["spots"])):
+    for x, y, w, h in geo["boxes"]:
         if b:
-            draw.rectangle((x, y, x + cw + 2 * b - 1, y + ch + 2 * b - 1),
-                           fill=opts["border_color"])
-        place = panel.get("caption_place") or opts["caption_place"]
-        if geo["below"] and place == "Below the panel" and panel.get("caption", "").strip():
-            pad = max(4, geo["base"] // 2)
-            font, lines = _fit_text(panel["caption"], fonts, cw - 2 * pad, 10_000, geo["base"])
-            _draw_lines(draw, lines, font, x + b + pad, y + ch + 2 * b + pad, cw - 2 * pad,
-                        opts.get("below_fg", opts["title_color"]))
+            draw.rectangle((x, y, x + w - 1, y + h - 1), fill=opts["border_color"])
 
     # Each panel's frames, rendered once.
     cells = []
-    for i, (panel, seq) in enumerate(zip(panels, sequences)):
+    for i, (panel, seq, (_x, _y, w, h)) in enumerate(zip(panels, sequences, geo["boxes"])):
         if progress:
             progress(f"Drawing panel {i + 1} of {len(panels)}…")
-        p = dict(panel)
-        if (p.get("caption_place") or opts["caption_place"]) == "Below the panel":
-            p["caption"] = ""
-        cells.append([render_panel(img, p, (cw, ch), opts, fonts) for img, _ in seq])
+        inner = (max(20, w - 2 * b), max(20, h - 2 * b))
+        cells.append([render_panel(img, panel, inner, opts, fonts) for img, _ in seq])
 
     times, step = _timeline(sequences)
     frames, durs, last_key = [], [], None
@@ -462,7 +548,7 @@ def render(panels: list, sequences: list, opts: Optional[dict] = None,
             durs[-1] += step
             continue
         frame = page.copy()
-        for (x, y), cell_frames, k in zip(geo["spots"], cells, key):
+        for (x, y, _w, _h), cell_frames, k in zip(geo["boxes"], cells, key):
             frame.paste(cell_frames[k], (x + b, y + b))
         frames.append(frame)
         durs.append(step)
