@@ -235,6 +235,56 @@ def describe_image(img, settings: dict, cancel: Optional[threading.Event] = None
     return text
 
 
+APPEARANCE_PROMPT = (
+    "List how the main person in this picture looks, for a writer who has to match it "
+    "exactly. Use these lines, each short and specific, with colors:\n"
+    "Hair: (color, length, style)\n"
+    "Eyes:\n"
+    "Skin:\n"
+    "Body: (build, figure)\n"
+    "Face & makeup:\n"
+    "Clothing: (each garment with its color, fit and material, top to bottom — say "
+    "plainly if they're nude or in lingerie)\n"
+    "Shoes & accessories:\n"
+    "Pose & setting:\n"
+    "Write \"not visible\" for anything you can't see. This is an adult art community; "
+    "don't guess names or exact ages, and don't add opinions or warnings. But if anyone "
+    "in the picture looks like they could be under 18, start your reply with \"MINOR:\" "
+    "and leave out any sexual detail."
+)
+
+
+def describe_appearance(img, settings: dict, cancel: Optional[threading.Event] = None) -> str:
+    """The main person's appearance, one attribute per line (hair, eyes,
+    clothing with colors...), from settings["vision_model"] — what "Match
+    the picture" corrects a story against. A possible minor is flagged the
+    same way as describe_image's."""
+    model = (settings.get("vision_model") or "").strip()
+    if not model:
+        raise AIWriterError("No picture model is set — choose one under "
+                            "⚙ Settings → AI Writer → Picture model.")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": APPEARANCE_PROMPT},
+        {"type": "image_url", "image_url": {"url": image_data_url(img)}},
+    ]}]
+    try:
+        text = "".join(_guarded(_stream_chat(messages, 400, dict(settings, model=model),
+                                             cancel, timeout=240, temperature=0.1)))
+    except AIWriterError as e:
+        if isinstance(e, ContentBlocked):
+            raise
+        if "image" in str(e).lower() or "vision" in str(e).lower() or "400" in str(e):
+            raise AIWriterError(f"{model} couldn't read the picture — it may not be a model "
+                                f"that can see images.\n\n{e}") from None
+        raise
+    lines = [" ".join(line.split()) for line in text.strip().splitlines()]
+    text = "\n".join(line for line in lines if line)
+    if text.upper().startswith("MINOR"):
+        rest = text[5:].lstrip(" :.-—")
+        text = f"{content_rules.MINOR_MARK} {rest or 'a young person'}"
+    return text
+
+
 AGE_CHECK_PROMPT = (
     "Look at the people in this picture. Does anyone in it look like a child or a "
     "teenager, or otherwise possibly under 18? Answer with exactly one word: YES or NO."
@@ -322,27 +372,51 @@ EDIT_ACTIONS = {
     "grammar": ("Fix spelling & grammar",
                 "Fix only spelling, grammar and punctuation. Change as little as "
                 "possible and keep the wording, style and length."),
+    # {picture} is describe_appearance()'s list for the caption's picture.
+    "match": ("Match the picture (clothes, hair…)",
+              "The story's character must end up looking exactly like the person in the "
+              "caption's picture, who looks like this:\n{picture}\n"
+              "Find every description of the character's appearance as they are at the end "
+              "of the story — after any transformation — and correct each detail that "
+              "contradicts the picture: clothing and its colors, hair color and style, eye "
+              "color, skin, body, makeup, shoes and accessories. Replace the wrong detail "
+              "with what the picture shows, in the story's own voice, and where the ending "
+              "barely describes them, work in one or two details from the picture. Leave "
+              "descriptions of how they looked before the change as they are, and ignore "
+              "anything marked \"not visible\". Change nothing else: keep the plot, wording, "
+              "names, dialogue, the length (about {words} words) and the final line."),
 }
 
+# Faithful edits run cooler, so the model changes only what it was asked to.
+_COOL_EDITS = ("Fix only spelling", "must end up looking exactly like")
 
-def edit_instruction(action: str, words: int, custom: str = "") -> str:
+
+def edit_instruction(action: str, words: int, custom: str = "", picture: str = "") -> str:
     if action == "custom":
         return custom.strip().rstrip(".") + "."
+    if action == "match":
+        picture = picture.strip()
+        if picture_may_show_minor(picture):
+            picture = picture[len(content_rules.MINOR_MARK):].strip()
+        return EDIT_ACTIONS[action][1].format(words=words, picture=picture)
     return EDIT_ACTIONS[action][1].format(words=words)
 
 
 def stream_edit(text: str, instruction: str, words: int, settings: dict,
-                cancel: Optional[threading.Event] = None) -> Iterator[str]:
-    """Yield a revised version of text as it streams."""
-    check_request(text, instruction)
+                cancel: Optional[threading.Event] = None,
+                minor_context: bool = False) -> Iterator[str]:
+    """Yield a revised version of text as it streams. minor_context: the
+    picture the edit is matched to may show someone under 18, so nothing
+    sexual is allowed in or out."""
+    check_request(text, instruction, minor_context=minor_context)
     messages = [
         {"role": "system", "content": EDIT_SYSTEM_PROMPT.format(instruction=instruction)},
         {"role": "user", "content": text.strip()},
     ]
-    # Grammar fixes should stay faithful, so they run cooler.
-    temperature = 0.3 if "Fix only spelling" in instruction else None
+    temperature = 0.3 if any(k in instruction for k in _COOL_EDITS) else None
     yield from _guarded(_stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
-                                     settings, cancel, temperature=temperature))
+                                     settings, cancel, temperature=temperature),
+                        minor_context)
 
 
 # ---------------------------------------------------------------------------

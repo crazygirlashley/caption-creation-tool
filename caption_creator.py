@@ -263,6 +263,10 @@ _WHATS_NEW = {
         ("AI & themes", [
             ("AI looks at your picture", "a picture model describes it so the story fits who "
              "and what's in it (Settings → AI Writer → Picture model)"),
+            ("Match the picture", "AI Edit → Match the picture: the picture model looks at "
+             "what she's wearing and how she looks, and the AI corrects the story's final "
+             "description to match — a miniskirt and red blouse become the skin-tight jeans "
+             "and pink crop top in the photo, red hair becomes blonde"),
             ("Theme Editor", "Settings → Theme → Theme Editor: make your own theme from three "
              "colors, with your own background picture and font"),
         ]),
@@ -6024,6 +6028,11 @@ class CaptionApp:
                 label = f"{label} (~{targets['shorten']} words)"
             elif key == "expand":
                 label = f"{label} (~{targets['expand']} words)"
+            if key == "match":
+                menu.add_separator()
+                menu.add_command(label=label, command=lambda: self._run_ai_edit("match"),
+                                 state="normal" if self._frames else "disabled")
+                continue
             menu.add_command(label=label, command=lambda k=key: self._run_ai_edit(k))
         menu.add_command(label="Custom instruction…", command=lambda: self._run_ai_edit("custom"))
         menu.add_separator()
@@ -6042,18 +6051,39 @@ class CaptionApp:
         start, end, text = self._ai_edit_target()
         if not text.strip():
             return
+        if action == "match" and not self._frames:
+            messagebox.showinfo("Match the picture", "Open the caption's picture first.")
+            return
         words = self._ai_edit_targets().get(action, len(text.split()))
         settings = self._ensure_ai_ready()
         if not settings:
             return
-        instruction = ai_writer.edit_instruction(action, words, custom)
+        picture_img = picture_key = None
+        appearance = ""
+        if action == "match":
+            # The picture model lists how the person looks; the writer then
+            # corrects the story's final description to match.
+            if not settings.get("vision_model"):
+                tag = self._ai_vision_setup_dialog()
+                if not tag:
+                    return
+                settings["vision_model"] = tag
+            picture_img, picture_key = self._ai_picture(), self._ai_picture_key()
+            cached = getattr(self, "_ai_appearance", None)
+            if cached and cached[0] == picture_key:
+                appearance = cached[1]
+        instruction = (None if action == "match"
+                       else ai_writer.edit_instruction(action, words, custom))
         box = self._text_target()
         # One undo step for the whole edit; streamed text goes in at a mark.
+        # The old text stays until the first of the new arrives (Match the
+        # picture looks at the picture first).
         box.edit_separator()
         box.config(autoseparators=False)
-        box.delete(start, end)
-        box.mark_set("ai_edit", start)
-        box.mark_gravity("ai_edit", "right")
+        box.mark_set("ai_old_start", start)
+        box.mark_gravity("ai_old_start", "left")
+        box.mark_set("ai_old_end", end)
+        box.mark_gravity("ai_old_end", "right")
         cancel = threading.Event()
         self._ai_edit_cancel = cancel
         self._ai_edit_btn.config(text="■ AI editing…")
@@ -6063,14 +6093,36 @@ class CaptionApp:
         state = {"wrote": False}
 
         def _append(chunk: str) -> None:
+            if not state["wrote"]:
+                box.delete("ai_old_start", "ai_old_end")
+                box.mark_set("ai_edit", "ai_old_start")
+                box.mark_gravity("ai_edit", "right")
+                state["wrote"] = True
             box.insert("ai_edit", chunk)
-            state["wrote"] = True
+
+        def _looked(desc: str) -> None:
+            self._ai_appearance = (picture_key, desc)
+            if self._ai_edit_cancel is cancel:
+                self._status.config(text=f"AI: {label}…")
 
         def _work() -> None:
             err = None
             try:
-                for chunk in ai_writer.stream_edit(text, instruction, words, settings, cancel):
-                    self.root.after(0, lambda c=chunk: _append(c))
+                instr, minor = instruction, False
+                if action == "match":
+                    desc = appearance
+                    if not desc:
+                        self.root.after(0, lambda: self._status.config(
+                            text=f"{settings['vision_model']} is looking at the picture… "
+                                 "(the first run can take a while)"))
+                        desc = ai_writer.describe_appearance(picture_img, settings, cancel)
+                        self.root.after(0, lambda d=desc: _looked(d))
+                    minor = ai_writer.picture_may_show_minor(desc)
+                    instr = ai_writer.edit_instruction("match", words, picture=desc)
+                if not cancel.is_set():
+                    for chunk in ai_writer.stream_edit(text, instr, words, settings, cancel,
+                                                       minor_context=minor):
+                        self.root.after(0, lambda c=chunk: _append(c))
             except ai_writer.AIWriterError as e:
                 err = str(e)
             except Exception as e:
@@ -6084,11 +6136,13 @@ class CaptionApp:
             self._ai_edit_cancel = None
             self._ai_edit_btn.config(text="✨ AI Edit")
             self._update_editor_ai_buttons()
-            if err or cancel.is_set() or not state["wrote"]:
+            if state["wrote"] and (err or cancel.is_set()):
                 # Put the original back — a half-rewritten caption isn't useful.
-                box.delete(start, "ai_edit")
-                box.insert(start, text)
-            box.mark_unset("ai_edit")
+                box.delete("ai_old_start", "ai_edit")
+                box.insert("ai_old_start", text)
+            for mark in ("ai_edit", "ai_old_start", "ai_old_end"):
+                if mark in box.mark_names():
+                    box.mark_unset(mark)
             box.edit_separator()
             box.config(autoseparators=True)
             self._status.config(text="AI edit stopped." if cancel.is_set() and not err
@@ -8464,11 +8518,13 @@ class CaptionApp:
                 "Describe the story and your local AI model writes it here"
                 ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self._editor_ai_buttons = []
-        icons = {"smooth": "✨", "shorten": "✂", "expand": "➕", "grammar": "✔"}
+        icons = {"smooth": "✨", "shorten": "✂", "expand": "➕", "grammar": "✔", "match": "🖼"}
         tips = {"smooth": "Improve flow and word choice, same length",
                 "shorten": "Cut it down to what fits beside the image at a readable size",
                 "expand": "Add sensory, physical and emotional detail",
                 "grammar": "Fix spelling, grammar and punctuation only",
+                "match": "Make the ending's description match the picture — clothes and\n"
+                         "their colors, hair, eyes, body, makeup (needs a picture model)",
                 "custom": "Tell the AI how to change it, e.g. \"more teasing\""}
         actions = [(key, f"{icons.get(key, '')}  {label}")
                    for key, (label, _i) in ai_writer.EDIT_ACTIONS.items()]
