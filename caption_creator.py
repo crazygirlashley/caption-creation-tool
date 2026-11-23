@@ -263,6 +263,8 @@ _WHATS_NEW = {
         ("AI & themes", [
             ("AI looks at your picture", "a picture model describes it so the story fits who "
              "and what's in it (Settings → AI Writer → Picture model)"),
+            ("Make it more erotic", "AI Edit → Make it more erotic turns up the heat: more "
+             "desire, tension and sensual detail, same story and ending"),
             ("Match the picture", "AI Edit → Match the picture: the picture model looks at "
              "what she's wearing and how she looks, and the AI corrects the story's final "
              "description to match — a miniskirt and red blouse become the skin-tight jeans "
@@ -6009,7 +6011,8 @@ class CaptionApp:
             overflow = len(full.split()) - fit
             shorten = max(10, int((n - overflow) * 0.9)) if overflow > 0 else max(10, int(n * 0.8))
         return {"smooth": max(1, n), "shorten": shorten,
-                "expand": max(n + 40, int(n * 1.5)), "grammar": max(1, n)}
+                "expand": max(n + 40, int(n * 1.5)), "grammar": max(1, n),
+                "spicy": max(n + 10, int(n * 1.2))}
 
     def _fill_ai_edit_menu(self) -> None:
         menu = self._ai_edit_menu
@@ -6074,6 +6077,13 @@ class CaptionApp:
                 appearance = cached[1]
         instruction = (None if action == "match"
                        else ai_writer.edit_instruction(action, words, custom))
+        # If the picture model has flagged this picture as maybe showing
+        # someone under 18, nothing sexual is written about it.
+        key_now = self._ai_picture_key()
+        picture_minor = any(
+            c and c[0] == key_now and ai_writer.picture_may_show_minor(c[1])
+            for c in (getattr(self, "_ai_pic_desc", None),
+                      getattr(self, "_ai_appearance", None)))
         box = self._text_target()
         # One undo step for the whole edit; streamed text goes in at a mark.
         # The old text stays until the first of the new arrives (Match the
@@ -6108,7 +6118,7 @@ class CaptionApp:
         def _work() -> None:
             err = None
             try:
-                instr, minor = instruction, False
+                instr, minor = instruction, picture_minor
                 if action == "match":
                     desc = appearance
                     if not desc:
@@ -6117,7 +6127,7 @@ class CaptionApp:
                                  "(the first run can take a while)"))
                         desc = ai_writer.describe_appearance(picture_img, settings, cancel)
                         self.root.after(0, lambda d=desc: _looked(d))
-                    minor = ai_writer.picture_may_show_minor(desc)
+                    minor = picture_minor or ai_writer.picture_may_show_minor(desc)
                     instr = ai_writer.edit_instruction("match", words, picture=desc)
                 if not cancel.is_set():
                     for chunk in ai_writer.stream_edit(text, instr, words, settings, cancel,
@@ -8518,11 +8528,14 @@ class CaptionApp:
                 "Describe the story and your local AI model writes it here"
                 ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self._editor_ai_buttons = []
-        icons = {"smooth": "✨", "shorten": "✂", "expand": "➕", "grammar": "✔", "match": "🖼"}
+        icons = {"smooth": "✨", "shorten": "✂", "expand": "➕", "grammar": "✔", "spicy": "🔥",
+                 "match": "🖼"}
         tips = {"smooth": "Improve flow and word choice, same length",
                 "shorten": "Cut it down to what fits beside the image at a readable size",
                 "expand": "Add sensory, physical and emotional detail",
                 "grammar": "Fix spelling, grammar and punctuation only",
+                "spicy": "Turn up the heat: more desire, tension and sensual detail,\n"
+                         "steamier language — same story, same ending",
                 "match": "Make the ending's description match the picture — clothes and\n"
                          "their colors, hair, eyes, body, makeup (needs a picture model)",
                 "custom": "Tell the AI how to change it, e.g. \"more teasing\""}

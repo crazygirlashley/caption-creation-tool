@@ -113,5 +113,56 @@ class MatchPictureTests(unittest.TestCase):
         self.assertEqual(out, "She walked to school in jeans.")
 
 
+class MoreEroticTests(unittest.TestCase):
+    """AI Edit → Make it more erotic."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.settings = dict(ai_writer.DEFAULTS, model="writer",
+                            base_url=f"http://127.0.0.1:{cls.server.server_address[1]}/v1")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        _Handler.replies, _Handler.seen = [], []
+
+    def test_offered_and_worded(self):
+        self.assertIn("spicy", ai_writer.EDIT_ACTIONS)
+        instr = ai_writer.edit_instruction("spicy", 120)
+        self.assertIn("about 120 words", instr)
+        self.assertIn("final line", instr)
+
+    def test_adult_story_is_rewritten(self):
+        _Handler.replies = ["Hotter version."]
+        out = "".join(ai_writer.stream_edit(STORY, ai_writer.edit_instruction("spicy", 40),
+                                            40, self.settings))
+        self.assertEqual(out, "Hotter version.")
+        self.assertIn("erotic", _Handler.seen[0]["messages"][0]["content"])
+
+    def test_story_about_a_minor_is_refused(self):
+        story = "Jenny, a 15-year-old, walked home from school in her uniform."
+        with self.assertRaises(ai_writer.ContentBlocked):
+            list(ai_writer.stream_edit(story, ai_writer.edit_instruction("spicy", 40), 40,
+                                       self.settings))
+        self.assertEqual(_Handler.seen, [])
+
+    def test_flagged_picture_is_refused(self):
+        with self.assertRaises(ai_writer.ContentBlocked):
+            list(ai_writer.stream_edit(STORY, ai_writer.edit_instruction("spicy", 40), 40,
+                                       self.settings, minor_context=True))
+        self.assertEqual(_Handler.seen, [])
+
+    def test_other_edits_of_young_characters_still_work(self):
+        _Handler.replies = ["Jenny, 15, walked home from school."]
+        out = "".join(ai_writer.stream_edit(
+            "Jenny, 15, walked home from school.", ai_writer.edit_instruction("grammar", 8),
+            8, self.settings))
+        self.assertEqual(out, "Jenny, 15, walked home from school.")
+
+
 if __name__ == "__main__":
     unittest.main()

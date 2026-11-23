@@ -372,6 +372,12 @@ EDIT_ACTIONS = {
     "grammar": ("Fix spelling & grammar",
                 "Fix only spelling, grammar and punctuation. Change as little as "
                 "possible and keep the wording, style and length."),
+    "spicy": ("Make it more erotic",
+              "Make it more erotic and sexy: heighten the desire, tension and physical "
+              "sensation, the character's arousal and the sensual detail of bodies, clothes "
+              "and touch, with bolder, steamier language — about {words} words. Keep what "
+              "happens, the characters, the point of view and the final line. Everyone in it "
+              "is an adult."),
     # {picture} is describe_appearance()'s list for the caption's picture.
     "match": ("Match the picture (clothes, hair…)",
               "The story's character must end up looking exactly like the person in the "
@@ -409,6 +415,11 @@ def stream_edit(text: str, instruction: str, words: int, settings: dict,
     picture the edit is matched to may show someone under 18, so nothing
     sexual is allowed in or out."""
     check_request(text, instruction, minor_context=minor_context)
+    if (instruction.startswith("Make it more erotic")
+            and (minor_context or content_rules.mentions_minor(text))):
+        # Making a story sexual is only for stories about adults.
+        raise ContentBlocked(content_rules.message(
+            "it would make a story about someone under 18 sexual"))
     messages = [
         {"role": "system", "content": EDIT_SYSTEM_PROMPT.format(instruction=instruction)},
         {"role": "user", "content": text.strip()},
