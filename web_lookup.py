@@ -612,6 +612,144 @@ def _search_porngifs(query: str, page: int) -> list:
     return posts
 
 
+# ---------------------------------------------------------------------------
+# More sources
+#
+# redgifs.com (mature): GET /v2/auth/temporary gives a token (kept until it
+# stops working), then /v2/gifs/search?query=… returns up to 40 clips with
+# tags; each is an MP4 (urls.hd), with a JPEG thumbnail. Clips tagged as
+# drawn (hentai, anime...) or with words for minors are skipped, as are tags
+# that name a performer.
+#
+# pornpics.com (mature): /search/srch.php?q=…&offset=… answers JSON galleries
+# ({"desc", "g_url", "t_url"}); a gallery page links its full-size pictures
+# as a.rel-link (1280px) beside 460px tiles (#tiles img[data-src]).
+#
+# Wikimedia Commons (any setting): the MediaWiki API's file search with
+# imageinfo gives each file's URL and a 330px thumbnail. Freely licensed,
+# mostly not explicit.
+# ---------------------------------------------------------------------------
+
+_REDGIFS_API = "https://api.redgifs.com/v2"
+_REDGIFS_PER_PAGE = 40
+_REDGIFS_SKIP_TAGS = re.compile(
+    r"\b(?:hentai|anime|cartoon|animated|3d|sfm|cosplay|loli|shota|teen|teens|schoolgirl|"
+    r"school|student|young|barely)\b", re.I)
+_redgifs_token: Optional[str] = None
+_redgifs_lock = threading.Lock()
+_PORNPICS = "https://www.pornpics.com"
+_PORNPICS_PER_PAGE = 20
+_COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+_COMMONS_PER_PAGE = 30
+
+
+def _redgifs_get(path: str, params: dict) -> dict:
+    global _redgifs_token
+    for attempt in range(2):
+        with _redgifs_lock:
+            if _redgifs_token is None or attempt:
+                resp = _SESSION.get(f"{_REDGIFS_API}/auth/temporary", timeout=_TIMEOUT)
+                resp.raise_for_status()
+                _redgifs_token = resp.json()["token"]
+            token = _redgifs_token
+        resp = _SESSION.get(f"{_REDGIFS_API}{path}", params=params, timeout=_TIMEOUT,
+                            headers={"Authorization": f"Bearer {token}"})
+        if getattr(resp, "status_code", 200) in (401, 403) and not attempt:
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    return {}
+
+
+def _search_redgifs(query: str, page: int) -> list:
+    data = _redgifs_get("/gifs/search", {"query": query.strip().lower(),
+                                         "count": _REDGIFS_PER_PAGE, "page": page})
+    items = []
+    for g in data.get("gifs") or []:
+        urls = g.get("urls") or {}
+        url = urls.get("hd") or urls.get("sd")
+        thumb = urls.get("thumbnail") or urls.get("poster")
+        tags = [str(t) for t in g.get("tags") or []]
+        text = " ".join(tags + [str(g.get("description") or "")])
+        if (not url or not thumb or _REDGIFS_SKIP_TAGS.search(text)
+                or content_rules.mentions_minor(text) or _is_minor_title(text)
+                or any(_is_celebrity_title(t) for t in tags if " " in t)):
+            continue
+        # Most are clips (MP4, opened like a GIF); some posts are pictures.
+        items.append({"url": url, "thumb": thumb,
+                      "gif": urllib.parse.urlparse(url).path.lower().endswith(".mp4")})
+    if not items:
+        return []
+    key = f"redgifs:{query.lower()}:{page}"
+    _store_group(key, items)
+    return [{"title": f"redgifs: {query} ({len(items)})", "url": key,
+             "thumb_url": items[0]["thumb"], "mature": True}]
+
+
+def _search_pornpics(query: str, page: int) -> list:
+    resp = _SESSION.get(_PORNPICS + "/search/srch.php", timeout=_TIMEOUT,
+                        # Most galleries name their performer and are skipped
+                        # (real people), so ask for three times as many.
+                        params={"q": query.strip().lower(), "lang": "en",
+                                "limit": _PORNPICS_PER_PAGE * 3,
+                                "offset": (page - 1) * _PORNPICS_PER_PAGE * 3},
+                        headers={"Referer": _PORNPICS + "/"})
+    resp.raise_for_status()
+    data = resp.json()
+    posts = []
+    for g in data if isinstance(data, list) else []:
+        title = re.sub(r"\s+\d+$", "", re.sub(r"\s+", " ", str(g.get("desc") or ""))).strip()
+        url = str(g.get("g_url") or "")
+        if not url.startswith(_PORNPICS) or not title or _is_excluded_title(title):
+            continue
+        posts.append({"title": title, "url": url,
+                      "thumb_url": g.get("t_url") or g.get("t_url_460") or "", "mature": True})
+    return posts[:_PORNPICS_PER_PAGE]
+
+
+def _fetch_gallery_pornpics(post_url: str) -> list:
+    resp = _SESSION.get(post_url, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    fulls = [a.get("href") for a in soup.select("a.rel-link") if a.get("href")]
+    tiles = [i.get("data-src") or i.get("src") or "" for i in soup.select("#tiles img")]
+    items = []
+    for i, full in enumerate(fulls):
+        thumb = tiles[i] if i < len(tiles) and tiles[i].startswith("http") else ""
+        items.append(_gallery_item(full, thumb))
+    return items
+
+
+def _search_commons(query: str, page: int) -> list:
+    resp = _SESSION.get(_COMMONS_API, timeout=_TIMEOUT, params={
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": f"{query.strip()} filetype:bitmap", "gsrnamespace": 6,
+        "gsrlimit": _COMMONS_PER_PAGE, "gsroffset": (page - 1) * _COMMONS_PER_PAGE,
+        "prop": "imageinfo", "iiprop": "url|mime", "iiurlwidth": 330})
+    resp.raise_for_status()
+    pages = ((resp.json().get("query") or {}).get("pages") or {}).values()
+    items = []
+    for p in sorted(pages, key=lambda p: p.get("index", 0)):
+        info = (p.get("imageinfo") or [{}])[0]
+        title = re.sub(r"^File:|\.\w+$", "", str(p.get("title") or ""))
+        url = (info.get("url") or "").split("?")[0]
+        thumb = (info.get("thumburl") or "").split("?")[0]
+        if (not url or not thumb or info.get("mime") not in ("image/jpeg", "image/png",
+                                                             "image/gif", "image/webp")
+                or _is_excluded_title(title.replace("_", " "))):
+            continue
+        item = _gallery_item(url, thumb)
+        if item["gif"]:
+            item["thumb"] = url        # Commons' GIF thumbnails are still frames
+        items.append(item)
+    if not items:
+        return []
+    key = f"commons:{query.lower()}:{page}"
+    _store_group(key, items)
+    return [{"title": f"Wikimedia Commons: {query} ({len(items)})", "url": key,
+             "thumb_url": items[0]["thumb"]}]
+
+
 def _rank_results(results: list, query: str) -> list:
     """Sort results the way a web search does: the query's first word is
     the primary term and decides who's in the top tier, exactly like
@@ -712,8 +850,12 @@ def search_stream(query: str, page: int = 1, gifs_only: bool = False,
         jobs.append((_search_sexcom, (query, page, gifs_only)))  # picks its own single term
         jobs.append((_search_xgroovy_gifs, (query, page)))
         jobs.append((_search_porngifs, (query, page)))
+        jobs.append((_search_redgifs, (query, page)))
         if not gifs_only:
             jobs.append((_search_xgroovy_photos, (query, page)))
+            jobs.append((_search_pornpics, (query, page)))
+    if not gifs_only:
+        jobs.append((_search_commons, (query, page)))
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = [pool.submit(src, *args) for src, args in jobs]
@@ -785,7 +927,7 @@ def fetch_gallery(post_url: str) -> list:
     """Return the images embedded in a post as [{"url", "thumb", "gif"}],
     in page order. Dispatches on post_url's host, since Barnorama and
     AcidCow need different selectors."""
-    if post_url.startswith(("sexcom:", "xgroovy:", "porngifs:")):
+    if post_url.startswith(("sexcom:", "xgroovy:", "porngifs:", "redgifs:", "commons:")):
         with _sexcom_lock:
             return list(_SEXCOM_GROUPS.get(post_url, []))
     host = urllib.parse.urlparse(post_url).netloc
@@ -793,6 +935,8 @@ def fetch_gallery(post_url: str) -> list:
         return _fetch_gallery_acidcow(post_url)
     if "xgroovy.com" in host:
         return _fetch_gallery_xgroovy(post_url)
+    if "pornpics.com" in host:
+        return _fetch_gallery_pornpics(post_url)
     return _fetch_gallery_barnorama(post_url)
 
 
@@ -889,10 +1033,91 @@ def find_faces(img: Image.Image, min_area: float = 0.002) -> "list | None":
     return out
 
 
+# ---------------------------------------------------------------------------
+# Text detection ("No text" filter)
+#
+# Results that already carry a caption, meme text or a big watermark aren't
+# usable as a base for a new caption. The PP-OCRv3 text detector
+# (assets/text_detection_en_ppocrv3_2023may.onnx, Apache-2.0, from
+# opencv_zoo) returns a per-pixel "text here" probability map; the share of
+# the picture covered by text, and how many separate text regions there
+# are, decide. A lone small corner watermark is let through. If OpenCV or
+# the model is unavailable, has_text() is None and nothing is filtered.
+# ---------------------------------------------------------------------------
+
+_TEXT_MODEL = os.path.join(app_paths.RESOURCE_DIR, "assets",
+                           "text_detection_en_ppocrv3_2023may.onnx")
+_TEXT_SIDE = 640            # detector input, square; small previews are upscaled
+_TEXT_PROB = 0.3            # pixel counts as text above this probability
+_TEXT_MIN_REGION = 0.0003   # regions smaller than this share of the picture are noise
+_TEXT_FRACTION = 0.004      # this much text anywhere = has text
+_TEXT_REGIONS = 2           # ...or this many separate text regions, covering
+_TEXT_REGIONS_FRACTION = 0.0035  # at least this much
+_text_lock = threading.Lock()
+_text_net = None
+_text_unavailable = False
+
+
+def _get_text_net():
+    global _text_net, _text_unavailable
+    if _text_net is None and not _text_unavailable:
+        try:
+            import cv2
+            _text_net = cv2.dnn.readNet(_TEXT_MODEL)
+        except Exception:
+            _text_unavailable = True
+    return _text_net
+
+
+def text_coverage(img: Image.Image) -> "tuple | None":
+    """(share of the picture covered by text, number of text regions), or
+    None if detection isn't available."""
+    with _text_lock:
+        net = _get_text_net()
+        if net is None:
+            return None
+        import cv2
+        import numpy as np
+        # Always the same square input (the picture scaled to fit, padded
+        # with black): OpenCV 5's new graph engine gave garbage when one
+        # network saw several input shapes.
+        im = img.convert("RGB")
+        w, h = im.size
+        s = _TEXT_SIDE / max(w, h)
+        nw, nh = max(1, round(w * s)), max(1, round(h * s))
+        canvas = Image.new("RGB", (_TEXT_SIDE, _TEXT_SIDE))
+        canvas.paste(im.resize((nw, nh), Image.BICUBIC), (0, 0))
+        arr = np.asarray(canvas, dtype=np.float32) / 255.0
+        arr = (arr - (0.485, 0.456, 0.406)) / (0.229, 0.224, 0.225)
+        net.setInput(arr.astype(np.float32).transpose(2, 0, 1)[None])
+        prob = np.asarray(net.forward())
+    prob = prob.reshape(prob.shape[-2:])[:nh, :nw]      # the picture, not the padding
+    mask = np.ascontiguousarray(prob > _TEXT_PROB, dtype=np.uint8)
+    _n, _labels, stats, _c = cv2.connectedComponentsWithStats(mask)
+    min_px = _TEXT_MIN_REGION * mask.size
+    regions = [st for st in stats[1:] if st[4] >= min_px]
+    covered = sum(int(st[4]) for st in regions) / mask.size
+    return covered, len(regions)
+
+
+def has_text(img: Image.Image) -> "bool | None":
+    """Whether the picture already has text on it (a caption, meme text, a
+    big watermark), or None if detection isn't available."""
+    try:
+        found = text_coverage(img)
+    except Exception:
+        return None
+    if found is None:
+        return None
+    covered, regions = found
+    return covered >= _TEXT_FRACTION or (regions >= _TEXT_REGIONS
+                                         and covered >= _TEXT_REGIONS_FRACTION)
+
+
 def load_preview(item: dict, size: tuple = (130, 95)) -> tuple:
-    """(thumbnail PIL image, face count or None) for a gallery item —
-    downloads its small `thumb` version, cached so paging back and forth
-    or reopening a gallery doesn't download it again."""
+    """(thumbnail PIL image, face count or None, has text or None) for a
+    gallery item — downloads its small `thumb` version, cached so paging
+    back and forth or reopening a gallery doesn't download it again."""
     key = item["thumb"]
     with _preview_lock:
         if key in _PREVIEW_CACHE:
@@ -902,8 +1127,9 @@ def load_preview(item: dict, size: tuple = (130, 95)) -> tuple:
     img.seek(0)
     img = img.convert("RGB")
     faces = count_faces(img)
+    text = has_text(img)
     img.thumbnail(size, Image.LANCZOS)
-    result = (img, faces)
+    result = (img, faces, text)
     with _preview_lock:
         _PREVIEW_CACHE[key] = result
         while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX:

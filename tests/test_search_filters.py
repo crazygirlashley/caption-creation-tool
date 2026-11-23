@@ -21,7 +21,9 @@ class FilterTests(unittest.TestCase):
     def setUp(self):
         self.saved = (web_lookup._search_barnorama, web_lookup._search_acidcow,
                       web_lookup._search_sexcom, web_lookup._search_xgroovy_gifs,
-                      web_lookup._search_xgroovy_photos, web_lookup._search_porngifs)
+                      web_lookup._search_xgroovy_photos, web_lookup._search_porngifs,
+                      web_lookup._search_redgifs, web_lookup._search_pornpics,
+                      web_lookup._search_commons)
         self.calls = []
         self.mature_calls = []
 
@@ -34,6 +36,14 @@ class FilterTests(unittest.TestCase):
         web_lookup._search_xgroovy_gifs = mature_source("xg")
         web_lookup._search_xgroovy_photos = mature_source("xp")
         web_lookup._search_porngifs = mature_source("pg")
+        web_lookup._search_redgifs = mature_source("rg")
+        web_lookup._search_pornpics = mature_source("pp")
+        self.commons_calls = []
+
+        def commons(q, page):
+            self.commons_calls.append(q)
+            return [{"title": "Wikimedia Commons: redhead (4)", "url": "cm", "thumb_url": ""}]
+        web_lookup._search_commons = commons
 
         def barn(q, page):
             return [{"title": "Sexy Redhead Babes", "url": "b1", "thumb_url": ""},
@@ -53,24 +63,30 @@ class FilterTests(unittest.TestCase):
     def tearDown(self):
         (web_lookup._search_barnorama, web_lookup._search_acidcow,
          web_lookup._search_sexcom, web_lookup._search_xgroovy_gifs,
-         web_lookup._search_xgroovy_photos, web_lookup._search_porngifs) = self.saved
+         web_lookup._search_xgroovy_photos, web_lookup._search_porngifs,
+         web_lookup._search_redgifs, web_lookup._search_pornpics,
+         web_lookup._search_commons) = self.saved
 
     def urls(self, **kw):
         return sorted(r["url"] for batch in web_lookup.search_stream("redhead", 1, **kw)
                       for r in batch)
 
     def test_mature_on_includes_everything(self):
-        self.assertEqual(self.urls(), ["a1", "b1", "b2", "pg", "s1", "xg", "xp"])
+        self.assertEqual(self.urls(), ["a1", "b1", "b2", "cm", "pg", "pp", "rg", "s1", "xg",
+                                       "xp"])
 
     def test_mature_off_skips_the_explicit_sites_and_titles(self):
-        self.assertEqual(self.urls(mature=False), ["a1", "b1"])
+        self.assertEqual(self.urls(mature=False), ["a1", "b1", "cm"])
         self.assertEqual(self.calls, [])               # sex.com not even asked
-        self.assertEqual(self.mature_calls, [])        # nor xgroovy or porngifs
+        self.assertEqual(self.mature_calls, [])        # nor the other explicit sites
 
     def test_gifs_only_asks_for_gifs(self):
         self.urls(gifs_only=True)
         self.assertEqual(self.calls, [True])
         self.assertNotIn("xp", self.mature_calls)      # xgroovy photo albums skipped
+        self.assertNotIn("pp", self.mature_calls)      # pornpics photo galleries skipped
+        self.assertIn("rg", self.mature_calls)         # redgifs clips searched
+        self.assertEqual(self.commons_calls, [])       # Commons (photos) skipped
 
     def test_searches_for_minors_are_never_run(self):
         for q in ("teen redhead", "loli", "schoolgirl", "16 year old", "high school girl"):
@@ -140,6 +156,66 @@ class MatureSourceTests(unittest.TestCase):
         self.assertTrue(posts[0]["mature"])
         items = web_lookup.fetch_gallery(posts[0]["url"])
         self.assertEqual(items[0]["url"], "https://cdn.porngifs.com/img/38828")
+
+    def test_redgifs_clips_and_skipped_tags(self):
+        def get(url, **k):
+            if url.endswith("/auth/temporary"):
+                return _FakeResp(data={"token": "t"})
+            self.assertEqual(k["headers"]["Authorization"], "Bearer t")
+            return _FakeResp(data={"gifs": [
+                {"tags": ["Redhead", "Lingerie"],
+                 "urls": {"hd": "https://m/A.mp4", "thumbnail": "https://m/A-mobile.jpg"}},
+                {"tags": ["Redhead", "Teen"],
+                 "urls": {"hd": "https://m/B.mp4", "thumbnail": "https://m/B.jpg"}},
+                {"tags": ["Hentai", "Redhead"],
+                 "urls": {"hd": "https://m/C.mp4", "thumbnail": "https://m/C.jpg"}},
+                {"tags": ["Redhead"],
+                 "urls": {"hd": "https://m/D-large.jpg", "thumbnail": "https://m/D-small.jpg"}},
+            ]})
+        web_lookup._SESSION.get = get
+        web_lookup._redgifs_token = None
+        posts = web_lookup._search_redgifs("redhead", 1)
+        self.assertEqual(posts[0]["title"], "redgifs: redhead (2)")
+        self.assertTrue(posts[0]["mature"])
+        items = web_lookup.fetch_gallery(posts[0]["url"])
+        self.assertEqual([(i["url"], i["gif"]) for i in items],
+                         [("https://m/A.mp4", True), ("https://m/D-large.jpg", False)])
+
+    def test_pornpics_galleries_skip_named_people(self):
+        web_lookup._SESSION.get = lambda url, **k: _FakeResp(data=[
+            {"desc": "European girls with model-like bodies pose naked outdoors 123",
+             "g_url": "https://www.pornpics.com/galleries/a-1/", "t_url": "https://c/1.jpg"},
+            {"desc": "Redheaded teen Megan Murkovski poses 456",
+             "g_url": "https://www.pornpics.com/galleries/b-2/", "t_url": "https://c/2.jpg"},
+        ])
+        posts = web_lookup._search_pornpics("redhead", 1)
+        self.assertEqual([p["title"] for p in posts],
+                         ["European girls with model-like bodies pose naked outdoors"])
+        html = ('<a class="rel-link" href="https://cdni.pornpics.com/1280/x/1.jpg"></a>'
+                '<a class="rel-link" href="https://cdni.pornpics.com/1280/x/2.jpg"></a>'
+                '<div id="tiles"><img data-src="https://cdni.pornpics.com/460/x/1.jpg">'
+                '<img data-src="https://cdni.pornpics.com/460/x/2.jpg"></div>')
+        web_lookup._SESSION.get = lambda url, **k: _FakeResp(html)
+        items = web_lookup.fetch_gallery(posts[0]["url"])
+        self.assertEqual(items[1], {"url": "https://cdni.pornpics.com/1280/x/2.jpg",
+                                    "thumb": "https://cdni.pornpics.com/460/x/2.jpg",
+                                    "gif": False})
+
+    def test_commons_files(self):
+        web_lookup._SESSION.get = lambda url, **k: _FakeResp(data={"query": {"pages": {
+            "1": {"index": 2, "title": "File:Redhead in Central Park.jpg", "imageinfo": [{
+                "url": "https://upload.wikimedia.org/a/Redhead.jpg?utm=x",
+                "thumburl": "https://thumb.wikimedia.org/a/330px-Redhead.jpg?utm=y",
+                "mime": "image/jpeg"}]},
+            "2": {"index": 1, "title": "File:Scan.pdf", "imageinfo": [{
+                "url": "https://upload.wikimedia.org/a/Scan.pdf", "thumburl": "https://t/x.jpg",
+                "mime": "application/pdf"}]}}}})
+        posts = web_lookup._search_commons("redhead", 1)
+        self.assertEqual(posts[0]["title"], "Wikimedia Commons: redhead (1)")
+        self.assertFalse(posts[0].get("mature"))
+        items = web_lookup.fetch_gallery(posts[0]["url"])
+        self.assertEqual(items[0]["url"], "https://upload.wikimedia.org/a/Redhead.jpg")
+        self.assertEqual(items[0]["thumb"], "https://thumb.wikimedia.org/a/330px-Redhead.jpg")
 
     def test_download_file_types(self):
         saved = web_lookup.download_bytes

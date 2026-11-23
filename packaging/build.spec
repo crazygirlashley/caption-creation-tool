@@ -49,6 +49,9 @@ datas = [
     (os.path.join(ASSETS_DIR, "given_names.txt"), "assets"),
     # YuNet face detector (MIT, opencv_zoo) — Find Online's single-person filter.
     (os.path.join(ASSETS_DIR, "face_detection_yunet_2023mar.onnx"), "assets"),
+    # PP-OCRv3 text detector (Apache-2.0, opencv_zoo) — Find Online's "No text" filter.
+    (os.path.join(ASSETS_DIR, "text_detection_en_ppocrv3_2023may.onnx"), "assets"),
+    (os.path.join(ASSETS_DIR, "LICENSE-text-detection-ppocr.txt"), "assets"),
     # The app's own version, for the "What's new" window.
     (os.path.join(REPO_ROOT, "VERSION"), "."),
     # Free (OFL) fonts for the themed formats, with their licenses.

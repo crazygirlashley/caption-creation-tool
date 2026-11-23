@@ -65,15 +65,17 @@ class SimilarQueryTests(unittest.TestCase):
 class StreamTests(unittest.TestCase):
     def setUp(self):
         self.orig = (wl._search_barnorama, wl._search_acidcow, wl._search_sexcom,
-                     wl._search_xgroovy_gifs, wl._search_xgroovy_photos, wl._search_porngifs)
+                     wl._search_xgroovy_gifs, wl._search_xgroovy_photos, wl._search_porngifs,
+                     wl._search_redgifs, wl._search_pornpics, wl._search_commons)
         # Keep these tests offline.
         wl._search_sexcom = lambda q, page, gifs_only=False: []
         wl._search_xgroovy_gifs = wl._search_xgroovy_photos = wl._search_porngifs = \
-            lambda q, page: []
+            wl._search_redgifs = wl._search_pornpics = wl._search_commons = lambda q, page: []
 
     def tearDown(self):
         (wl._search_barnorama, wl._search_acidcow, wl._search_sexcom,
-         wl._search_xgroovy_gifs, wl._search_xgroovy_photos, wl._search_porngifs) = self.orig
+         wl._search_xgroovy_gifs, wl._search_xgroovy_photos, wl._search_porngifs,
+         wl._search_redgifs, wl._search_pornpics, wl._search_commons) = self.orig
 
     def test_multiword_query_also_searches_distinctive_term_and_dedupes(self):
         queries = []
@@ -171,6 +173,46 @@ class FaceCountTests(unittest.TestCase):
     def test_blank_image_has_no_faces(self):
         faces = wl.count_faces(Image.new("RGB", (300, 300), (200, 180, 160)))
         self.assertIn(faces, (0, None))  # None only if OpenCV isn't installed
+
+
+class TextDetectionTests(unittest.TestCase):
+    """The "No text" filter (PP-OCRv3 text detector)."""
+
+    @staticmethod
+    def _photo():
+        from PIL import ImageDraw
+        img = Image.new("RGB", (600, 800), "#8a6f60")
+        d = ImageDraw.Draw(img)
+        for i in range(0, 800, 40):
+            d.ellipse((100 + i % 200, i, 300 + i % 150, i + 90), fill=(150 + i % 90, 110, 100))
+        return img
+
+    @staticmethod
+    def _font(size):
+        from PIL import ImageFont
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except OSError:
+            return ImageFont.load_default(size)
+
+    def test_plain_picture_has_no_text(self):
+        self.assertIn(wl.has_text(self._photo()), (False, None))
+
+    def test_caption_is_found(self):
+        from PIL import ImageDraw
+        img = self._photo()
+        d = ImageDraw.Draw(img)
+        for k, line in enumerate(["She took the pill and", "by morning everything",
+                                  "had changed forever."]):
+            d.text((40, 500 + k * 40), line, font=self._font(30), fill="white",
+                   stroke_width=2, stroke_fill="black")
+        self.assertIn(wl.has_text(img), (True, None))
+
+    def test_small_corner_watermark_is_allowed(self):
+        from PIL import ImageDraw
+        img = self._photo()
+        ImageDraw.Draw(img).text((480, 770), "sex.com", font=self._font(16), fill="white")
+        self.assertIn(wl.has_text(img), (False, None))
 
 
 if __name__ == "__main__":

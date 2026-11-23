@@ -9742,11 +9742,15 @@ class CaptionApp:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Find Online — Barnorama + AcidCow (Mature: sex.com, xgroovy, porngifs)")
+        win.title("Find Online — Barnorama, AcidCow, Wikimedia Commons (Mature: sex.com, "
+                  "redgifs, pornpics, xgroovy, porngifs)")
         if not hasattr(self, "_wl_single_var"):
             self._wl_single_var = tk.BooleanVar(value=True)
-        # Load the face detector now (~1s) rather than on the first preview.
+            self._wl_notext_var = tk.BooleanVar(
+                value=bool(recent_store.get_setting("wl_no_text", True)))
+        # Load the face and text detectors now (~1s) rather than on the first preview.
         _WL_PREVIEW_POOL.submit(web_lookup.count_faces, Image.new("RGB", (64, 64)))
+        _WL_PREVIEW_POOL.submit(web_lookup.has_text, Image.new("RGB", (64, 64)))
         win.geometry("860x620")
         self._wl_win = win
         self._wl_page = 1
@@ -9773,6 +9777,15 @@ class CaptionApp:
         search_btn.pack(side="left")
         ttk.Checkbutton(search_row, text="Single person only", variable=self._wl_single_var,
                         command=self._wl_apply_filter_all).pack(side="left", padx=(10, 0))
+
+        def _notext_changed() -> None:
+            recent_store.set_setting("wl_no_text", self._wl_notext_var.get())
+            self._wl_apply_filter_all()
+        tooltip(ttk.Checkbutton(search_row, text="No text", variable=self._wl_notext_var,
+                                command=_notext_changed),
+                "Hide pictures that already have text on them — captions, meme text,\n"
+                "big watermarks — so you get a clean base for your own caption.\n"
+                "A small corner watermark is allowed.").pack(side="left", padx=(10, 0))
         if not hasattr(self, "_wl_gif_var"):
             self._wl_gif_var = tk.BooleanVar(
                 value=bool(recent_store.get_setting("wl_gifs_only", False)))
@@ -9790,8 +9803,9 @@ class CaptionApp:
                 "Show only animated GIFs").pack(side="left", padx=(10, 0))
         tooltip(ttk.Checkbutton(search_row, text="Mature", variable=self._wl_mature_var,
                                 command=_filters_changed),
-                "On: also search the explicit (porn) sites — sex.com, xgroovy.com and\n"
-                "porngifs.com — and show explicit posts; their results are marked 🔞 MATURE.\n"
+                "On: also search the explicit (porn) sites — sex.com, redgifs.com,\n"
+                "pornpics.com, xgroovy.com and porngifs.com — and show explicit posts;\n"
+                "their results are marked 🔞 MATURE.\n"
                 "Off: skip them — sexy, not explicit.").pack(side="left", padx=(10, 0))
         self._wl_query_var = query_var
 
@@ -10068,7 +10082,7 @@ class CaptionApp:
         for item in items[:_WL_STRIP_CANDIDATES]:
             btn = tk.Button(strip, text="…", width=12, height=6, relief="flat",
                             command=lambda u=item["url"]: self._wl_select_image(u, post_url))
-            cell = {"btn": btn, "faces": None, "loaded": False}
+            cell = {"btn": btn, "faces": None, "text": None, "loaded": False}
             block["cells"].append(cell)
             self._wl_image_buttons.append(btn)
             fut = _WL_PREVIEW_POOL.submit(self._wl_make_preview, item)
@@ -10084,17 +10098,17 @@ class CaptionApp:
 
     @staticmethod
     def _wl_make_preview(item: dict) -> tuple:
-        """Pool job: (PIL thumbnail, face count or None)."""
-        img, faces = web_lookup.load_preview(item)
+        """Pool job: (PIL thumbnail, face count or None, has text or None)."""
+        img, faces, text = web_lookup.load_preview(item)
         if item["gif"]:
             img = _wl_badge_gif(img)
-        return img, faces
+        return img, faces, text
 
     def _wl_on_preview(self, fut, cell: dict, block: dict, token: object) -> None:
         if not self._wl_search_alive(token) or not cell["btn"].winfo_exists():
             return
         try:
-            img, faces = fut.result()
+            img, faces, text = fut.result()
         except Exception:
             cell["loaded"] = True
             cell["faces"] = -1  # failed to load: never shown
@@ -10104,14 +10118,34 @@ class CaptionApp:
         self._wl_apply_thumb(photo, cell["btn"])
         cell["loaded"] = True
         cell["faces"] = faces
+        cell["text"] = text
         self._wl_layout_block(block)
 
     def _wl_cell_visible(self, cell: dict) -> bool:
         if cell["faces"] == -1:
             return False
-        if self._wl_single_var.get() and cell["loaded"] and cell["faces"] is not None:
+        if not cell["loaded"]:
+            return True
+        if self._wl_notext_var.get() and cell.get("text"):
+            return False
+        if self._wl_single_var.get() and cell["faces"] is not None:
             return cell["faces"] == 1
         return True
+
+    def _wl_hidden_note(self, cells: list) -> str:
+        """Why some loaded pictures are hidden, e.g. "3 have text, 2 not a
+        single person" ("" if none are)."""
+        texted = single = 0
+        for c in cells:
+            if not c["loaded"] or c["faces"] == -1 or self._wl_cell_visible(c):
+                continue
+            if self._wl_notext_var.get() and c.get("text"):
+                texted += 1
+            else:
+                single += 1
+        parts = ([f"{texted} with text"] if texted else []) + (
+            [f"{single} not a single person"] if single else [])
+        return f"{texted + single} hidden ({', '.join(parts)})" if parts else ""
 
     def _wl_layout_block(self, block: dict) -> None:
         """(Re)pack a post's strip: the first _WL_MAX_IMAGES_PER_POST
@@ -10130,10 +10164,10 @@ class CaptionApp:
         if block["more"] is not None:
             block["more"].pack(side="left", padx=(4, 0))
 
-        hidden = sum(1 for c in block["cells"] if c["loaded"] and not self._wl_cell_visible(c))
+        note = self._wl_hidden_note(block["cells"])
         title = block["title"]
-        if hidden and self._wl_single_var.get():
-            title += f"   ·  {hidden} hidden (not a single person)"
+        if note:
+            title += f"   ·  {note}"
         block["header_label"].config(text=title)
         all_loaded = all(c["loaded"] for c in block["cells"])
         if all_loaded and not visible:
@@ -10187,11 +10221,11 @@ class CaptionApp:
                 c["btn"].grid_forget()
             for i, c in enumerate(shown):
                 c["btn"].grid(row=i // cols, column=i % cols, padx=4, pady=4)
-            hidden = sum(1 for c in cells if c["loaded"] and not self._wl_cell_visible(c))
+            note = self._wl_hidden_note(cells)
             loading = sum(1 for c in cells if not c["loaded"])
             parts = [f"{len(shown)} shown"]
-            if hidden and self._wl_single_var.get():
-                parts.append(f"{hidden} hidden (not a single person)")
+            if note:
+                parts.append(note)
             if loading:
                 parts.append(f"{loading} loading…")
             status.config(text="  ·  ".join(parts))
@@ -10200,11 +10234,12 @@ class CaptionApp:
             if not gallery.winfo_exists() or not cell["btn"].winfo_exists():
                 return
             try:
-                img, faces = fut.result()
+                img, faces, text = fut.result()
                 photo = ImageTk.PhotoImage(img)
                 cell["btn"].config(image=photo, text="", width=0, height=0)
                 thumbs.append(photo)
                 cell["faces"] = faces
+                cell["text"] = text
             except Exception:
                 cell["faces"] = -1
             cell["loaded"] = True
@@ -10213,14 +10248,20 @@ class CaptionApp:
         for item in items:
             btn = tk.Button(grid_frame, text="…", width=12, height=6, relief="flat",
                             command=lambda u=item["url"]: _pick(u))
-            cell = {"btn": btn, "faces": None, "loaded": False}
+            cell = {"btn": btn, "faces": None, "text": None, "loaded": False}
             cells.append(cell)
             fut = _WL_PREVIEW_POOL.submit(self._wl_make_preview, item)
             fut.add_done_callback(
                 lambda f, c=cell: self.root.after(0, lambda: _on_preview(f, c)))
-        ttk.Checkbutton(gallery, text="Single person only", variable=self._wl_single_var,
-                        command=lambda: (_relayout(), self._wl_apply_filter_all())).pack(
-            side="top", anchor="e", before=status)
+        opts_row = ttk.Frame(gallery)
+        opts_row.pack(side="top", anchor="e", before=status)
+        for text, var in (("No text", self._wl_notext_var),
+                          ("Single person only", self._wl_single_var)):
+            ttk.Checkbutton(opts_row, text=text, variable=var,
+                            command=lambda: (recent_store.set_setting(
+                                "wl_no_text", self._wl_notext_var.get()),
+                                _relayout(), self._wl_apply_filter_all())).pack(
+                side="left", padx=(0, 8))
         _relayout()
 
     def _wl_apply_thumb(self, photo: ImageTk.PhotoImage, button: tk.Button) -> None:
