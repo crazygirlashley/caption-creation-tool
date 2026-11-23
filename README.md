@@ -36,6 +36,7 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
   - **Describe it — the AI plans it**: write what should happen (*"hold on her, slowly zoom into her face, a jolt, then purple smoke reveals the after picture"*) and **Plan it** — your local AI writer turns it into a numbered list of steps (holds, zooms toward the face or a body part, pans, shakes, pulses, color flashes and any of the transitions, with colors and timings), previewed before you create it. A second picture is optional. Runs on the same local model as the AI writer, so it works on modest PCs
   - **AI video (ComfyUI)**: real AI-generated motion (*"she turns to the camera and smiles"*) from an image-to-video model such as Wan or LTX-Video running in [ComfyUI](https://www.comfy.org). These need an NVIDIA graphics card with roughly 8–24 GB of video memory, so ComfyUI can run on this PC, another PC on your network (start it with `--listen`), or a rented cloud GPU. **Set up…** takes ComfyUI's address and your own workflow exported with **Workflow → Export (API)**; your picture goes into its Load Image node and the description into its prompt (or wherever you put `%image%` / `%prompt%`), seeds are randomized, and width/height can follow your picture's shape. ComfyUI's own error messages (a missing model, an uninstalled node) are shown if it can't run. The finished clip — video, animated WebP/GIF, or frames — opens as your picture. **Allow explicit content** in the AI Video settings (off by default) decides whether videos may be explicit; off, explicit terms go into the workflow's negative prompt so videos stay suggestive. Before a sexual video is made, the picture model checks that everyone in the picture looks 18 or older — it's refused if anyone may be younger, and explicit content is only let through after that check; non-sexual motion is made for anyone
 - **Comic Strip** — **File → Comic Strip…** lays out several pictures as comic panels: in a row, a column, or a grid (choose the columns), all cropped to one panel shape (square, 3:4, 9:16, 4:3, 16:9 or the first picture's). Each panel can have a narration caption (a yellow box inside the top or bottom, or plain text below the panel) and a speech bubble whose tail points at the face it finds (Auto keeps the bubble off the face; or pick a corner). Add a title, change the gaps, borders, colors, font and text size, and reorder panels with ▲▼. GIF and animated WebP panels keep playing, each on its own timing. **Open in Caption Creator** makes it your picture (kept in `comics/`) for a watermark, more text, saving or posting; **Save as…** saves it straight to PNG/JPEG/WebP, or GIF/WebP when animated.
+- **Themed formats** — **Goth** (blackletter title, old-style serif, dark vignette), **Bimbo** (Pacifico title, bubbly caption on pink hearts), **Sissy** (script title, lavender hearts), **Magic** (Cinzel Decorative title, gold stars on midnight blue) and **Hypno** (Monoton title on a magenta spiral). Their fonts come with the app in `fonts/` (all SIL Open Font License, see `fonts/CREDITS.md`) and appear in every font list without installing anything. Any format can use the patterns: Caption tab → **Pattern** (gradient, spiral, hearts, stars, vignette) with a second color.
 - **Vertical switch** — one switch under the Format dropdown turns any panel format vertical (caption below the picture instead of beside it); it's remembered between sessions and saved with projects.
 - **Before & after** — in the **Image** tab, pick a second "before" picture to show beside (or above) the one you opened, cropped to the same size, with optional "Before"/"After" labels. The caption, title, tagline and watermark lay out around the pair. A GIF before picture plays frame for frame with the main one (looping if it's shorter)
 - **📖 Long story** — for stories too long to fit beside the image: the caption box keeps the whole story, which goes in the DeviantArt description (and is saved as a `- story.txt` file next to exports), while the image shows the opening, cut at a sentence where it stops fitting at a readable size, ending with "(The story continues in the description ⬇)". **Text on image…** changes that line, or lets you write your own short version — or have the AI write one
@@ -255,7 +256,7 @@ Click **Log Out** to clear the cached token (with a confirmation prompt) if you 
 
 ## Custom Formats
 
-Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the built-in formats (`Standard`, `X-Change`, `Text Message`, `Text Boxes`) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
+Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the built-in formats (`Standard`, `X-Change`, `Text Message`, `Text Boxes`, and the themed `Goth`, `Bimbo`, `Sissy`, `Magic` and `Hypno`) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
 
 You can also hand-edit or drop in a `.json` file directly — it'll appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
 
@@ -265,6 +266,8 @@ Each format file supports the following fields:
 |---|---|---|
 | `name` | string | Display name shown in the dropdown |
 | `page_bg_color` | hex string | Caption panel background color |
+| `panel_style` | `""` / `"gradient"` / `"spiral"` / `"hearts"` / `"stars"` / `"vignette"` | Pattern behind the caption, drawn in `page_bg_color` and `panel_color2` (Caption tab → Pattern) |
+| `panel_color2` | hex string | The pattern's second color |
 | `font_color` | hex string | Caption text color |
 | `stroke_width` | int | Text stroke thickness in px |
 | `stroke_color` | hex string | Stroke color |
@@ -374,6 +377,7 @@ caption-creation-tool/
 │   ├── english_words.txt     # Wordlists used by Find Online's celebrity filter
 │   ├── face_detection_yunet_2023mar.onnx  # Face detector for Find Online (MIT, opencv_zoo)
 │   └── given_names.txt
+├── fonts/                    # Bundled OFL fonts for the themed formats (+ licenses/, CREDITS.md)
 ├── formats/                  # Format definitions (JSON) — add your own here
 │   ├── Standard.json
 │   ├── Text Message.json

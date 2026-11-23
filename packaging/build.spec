@@ -51,8 +51,11 @@ datas = [
     (os.path.join(ASSETS_DIR, "face_detection_yunet_2023mar.onnx"), "assets"),
     # The app's own version, for the "What's new" window.
     (os.path.join(REPO_ROOT, "VERSION"), "."),
+    # Free (OFL) fonts for the themed formats, with their licenses.
+    (os.path.join(REPO_ROOT, "fonts"), "fonts"),
 ]
-for fname in ("Standard.json", "X-Change.json", "Text Message.json", "Text Boxes.json"):
+for fname in ("Standard.json", "X-Change.json", "Text Message.json", "Text Boxes.json",
+              "Goth.json", "Bimbo.json", "Sissy.json", "Magic.json", "Hypno.json"):
     src = os.path.join(FORMATS_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "formats"))

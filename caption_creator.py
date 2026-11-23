@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -151,6 +152,9 @@ class _Watchdog(threading.Thread):
 # ---------------------------------------------------------------------------
 
 _FONT_DIRS = [
+    # Free (OFL) fonts that come with the app, for the themed formats —
+    # usable without installing them into Windows. See fonts/CREDITS.md.
+    os.path.join(RESOURCE_DIR, "fonts"),
     os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
     os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Microsoft\Windows\Fonts"),
 ]
@@ -184,10 +188,11 @@ _FORMATS_DIR = os.path.join(BASE_DIR, "formats")
 
 # Formats shipped with the app — overwriting one of these locally is fine,
 # but only these are pushed/committed to the repo by default.
-_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Text Message", "Text Boxes"}
+_THEMED_FORMATS = ("Goth", "Bimbo", "Sissy", "Magic", "Hypno")
+_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Text Message", "Text Boxes", *_THEMED_FORMATS}
 # Built-in formats added after the first release: copied into an existing
 # install's formats/ once (so deleting one later sticks).
-_LATER_CORE_FORMATS = ("Text Boxes",)
+_LATER_CORE_FORMATS = ("Text Boxes", *_THEMED_FORMATS)
 
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
@@ -234,6 +239,10 @@ _WHATS_NEW = {
              "at faces, and a title. GIF panels keep playing"),
             ("Vertical switch", "one switch under the format turns any format vertical "
              "(caption below the picture) — no more separate (Vertical) formats"),
+            ("Themed formats", "Goth, Bimbo, Sissy, Magic and Hypno — each with its own "
+             "fonts (included with the app) and a patterned caption panel"),
+            ("Panel patterns", "Caption tab → Pattern: gradient, spiral, hearts, stars or "
+             "vignette behind any caption, in two colors you pick"),
         ]),
         ("Text Boxes", [
             ("Snapping guides", "boxes line up with the picture's center and edges and with "
@@ -530,7 +539,7 @@ _FORMAT_DEFAULTS = {
     "auto_size": False, "align": "center", "caption_side": "right",
     "dynamic_width": False, "header_font": "Arial", "header_size": 28,
     "footer_font": "Arial", "footer_size": 16, "footer_enabled": False,
-    "scale_overlays": False,
+    "scale_overlays": False, "panel_style": "", "panel_color2": "#ffffff",
 }
 # Per-caption text, not part of what makes a format different.
 _FORMAT_PER_CAPTION_KEYS = ("header_text", "footer_text", "name")
@@ -1325,6 +1334,7 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
         bubble_color=raw.get("bubble_color", "blue"),
         cap_width=width,
         page_bg=raw["page_bg"],
+        panel_style=raw.get("panel_style", ""),
         font_family=raw["font_family"],
         font_size=size,
         font_color=raw["font_color"],
@@ -2215,6 +2225,75 @@ def _output_scale(total_w: int, total_h: int, output_override: bool,
     return scale, new_w, new_h
 
 
+# Caption panel patterns: display name -> format "panel_style" value. Each
+# is drawn in the Page BG color and the format's "panel_color2".
+_PANEL_STYLES = {"None": "", "Gradient": "gradient", "Spiral": "spiral", "Hearts": "hearts",
+                 "Stars": "stars", "Vignette": "vignette"}
+
+
+def _heart(draw: ImageDraw.ImageDraw, cx: float, cy: float, s: float, fill) -> None:
+    r = s * 0.27
+    draw.ellipse((cx - 2 * r, cy - r * 1.6, cx, cy + r * 0.4), fill=fill)
+    draw.ellipse((cx, cy - r * 1.6, cx + 2 * r, cy + r * 0.4), fill=fill)
+    draw.polygon([(cx - 1.95 * r, cy - r * 0.35), (cx + 1.95 * r, cy - r * 0.35),
+                  (cx, cy + r * 2.1)], fill=fill)
+
+
+def _star(draw: ImageDraw.ImageDraw, cx: float, cy: float, s: float, fill) -> None:
+    """A four-point sparkle."""
+    a, b = s / 2, s / 9
+    draw.polygon([(cx, cy - a), (cx + b, cy - b), (cx + a, cy), (cx + b, cy + b),
+                  (cx, cy + a), (cx - b, cy + b), (cx - a, cy), (cx - b, cy - b)], fill=fill)
+
+
+@functools.lru_cache(maxsize=16)
+def _panel_background(w: int, h: int, page_bg: str, panel_style: str = "") -> Image.Image:
+    """The caption panel's background: page_bg, or a pattern from
+    panel_style ("gradient:#hex", "spiral:#hex", ...). Patterns stay soft
+    so the caption reads over them. Cached — the same panel is drawn for
+    every frame and every preview."""
+    c1 = _hex_to_rgb(page_bg)
+    style, _, color2 = (panel_style or "").partition(":")
+    if not style or w <= 0 or h <= 0:
+        return Image.new("RGBA", (max(1, w), max(1, h)), c1 + (255,))
+    try:
+        c2 = _hex_to_rgb(color2 or "#ffffff")
+    except (ValueError, TypeError):
+        c2 = (255, 255, 255)
+    a1, a2 = np.array(c1, np.float32), np.array(c2, np.float32)
+    if style in ("gradient", "spiral", "vignette"):
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        if style == "gradient":
+            t = yy / max(1, h - 1)
+        elif style == "spiral":
+            dx, dy = xx - w / 2, yy - h / 2
+            r = np.sqrt(dx * dx + dy * dy) / max(w, h)
+            ang = np.arctan2(dy, dx)
+            # Soft-edged stripes winding out from the middle.
+            t = (np.sin(ang * 2 + r * 38) * 0.5 + 0.5) * 0.55
+        else:
+            dx, dy = (xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2)
+            t = np.clip((np.sqrt(dx * dx + dy * dy) - 0.45) / 0.9, 0, 1) ** 1.4
+        rgb = a1 + (a2 - a1) * t[..., None]
+        img = Image.fromarray(rgb.clip(0, 255).astype(np.uint8), "RGB")
+        return img.convert("RGBA")
+    img = Image.new("RGBA", (w, h), c1 + (255,))
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    rng = random.Random(f"{w}x{h}{style}")
+    unit = max(10.0, min(w, h) / 7)
+    cols, rows = int(w / unit) + 2, int(h / unit) + 2
+    for gy in range(rows):
+        for gx in range(cols):
+            cx = (gx + (0.5 if gy % 2 else 0) + rng.uniform(-0.25, 0.25)) * unit
+            cy = (gy + rng.uniform(-0.25, 0.25)) * unit
+            s = unit * rng.uniform(0.35, 0.65)
+            alpha = int(255 * rng.uniform(0.22, 0.45))
+            (_heart if style == "hearts" else _star)(d, cx, cy, s, c2 + (alpha,))
+    img.alpha_composite(layer)
+    return img
+
+
 def build_composite(
     frame: Image.Image,
     text: str,
@@ -2267,6 +2346,7 @@ def build_composite(
     watermark_text_font: str = "Arial",
     frame_index: int = 0,
     _px_scale: float = 1.0,
+    panel_style: str = "",
 ) -> Image.Image:
     if layout == "overlay":
         cap_width = 0
@@ -2343,6 +2423,7 @@ def build_composite(
             upscale_filter=upscale_filter,
             watermark_text=watermark_text, watermark_text_color=watermark_text_color,
             watermark_text_font=watermark_text_font, frame_index=frame_index,
+            panel_style=panel_style,
             **ba_kw,
         )
 
@@ -2378,7 +2459,7 @@ def build_composite(
         has_panel = layout != "overlay" and panel_w > 0 and panel_h > 0
 
         if has_panel:
-            out.paste(Image.new("RGBA", (panel_w, panel_h), _hex_to_rgb(page_bg) + (255,)),
+            out.paste(_panel_background(panel_w, panel_h, page_bg, panel_style),
                       (panel_x, panel_y))
 
         # When shadow is on, accumulate all text into two layers then composite once.
@@ -2543,7 +2624,7 @@ def build_composite(
            json.dumps(header_outline), json.dumps(footer_outline),
            json.dumps(ba_boxes), json.dumps(list(ba_labels)), ba_label_size,
            json.dumps(text_boxes, sort_keys=True) if layout == "overlay" else None,
-           watermark_text, watermark_text_color, watermark_text_font)
+           watermark_text, watermark_text_color, watermark_text_font, panel_style)
     with _OVERLAY_CACHE_LOCK:
         overlay = _OVERLAY_CACHE.get(key)
         if overlay is not None:
@@ -3100,6 +3181,8 @@ class CaptionApp:
 
         # Background and text (shared globally)
         self._page_bg_color = "#f5f5f5"
+        self._panel_style_var = tk.StringVar(value="None")   # see _PANEL_STYLES
+        self._panel_color2 = "#ffffff"
         self._fc_color = "#111111"
         self._stroke_color = "#000000"
         available_fonts = _font_list()
@@ -3533,7 +3616,8 @@ class CaptionApp:
                   self._zoom_var, self._pan_x_var, self._pan_y_var, self._wm_pos_var,
                   self._wm_opacity_var, self._ba_on_var, self._ba_layout_var,
                   self._ba_before_label_var, self._ba_after_label_var,
-                  self._ba_label_size_var, self._story_mode_var, self._wm_text_var):
+                  self._ba_label_size_var, self._story_mode_var, self._wm_text_var,
+                  self._panel_style_var):
             v.trace_add("write", lambda *_: self._safe_refresh())
         self._story_mode_var.trace_add("write", lambda *_: self._update_editor_stats())
         self._watermark_height_var.trace_add("write", lambda *_: self._on_wm_height_write())
@@ -3645,6 +3729,19 @@ class CaptionApp:
         self._bg_btn.pack(side="left")
         ttk.Button(bg_row, text="Pick", width=5,
                    command=lambda: self._start_color_pick("bg")).pack(side="left", padx=(4, 0))
+        r += 1
+
+        ttk.Label(f, text="Pattern:").grid(row=r, column=0, sticky="w", pady=4)
+        pat_row = ttk.Frame(f)
+        pat_row.grid(row=r, column=1, sticky="w", padx=6)
+        tooltip(ttk.Combobox(pat_row, textvariable=self._panel_style_var, width=10,
+                             values=list(_PANEL_STYLES), state="readonly"),
+                "A pattern behind the caption, in the Page BG color and this\n"
+                "second color").pack(side="left")
+        self._bg2_btn = tk.Button(pat_row, bg=self._panel_color2, width=3, relief="groove",
+                                  command=self._pick_bg2)
+        tooltip(self._bg2_btn, "The pattern's second color")
+        self._bg2_btn.pack(side="left", padx=(4, 0))
         r += 1
 
         ttk.Label(f, text="Font:").grid(row=r, column=0, sticky="w", pady=4)
@@ -7995,6 +8092,19 @@ class CaptionApp:
     # Color pickers
     # ------------------------------------------------------------------
 
+    def _panel_style_spec(self) -> str:
+        """The caption panel's pattern for build_composite: "style:#color2",
+        or "" for a plain color."""
+        style = _PANEL_STYLES.get(self._panel_style_var.get(), "")
+        return f"{style}:{self._panel_color2}" if style else ""
+
+    def _pick_bg2(self) -> None:
+        r = colorchooser.askcolor(color=self._panel_color2, title="Pattern Color")
+        if r[1]:
+            self._panel_color2 = r[1]
+            self._bg2_btn.config(bg=r[1])
+            self._safe_refresh()
+
     def _pick_bg(self) -> None:
         r = colorchooser.askcolor(color=self._page_bg_color, title="Page Background Color")
         if r[1]:
@@ -10085,6 +10195,13 @@ class CaptionApp:
             else:
                 base["cap_panel_size"] = self._width_var.get()
             base["page_bg_color"] = self._page_bg_color
+            style = _PANEL_STYLES.get(self._panel_style_var.get(), "")
+            if style:
+                base["panel_style"] = style
+                base["panel_color2"] = self._panel_color2
+            else:
+                base.pop("panel_style", None)
+                base.pop("panel_color2", None)
             base["font_color"] = self._fc_color
             base["stroke_width"] = self._stroke_width_var.get()
             base["stroke_color"] = self._stroke_color
@@ -10175,6 +10292,11 @@ class CaptionApp:
         self._fc_btn.config(bg=fc)
         self._page_bg_color = bg
         self._bg_btn.config(bg=bg)
+        style = data.get("panel_style") or ""
+        self._panel_style_var.set(next((k for k, v in _PANEL_STYLES.items() if v == style),
+                                       "None"))
+        self._panel_color2 = data.get("panel_color2", "#ffffff")
+        self._bg2_btn.config(bg=self._panel_color2)
         self._stroke_color = sc
         self._stroke_btn.config(bg=sc)
 
@@ -10345,6 +10467,7 @@ class CaptionApp:
             scale_overlays=self._scale_overlays_var.get(),
             font_family=self._font_var.get(),
             page_bg=self._page_bg_color,
+            panel_style=self._panel_style_spec(),
             font_color=self._fc_color,
             header_enabled=header_enabled,
         )
