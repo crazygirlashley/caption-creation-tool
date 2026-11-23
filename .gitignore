@@ -68,3 +68,5 @@ comics/
 
 # Source art for tools/build_assets.py (see themes/CREDITS.md)
 tools/theme_art_src/
+# every image/GIF already used for a caption (personal; never reused)
+used_media.csv

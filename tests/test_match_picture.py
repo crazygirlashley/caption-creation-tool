@@ -152,6 +152,27 @@ class NoPictureTalkTests(unittest.TestCase):
                                                                           picture="Hair: red"))
 
 
+class WritingStyleTests(unittest.TestCase):
+    """Stories default to the plain, smutty voice of typical TG captions."""
+
+    def test_default_is_smutty_and_casual(self):
+        self.assertEqual(ai_writer.DEFAULTS["style"], "Smutty & casual")
+        system = ai_writer.build_messages("He took the pill.", 120)[0]["content"]
+        self.assertIn("plain everyday words", system)
+        self.assertIn("no poetic metaphors", system)
+        self.assertNotIn("vivid, immersive", system)
+
+    def test_styles_change_the_voice(self):
+        lit = ai_writer.build_messages("x", 60, style="Literary")[0]["content"]
+        self.assertIn("literary fiction", lit)
+        unknown = ai_writer.build_messages("x", 60, style="nope")[0]["content"]
+        self.assertIn("plain everyday words", unknown)
+
+    def test_edits_keep_the_plain_voice(self):
+        self.assertIn("don't make it fancier", ai_writer.EDIT_SYSTEM_PROMPT)
+        self.assertNotIn("word choice", ai_writer.EDIT_ACTIONS["smooth"][1])
+
+
 class AgeCheckFallbackTests(unittest.TestCase):
     """Picture models that describe instead of answering YES/NO (Moondream
     through Ollama): the description decides, strictly."""

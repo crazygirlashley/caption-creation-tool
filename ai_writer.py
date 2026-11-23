@@ -41,6 +41,8 @@ DEFAULTS = {
     # A model that can see pictures (e.g. Moondream, LLaVA), used only to
     # describe the caption's picture; "" = don't look at the picture.
     "vision_model": "",
+    # How stories read — a key of STYLES.
+    "style": "Smutty & casual",
 }
 
 # label -> approximate word target. Caption panels hold a paragraph or
@@ -52,6 +54,23 @@ LENGTHS = {
     "Very long (~350 words)": 350,
 }
 
+# How the story reads. Captions are read fast, by everyone: the default is
+# the plain, dirty-minded voice typical of TG captions, not literary prose.
+STYLES = {
+    "Smutty & casual": (
+        "Write it like a typical TG caption on DeviantArt or Reddit: plain everyday words "
+        "an average reader uses, short punchy sentences, casual and conversational, a bit "
+        "dirty and teasing. Lean into the smutty side — how her new body looks and feels, how "
+        "turned on and flustered she gets. No fancy vocabulary, no poetic metaphors, no "
+        "flowery or literary prose."),
+    "Steamy romance": (
+        "Write it in a warm, steamy romance-novel voice: emotional, flirty and sensual, in "
+        "easy everyday language — not purple prose."),
+    "Literary": (
+        "Write it as polished literary fiction, with rich imagery and careful word choice."),
+}
+DEFAULT_STYLE = "Smutty & casual"
+
 # The image is the reader's to look at; the story never talks about it.
 NO_PICTURE_TALK = (
     "Never mention or refer to a picture, photo, image, caption or the reader looking at "
@@ -62,9 +81,9 @@ NO_PICTURE_TALK = (
 SYSTEM_PROMPT = (
     "You are a fiction writer for an adult caption-art community that makes "
     "TG (gender transformation) captions: an image paired with a short story "
-    "panel. Turn the user's prompt into a vivid, immersive story told in the "
+    "panel. Turn the user's prompt into a story told in the "
     "point of view and tense the prompt asks for (default: the main "
-    "character's first-person POV). Keep the user's key beats, names and any "
+    "character's first-person POV). {style} Keep the user's key beats, names and any "
     "quoted lines, ending on the line or twist the prompt gives. Aim for about "
     "{words} words. Output only the story text — no title, no preamble, no notes "
     "or disclaimers, no markdown. " + NO_PICTURE_TALK + "\n\n"
@@ -156,9 +175,10 @@ def _unreachable_msg(base_url: str) -> str:
             "model, then check the address under ⚙ Settings → AI Writer.")
 
 
-def build_messages(prompt: str, words: int, picture: str = "") -> list:
+def build_messages(prompt: str, words: int, picture: str = "",
+                   style: str = DEFAULT_STYLE) -> list:
     """`picture` is a description of the caption's image, if there is one,
-    so the story can match who and what is in it."""
+    so the story can match who and what is in it. `style`: a key of STYLES."""
     user = prompt.strip()
     if picture.strip():
         note = ""
@@ -172,7 +192,8 @@ def build_messages(prompt: str, words: int, picture: str = "") -> list:
                 "The notes describe a picture the reader sees beside the story; never "
                 f"mention that picture, or any picture, photo or image.{note}\n\n{user}")
     return [
-        {"role": "system", "content": SYSTEM_PROMPT.format(words=words)},
+        {"role": "system", "content": SYSTEM_PROMPT.format(
+            words=words, style=STYLES.get(style, STYLES[DEFAULT_STYLE]))},
         {"role": "user", "content": user},
     ]
 
@@ -387,7 +408,9 @@ EDIT_SYSTEM_PROMPT = (
     "(gender transformation) captions: an image paired with a short story "
     "panel. Revise the text the user sends as instructed: {instruction} "
     "Unless the instruction says otherwise, keep the point of view, tense, "
-    "names, any quoted dialogue, emoji and the ending line. Output only the revised "
+    "names, any quoted dialogue, emoji and the ending line, and its voice and reading level: "
+    "don't make it fancier, more formal or more literary — plain words stay plain. "
+    "Output only the revised "
     "text — no title, preamble, notes, quotation marks around it, or markdown. "
     + NO_PICTURE_TALK + "\n\n"
     + content_rules.WRITING_RULES.replace("{", "{{").replace("}", "}}")
@@ -396,8 +419,8 @@ EDIT_SYSTEM_PROMPT = (
 # key -> (menu label, instruction; {words} is the target length)
 EDIT_ACTIONS = {
     "smooth": ("Smooth & polish",
-               "Improve the flow, rhythm and word choice and fix awkward phrasing, "
-               "keeping the length about the same (about {words} words)."),
+               "Improve the flow and fix awkward phrasing, keeping the same casual "
+               "voice and the length about the same (about {words} words)."),
     "shorten": ("Shorten to fit",
                 "Condense it to about {words} words, keeping the key story beats, the "
                 "strongest details and the final line."),
@@ -657,7 +680,8 @@ def stream_story(prompt: str, words: int, settings: dict,
     sexual request is refused and a reply that turns sexual is stopped."""
     minor = picture_may_show_minor(picture)
     check_request(prompt, picture, minor_context=minor)
-    yield from no_picture_talk(_guarded(_stream_chat(build_messages(prompt, words, picture),
+    style = settings.get("style") or DEFAULT_STYLE
+    yield from no_picture_talk(_guarded(_stream_chat(build_messages(prompt, words, picture, style),
                                      int(words * 2.5) + 200, settings, cancel,
                                      timeout=timeout), minor_context=minor))
 

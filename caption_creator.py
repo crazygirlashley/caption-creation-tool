@@ -6329,6 +6329,13 @@ class CaptionApp:
         length_var = tk.StringVar(value=getattr(self, "_ai_last_length", "Medium (~120 words)"))
         ttk.Combobox(opts, textvariable=length_var, state="readonly", width=20,
                      values=list(ai_writer.LENGTHS)).pack(side="left", padx=(6, 14))
+        ttk.Label(opts, text="Style:").pack(side="left")
+        style_var = tk.StringVar(value=settings.get("style") or ai_writer.DEFAULT_STYLE)
+        tooltip(ttk.Combobox(opts, textvariable=style_var, state="readonly", width=15,
+                             values=list(ai_writer.STYLES)),
+                "Smutty & casual: plain everyday words, short punchy sentences — how\n"
+                "most TG captions read. Steamy romance: warmer and more emotional.\n"
+                "Literary: polished prose.").pack(side="left", padx=(6, 14))
         mode_var = tk.StringVar(value="replace")
         ttk.Radiobutton(opts, text="Replace caption", value="replace",
                         variable=mode_var).pack(side="left")
@@ -6499,6 +6506,11 @@ class CaptionApp:
                 return
             self._ai_last_prompt = prompt
             self._ai_last_length = length_var.get()
+            if settings.get("style") != style_var.get():
+                settings["style"] = style_var.get()
+                stored = ai_writer.load_settings()
+                stored["style"] = style_var.get()
+                ai_writer.save_settings(stored)
             self._ai_look = look_var.get()
             picture = ""
             if look_var.get() and self._frames:
