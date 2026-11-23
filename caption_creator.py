@@ -9834,6 +9834,7 @@ class CaptionApp:
         results_frame.bind(
             "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         self._wl_results_frame = results_frame
+        self._wl_results_canvas = canvas
 
         search_btn.config(command=lambda: self._wl_run_search(1))
         entry.bind("<Return>", lambda _e: self._wl_run_search(1))
@@ -9905,6 +9906,8 @@ class CaptionApp:
         self._wl_page = page
         for w in self._wl_results_frame.winfo_children():
             w.destroy()
+        # Every new search and every page starts at the top of the results.
+        self._wl_results_canvas.yview_moveto(0.0)
         self._wl_thumbs = []
         self._wl_image_buttons = []
         self._wl_blocks: list = []
