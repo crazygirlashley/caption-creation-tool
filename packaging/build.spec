@@ -52,10 +52,7 @@ datas = [
     # The app's own version, for the "What's new" window.
     (os.path.join(REPO_ROOT, "VERSION"), "."),
 ]
-for fname in ("Standard.json", "Standard (Vertical).json",
-              "X-Change.json", "X-Change (Vertical).json",
-              "Text Message.json", "Text Message (Vertical).json",
-              "Text Boxes.json"):
+for fname in ("Standard.json", "X-Change.json", "Text Message.json", "Text Boxes.json"):
     src = os.path.join(FORMATS_DIR, fname)
     if os.path.isfile(src):
         datas.append((src, "formats"))

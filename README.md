@@ -35,6 +35,8 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 - **Create Animation** — **File → Create Animation…** makes an animation from still pictures, which then opens as your picture, ready for a caption. **Bring one picture to life**: slow zoom in or out (toward the face, if there is one), pan, pulse or shake, optionally playing forwards then back so it loops smoothly. **Change one picture into another**: crossfade, fade through white or black, wipe, slide, pixel dissolve, circle reveal, zoom through, or a **smoke bomb** — colored smoke bursts out, covers the first picture and drifts away to reveal the second (pick any smoke color). Set how long each picture shows, how long the change takes, and whether it changes back so the GIF loops. A live preview plays as you choose; with Before & after on, it starts as a before → after transition. Animations are kept in `animations/` as lossless WebP. Two AI modes:
   - **Describe it — the AI plans it**: write what should happen (*"hold on her, slowly zoom into her face, a jolt, then purple smoke reveals the after picture"*) and **Plan it** — your local AI writer turns it into a numbered list of steps (holds, zooms toward the face or a body part, pans, shakes, pulses, color flashes and any of the transitions, with colors and timings), previewed before you create it. A second picture is optional. Runs on the same local model as the AI writer, so it works on modest PCs
   - **AI video (ComfyUI)**: real AI-generated motion (*"she turns to the camera and smiles"*) from an image-to-video model such as Wan or LTX-Video running in [ComfyUI](https://www.comfy.org). These need an NVIDIA graphics card with roughly 8–24 GB of video memory, so ComfyUI can run on this PC, another PC on your network (start it with `--listen`), or a rented cloud GPU. **Set up…** takes ComfyUI's address and your own workflow exported with **Workflow → Export (API)**; your picture goes into its Load Image node and the description into its prompt (or wherever you put `%image%` / `%prompt%`), seeds are randomized, and width/height can follow your picture's shape. ComfyUI's own error messages (a missing model, an uninstalled node) are shown if it can't run. The finished clip — video, animated WebP/GIF, or frames — opens as your picture. **Allow explicit content** in the AI Video settings (off by default) decides whether videos may be explicit; off, explicit terms go into the workflow's negative prompt so videos stay suggestive. Before a sexual video is made, the picture model checks that everyone in the picture looks 18 or older — it's refused if anyone may be younger, and explicit content is only let through after that check; non-sexual motion is made for anyone
+- **Comic Strip** — **File → Comic Strip…** lays out several pictures as comic panels: in a row, a column, or a grid (choose the columns), all cropped to one panel shape (square, 3:4, 9:16, 4:3, 16:9 or the first picture's). Each panel can have a narration caption (a yellow box inside the top or bottom, or plain text below the panel) and a speech bubble whose tail points at the face it finds (Auto keeps the bubble off the face; or pick a corner). Add a title, change the gaps, borders, colors, font and text size, and reorder panels with ▲▼. GIF and animated WebP panels keep playing, each on its own timing. **Open in Caption Creator** makes it your picture (kept in `comics/`) for a watermark, more text, saving or posting; **Save as…** saves it straight to PNG/JPEG/WebP, or GIF/WebP when animated.
+- **Vertical switch** — one switch under the Format dropdown turns any panel format vertical (caption below the picture instead of beside it); it's remembered between sessions and saved with projects.
 - **Before & after** — in the **Image** tab, pick a second "before" picture to show beside (or above) the one you opened, cropped to the same size, with optional "Before"/"After" labels. The caption, title, tagline and watermark lay out around the pair. A GIF before picture plays frame for frame with the main one (looping if it's shorter)
 - **📖 Long story** — for stories too long to fit beside the image: the caption box keeps the whole story, which goes in the DeviantArt description (and is saved as a `- story.txt` file next to exports), while the image shows the opening, cut at a sentence where it stops fitting at a readable size, ending with "(The story continues in the description ⬇)". **Text on image…** changes that line, or lets you write your own short version — or have the AI write one
 - **Post to** — pick DeviantArt, Reddit or X / Twitter next to the size estimate and exports stay under that site's upload limits (DeviantArt 80 MB; Reddit 20 MB images, 100 MB GIFs; X 5 MB images, 15 MB GIFs, 4096 px). Stills are shrunk automatically when needed (JPEG/WebP quality first, then size); for GIFs, **Fit under…** finds the best settings that fit. Stills can also be saved as **WebP**
@@ -253,7 +255,7 @@ Click **Log Out** to clear the cached token (with a confirmation prompt) if you 
 
 ## Custom Formats
 
-Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the six built-in formats (`Standard`, `X-Change`, `Text Message`, and their `(Vertical)` counterparts) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
+Caption styles are defined as JSON files in the `formats/` folder. Easiest way to make one: pick a format, adjust the settings in the Caption/Header/Footer/Watermark tabs, then click **Save As…** to save it under a new name (or **Save** to overwrite the currently selected format). New formats you create this way are personal — only the built-in formats (`Standard`, `X-Change`, `Text Message`, `Text Boxes`) are tracked in version control by default, so your own formats won't accidentally get pushed/committed.
 
 You can also hand-edit or drop in a `.json` file directly — it'll appear in the Format dropdown automatically (click the **↺** button next to the dropdown to reload without restarting).
 
@@ -270,7 +272,7 @@ Each format file supports the following fields:
 | `bold` | bool | Bold caption text |
 | `padding` | int | Caption text padding in px |
 | `auto_size` | bool | Auto-fit font size to panel height |
-| `layout` | `"horizontal"` / `"vertical"` | Caption panel beside the image (default) or below it |
+| `layout` | `"horizontal"` / `"vertical"` / `"overlay"` | Caption panel beside the image (default) or below it; `"overlay"` is Text Boxes. The **Vertical** switch under the Format dropdown overrides horizontal/vertical for any panel format; a format saved with the switch on is stored as `"vertical"` and turns it on when chosen |
 | `cap_panel_size` | int | Caption panel width (horizontal layout) or height (vertical layout) in px. Ignored if `dynamic_width` is true |
 | `dynamic_width` | bool | Auto-set the caption panel size to 1.25× the source image/GIF/video width, overriding `cap_panel_size`. Locks the Caption Width/Height spinbox in the UI while active |
 | `shadow` | bool | Drop shadow on all overlaid text |
@@ -287,7 +289,7 @@ Each format file supports the following fields:
 | `footer_font` | string | Tagline font |
 | `footer_size` | int | Tagline font size |
 
-See `formats/Standard.json`, `formats/X-Change.json`, `formats/Text Message.json`, and their `(Vertical)` counterparts for examples.
+See `formats/Standard.json`, `formats/X-Change.json` and `formats/Text Message.json` for examples. Older installs had separate `(Vertical)` copies of these; they're hidden automatically when they only differ by orientation (use the Vertical switch instead), and kept if you customised them.
 
 ---
 
@@ -358,6 +360,7 @@ caption-creation-tool/
 ├── caption_creator.py        # Main application
 ├── ai_writer.py              # Local-LLM caption story writer (OpenAI-compatible API)
 ├── animate.py                # Create Animation: still effects, transitions, AI-planned storyboards
+├── comic.py                  # Comic Strip: panel layout, narration boxes, speech bubbles
 ├── comfy_client.py           # AI video through a ComfyUI server (image-to-video workflows)
 ├── content_rules.py          # What the AI features may make (explicit adults yes, minors never)
 ├── da_client.py              # DeviantArt API client (OAuth2 PKCE, Sta.sh upload)
@@ -373,11 +376,9 @@ caption-creation-tool/
 │   └── given_names.txt
 ├── formats/                  # Format definitions (JSON) — add your own here
 │   ├── Standard.json
-│   ├── Standard (Vertical).json
 │   ├── Text Message.json
-│   ├── Text Message (Vertical).json
 │   ├── X-Change.json
-│   └── X-Change (Vertical).json
+│   └── Text Boxes.json
 ├── themes/                   # UI theme definitions (JSON) — add your own here
 │   ├── Basic.json            # Reference only, never loaded
 │   ├── Bimbo.json / Bimbo_kisses.gif

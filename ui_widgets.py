@@ -68,6 +68,66 @@ def tooltip(widget: tk.Widget, text: str) -> tk.Widget:
     return widget
 
 
+class ToggleSwitch(tk.Frame):
+    """An on/off switch (pill and knob) with a label, bound to a BooleanVar.
+    Click it, or focus it and press Space. Colors come from the ttk theme
+    each time it's drawn, so it follows theme switches."""
+
+    W, H = 34, 18
+
+    def __init__(self, master: tk.Widget, text: str, variable: tk.BooleanVar,
+                 bg: Optional[str] = None) -> None:
+        bg = bg or master.cget("bg")
+        super().__init__(master, bg=bg)
+        self.var = variable
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H, bg=bg,
+                                highlightthickness=0, cursor="hand2", takefocus=True)
+        self.canvas.pack(side="left")
+        self.label = ttk.Label(self, text=text, cursor="hand2")
+        self.label.pack(side="left", padx=(5, 0))
+        for w in (self.canvas, self.label):
+            w.bind("<Button-1>", self._toggle)
+        self.canvas.bind("<space>", self._toggle)
+        self._trace = variable.trace_add("write", lambda *_: self.draw())
+        self.bind("<Destroy>", self._untrace, add="+")
+        self.draw()
+
+    def _untrace(self, event) -> None:
+        if event.widget is self:
+            try:
+                self.var.trace_remove("write", self._trace)
+            except tk.TclError:
+                pass
+
+    def _toggle(self, _event=None) -> str:
+        self.var.set(not self.var.get())
+        return "break"
+
+    def set_bg(self, bg: str) -> None:
+        self.configure(bg=bg)
+        self.canvas.configure(bg=bg)
+        self.draw()
+
+    def draw(self) -> None:
+        c = self.canvas
+        try:
+            on = bool(self.var.get())
+        except tk.TclError:
+            on = False
+        style = ttk.Style(self)
+        on_fill = style.lookup("Accent.TButton", "background") or "#d0459a"
+        off_fill = style.lookup("TButton", "bordercolor") or "#888888"
+        knob = "#ffffff"
+        c.delete("all")
+        w, h, r = self.W, self.H, self.H // 2
+        fill = on_fill if on else off_fill
+        c.create_oval(0, 0, h, h, fill=fill, outline=fill)
+        c.create_oval(w - h, 0, w, h, fill=fill, outline=fill)
+        c.create_rectangle(r, 0, w - r, h, fill=fill, outline=fill)
+        x = w - r if on else r
+        c.create_oval(x - r + 3, 3, x + r - 3, h - 3, fill=knob, outline=knob)
+
+
 class Placeholder:
     """Grey hint text shown over an empty tk.Text (e.g. "Start writing…")."""
 

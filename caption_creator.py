@@ -37,12 +37,13 @@ except ImportError:  # pragma: no cover
 import ai_writer
 import animate
 import comfy_client
+import comic
 import content_rules
 import da_client
 import recent_store
 import spellcheck
 import wallpaper
-from ui_widgets import Placeholder, tooltip
+from ui_widgets import Placeholder, ToggleSwitch, tooltip
 import themes
 import web_lookup
 from app_paths import BASE_DIR, RESOURCE_DIR
@@ -183,8 +184,7 @@ _FORMATS_DIR = os.path.join(BASE_DIR, "formats")
 
 # Formats shipped with the app — overwriting one of these locally is fine,
 # but only these are pushed/committed to the repo by default.
-_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Standard (Vertical)", "X-Change (Vertical)",
-                      "Text Message", "Text Message (Vertical)", "Text Boxes"}
+_CORE_FORMAT_NAMES = {"Standard", "X-Change", "Text Message", "Text Boxes"}
 # Built-in formats added after the first release: copied into an existing
 # install's formats/ once (so deleting one later sticks).
 _LATER_CORE_FORMATS = ("Text Boxes",)
@@ -227,6 +227,13 @@ _WHATS_NEW = {
              "as long"),
             ("Smarter Fit under…", "when a GIF still won't fit, offers to drop frames or "
              "shorten it"),
+        ]),
+        ("Comics & layout", [
+            ("Comic Strip", "File → Comic Strip lays out several pictures as comic panels — "
+             "in a row, a column or a grid — with narration boxes, speech bubbles that point "
+             "at faces, and a title. GIF panels keep playing"),
+            ("Vertical switch", "one switch under the format turns any format vertical "
+             "(caption below the picture) — no more separate (Vertical) formats"),
         ]),
         ("Text Boxes", [
             ("Snapping guides", "boxes line up with the picture's center and edges and with "
@@ -332,7 +339,34 @@ def _load_formats() -> dict:
             result[name] = data
         except Exception:
             log.warning("FORMAT_LOAD_ERROR  %s", fname)
-    return result
+    return _merge_vertical_twins(result)
+
+
+_VERTICAL_SUFFIX = " (Vertical)"
+
+
+def _vertical_twin_base(name: str, formats: dict) -> Optional[str]:
+    """"Standard (Vertical)" -> "Standard" when that format exists: older
+    versions kept a separate vertical copy of each format, which is now the
+    Vertical switch on the plain one."""
+    if name.endswith(_VERTICAL_SUFFIX):
+        base = name[:-len(_VERTICAL_SUFFIX)]
+        if base in formats:
+            return base
+    return None
+
+
+def _merge_vertical_twins(formats: dict) -> dict:
+    """Hide "X (Vertical)" formats that are just X turned vertical (nothing
+    else changed); ones with their own colors or text stay listed."""
+    out = {}
+    for name, data in formats.items():
+        base = _vertical_twin_base(name, formats)
+        if (base and data.get("layout") == "vertical"
+                and not _format_differs(formats[base], dict(data, layout=formats[base].get("layout")))):
+            continue
+        out[name] = data
+    return out
 
 
 @functools.lru_cache(maxsize=None)
@@ -503,7 +537,16 @@ _FORMAT_PER_CAPTION_KEYS = ("header_text", "footer_text", "name")
 
 
 def _format_differs(stored: dict, snapshot: dict) -> bool:
-    keys = (set(stored) | set(snapshot)) - set(_FORMAT_PER_CAPTION_KEYS)
+    """Whether two format dicts differ in anything but per-caption text and
+    orientation (the Vertical switch); cap_panel_size only counts when the
+    panel isn't sized dynamically."""
+    if (stored.get("layout") == "overlay") != (snapshot.get("layout") == "overlay"):
+        return True
+    ignore = set(_FORMAT_PER_CAPTION_KEYS) | {"layout"}
+    if (stored.get("dynamic_width", _FORMAT_DEFAULTS["dynamic_width"])
+            and snapshot.get("dynamic_width", _FORMAT_DEFAULTS["dynamic_width"])):
+        ignore.add("cap_panel_size")
+    keys = (set(stored) | set(snapshot)) - ignore
     return any(stored.get(k, _FORMAT_DEFAULTS.get(k)) != snapshot.get(k, _FORMAT_DEFAULTS.get(k))
                for k in keys)
 
@@ -3105,6 +3148,10 @@ class CaptionApp:
         default_fmt = "Standard" if "Standard" in self._formats else (
             next(iter(self._formats), "Standard"))
         self._format_var = tk.StringVar(value=default_fmt)
+        # Caption below the picture (tall) instead of beside it — a switch
+        # on top of any panel format, remembered between sessions.
+        self._vertical_var = tk.BooleanVar(
+            value=bool(recent_store.get_setting("vertical", False)))
 
         # Header
         self._header_font_var = tk.StringVar(value="Arial")
@@ -3414,6 +3461,20 @@ class CaptionApp:
         tooltip(fmt_save, "Save these settings into this format, or as a new one").pack(
             side="right", padx=(0, 2))
 
+        # Vertical switch: any panel format with the caption below the
+        # picture instead of beside it (hidden for Text Boxes — no panel).
+        self._orient_row = tk.Frame(right, bg=right.cget("bg"))
+        self._orient_row.pack(fill="x", padx=8, pady=(0, 4), after=fmt_bar)
+        self._vertical_switch = ToggleSwitch(self._orient_row, "Vertical",
+                                             self._vertical_var, bg=right.cget("bg"))
+        self._vertical_switch.pack(side="left")
+        tooltip(self._vertical_switch.canvas,
+                "On: the caption goes below the picture (tall). "
+                "Off: beside it (wide)")
+        tooltip(self._vertical_switch.label,
+                "On: the caption goes below the picture (tall). "
+                "Off: beside it (wide)")
+
         # Pill preset bar — shown only for X-Change
         self._pill_frame = tk.Frame(right, bg=right.cget("bg"))
         ttk.Label(self._pill_frame, text="Pill:").pack(side="left", padx=(8, 4))
@@ -3490,6 +3551,7 @@ class CaptionApp:
         self._gif_colors_var.trace_add(
             "write", lambda *_: self._gif_colors_label.config(text=f"{self._gif_colors_var.get()} colors"))
         self._format_var.trace_add("write", lambda *_: self._on_format_change())
+        self._vertical_var.trace_add("write", lambda *_: self._on_orientation_change())
 
     def _setup_font_autocomplete(self, combo: ttk.Combobox) -> None:
         """Let the user type into a font Combobox, narrowing the dropdown to
@@ -4770,6 +4832,34 @@ class CaptionApp:
     def _overlay_mode(self) -> bool:
         return self._formats.get(self._format_var.get(), {}).get("layout") == "overlay"
 
+    def _layout(self) -> str:
+        """The layout in use: "overlay" for Text Boxes, else the Vertical
+        switch decides between "vertical" and "horizontal"."""
+        if self._overlay_mode():
+            return "overlay"
+        return "vertical" if self._vertical_var.get() else "horizontal"
+
+    def _update_orientation_ui(self) -> None:
+        """Labels and controls that depend on the panel being beside or below
+        the picture; the switch itself hides for Text Boxes (no panel)."""
+        if self._overlay_mode():
+            self._orient_row.pack_forget()
+        elif not self._orient_row.winfo_ismapped():
+            self._orient_row.pack(fill="x", padx=8, pady=(0, 4), after=self._fmt_bar)
+        if self._layout() == "vertical":
+            self._cap_size_label.config(text="Caption Height:")
+            self._dynamic_width_check.config(text="Dynamic Height (1.25× image height)")
+        else:
+            self._cap_size_label.config(text="Caption Width:")
+            self._dynamic_width_check.config(text="Dynamic Width (1.25× image width)")
+        self._update_side_visibility()
+
+    def _on_orientation_change(self) -> None:
+        recent_store.set_setting("vertical", bool(self._vertical_var.get()))
+        self._update_orientation_ui()
+        self._apply_dynamic_width()
+        self._safe_refresh()
+
     def _update_overlay_mode(self) -> None:
         """Text Boxes format: swap the Caption tab for the Text tab, and
         start with the format's boxes (the caption becomes the first one's
@@ -5215,7 +5305,7 @@ class CaptionApp:
         if self._ba_on_var.get() and self._before_path:
             fw, fh = _ba_frame_size(fw, fh, "stacked" if self._ba_layout_var.get() == "Stacked"
                                     else "side")
-        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        layout = self._layout()
         try:
             cap = int(self._width_var.get())
             pct = float(self._output_pct_var.get())
@@ -5359,7 +5449,7 @@ class CaptionApp:
         if self._ba_on_var.get() and self._before_path:
             cw, ch = _ba_frame_size(fw, fh, "stacked" if self._ba_layout_var.get() == "Stacked"
                                     else "side")
-        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        layout = self._layout()
         k_disp = (disp.width if layout == "vertical" else disp.height * cw / ch) / cw
         shown_w, shown_h = fw * k_disp, fh * k_disp
         k = max(0.01, zoom - 1)
@@ -6311,6 +6401,8 @@ class CaptionApp:
         colors = themes.classic_colors(name)
         self._right_frame.configure(bg=colors["bg"])
         self._fmt_bar.configure(bg=colors["bg"])
+        self._orient_row.configure(bg=colors["bg"])
+        self._vertical_switch.set_bg(colors["bg"])
         self._pill_frame.configure(bg=colors["bg"])
         for box in (self._text_box, self._header_text_box, self._footer_text_box,
                     self._editor_box):
@@ -6962,6 +7054,561 @@ class CaptionApp:
             var.trace_add("write", _schedule)
         win.protocol("WM_DELETE_WINDOW", _close)
         _layout()
+
+    # Comic strip builder (comic.py): pictures as panels with narration
+    # captions and speech bubbles. Results go in comics/ (gitignored) and
+    # open as the current picture, like Create Animation's.
+    _COMIC_DIR = os.path.join(BASE_DIR, "comics")
+    _COMIC_OPT_KEYS = ("layout", "columns", "shape", "panel_width", "gutter", "border",
+                       "border_color", "page_bg", "caption_bg", "caption_place", "text_scale",
+                       "font", "faces")
+
+    def _comic_dialog(self) -> None:
+        if getattr(self, "_comic_win", None) is not None and self._comic_win.winfo_exists():
+            self._comic_win.lift()
+            return
+        saved = dict(recent_store.get_setting("comic", {}) or {})
+        opts = {k: saved.get(k, comic.DEFAULTS.get(k)) for k in self._COMIC_OPT_KEYS}
+        opts["font"] = opts.get("font") or "Arial"
+        opts["faces"] = True if opts.get("faces") is None else bool(opts["faces"])
+        # Panels survive closing the window for the rest of the session.
+        panels = getattr(self, "_comic_panels", None)
+        if panels is None:
+            panels = []
+            if self._frames and getattr(self, "_source_path", None) and not self._is_video:
+                panels.append(self._comic_new_panel(self._source_path))
+        self._comic_panels = panels
+        title_text = getattr(self, "_comic_title", "")
+
+        win = tk.Toplevel(self.root)
+        self._comic_win = win
+        win.title("Comic Strip")
+        win.transient(self.root)
+        win.minsize(980, 620)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsw")
+        right = ttk.Frame(body)
+        right.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+
+        # Panels: a scrolling list, one row per picture.
+        top = ttk.Frame(left)
+        top.pack(fill="x")
+        ttk.Label(top, text="Panels", style="Heading.TLabel").pack(side="left")
+        pan_box = ttk.Frame(left, relief="solid", borderwidth=1)
+        pan_box.pack(fill="both", expand=True, pady=(4, 0))
+        canvas = tk.Canvas(pan_box, width=470, height=330, highlightthickness=0,
+                           bg=themes.classic_colors(self._theme_name)["bg"])
+        vsb = ttk.Scrollbar(pan_box, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        rows_frame = ttk.Frame(canvas, padding=4)
+        canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+        rows_frame.bind("<Configure>",
+                        lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta // 120, "units"))
+        thumbs: dict = {}
+        state = {"gen": 0, "job": None, "play": None, "imgs": [], "durs": [], "i": 0,
+                 "busy": False}
+
+        def _thumb(path: str):
+            if path not in thumbs:
+                try:
+                    with Image.open(path) as im:
+                        im.seek(0)
+                        t = im.convert("RGB")
+                    t.thumbnail((64, 64), Image.LANCZOS)
+                    thumbs[path] = ImageTk.PhotoImage(t)
+                except OSError:
+                    thumbs[path] = None
+            return thumbs[path]
+
+        def _move(i: int, d: int) -> None:
+            j = i + d
+            if 0 <= j < len(panels):
+                _pull_text()
+                panels[i], panels[j] = panels[j], panels[i]
+                _rebuild_rows()
+                _schedule()
+
+        def _remove(i: int) -> None:
+            _pull_text()
+            del panels[i]
+            _rebuild_rows()
+            _schedule()
+
+        row_widgets: list = []
+
+        def _pull_text() -> None:
+            """Copy the row editors back into the panels."""
+            for p, (cap, says, place) in zip(panels, row_widgets):
+                p["caption"] = cap.get("1.0", "end-1c")
+                p["bubble"] = says.get()
+                p["bubble_place"] = place.get()
+
+        def _rebuild_rows() -> None:
+            for w in rows_frame.winfo_children():
+                w.destroy()
+            row_widgets.clear()
+            if not panels:
+                ttk.Label(rows_frame, style="Muted.TLabel", justify="left",
+                          text="Add pictures to make panels — they're shown left to right,\n"
+                               "top to bottom, in this order.").pack(anchor="w", pady=20,
+                                                                      padx=8)
+            for i, p in enumerate(panels):
+                row = ttk.Frame(rows_frame, padding=(0, 4))
+                row.pack(fill="x")
+                img = _thumb(p["path"])
+                tk.Label(row, image=img, text="" if img else "?", width=64, height=64,
+                         bg="#777777").grid(row=0, column=0, rowspan=3, sticky="n")
+                ttk.Label(row, text=f"{i + 1}. {os.path.basename(p['path'])[:34]}",
+                          style="Muted.TLabel").grid(row=0, column=1, columnspan=3,
+                                                     sticky="w", padx=6)
+                cap = tk.Text(row, width=34, height=2, wrap="word", relief="solid", bd=1,
+                              padx=3, pady=2, undo=True)
+                cap.insert("1.0", p.get("caption", ""))
+                cap.grid(row=1, column=1, columnspan=3, sticky="we", padx=6, pady=(2, 2))
+                Placeholder(cap, "Caption (narration box)")
+                says = ttk.Entry(row, width=24)
+                says.insert(0, p.get("bubble", ""))
+                says.grid(row=2, column=1, sticky="we", padx=(6, 2))
+                tooltip(says, "What they say — a speech bubble. Leave empty for none.")
+                place = ttk.Combobox(row, values=list(comic.BUBBLE_PLACES), width=11,
+                                     state="readonly")
+                place.set(p.get("bubble_place") or "Auto")
+                place.grid(row=2, column=2, sticky="w")
+                tooltip(place, "Where the speech bubble goes. Auto keeps it off the face.")
+                btns = ttk.Frame(row)
+                btns.grid(row=0, column=4, rowspan=3, sticky="ne", padx=(4, 0))
+                for txt, tip, cmd in (("▲", "Move earlier", lambda i=i: _move(i, -1)),
+                                      ("▼", "Move later", lambda i=i: _move(i, 1)),
+                                      ("✕", "Remove this panel", lambda i=i: _remove(i))):
+                    tooltip(ttk.Button(btns, text=txt, width=2, style="Small.TButton",
+                                       command=cmd), tip).pack(pady=1)
+                for w in (cap, says):
+                    w.bind("<KeyRelease>", lambda _e: _schedule(), add="+")
+                place.bind("<<ComboboxSelected>>", lambda _e: _schedule())
+                row_widgets.append((cap, says, place))
+            count.config(text=f"{len(panels)} panel{'s' if len(panels) != 1 else ''}")
+
+        def _add_files() -> None:
+            paths = filedialog.askopenfilenames(
+                parent=win, title="Choose pictures for the panels",
+                filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
+                           ("All files", "*.*")])
+            if paths:
+                _pull_text()
+                panels.extend(self._comic_new_panel(p) for p in paths)
+                _rebuild_rows()
+                _schedule()
+
+        def _add_current() -> None:
+            path = getattr(self, "_source_path", None)
+            if not (self._frames and path) or self._is_video:
+                messagebox.showinfo("Comic Strip", "Open a picture or GIF first (videos "
+                                    "can't be panels).", parent=win)
+                return
+            _pull_text()
+            panels.append(self._comic_new_panel(path))
+            _rebuild_rows()
+            _schedule()
+
+        add_row = ttk.Frame(left)
+        add_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(add_row, text="＋ Add pictures…", command=_add_files).pack(side="left")
+        tooltip(ttk.Button(add_row, text="Add the open picture", style="Small.TButton",
+                           command=_add_current),
+                "The picture that's open in Caption Creator").pack(side="left", padx=(6, 0))
+        count = ttk.Label(add_row, style="Muted.TLabel")
+        count.pack(side="right")
+
+        # Look of the strip.
+        look = ttk.LabelFrame(left, text="Layout & style", padding=8)
+        look.pack(fill="x", pady=(10, 0))
+        v = {
+            "layout": tk.StringVar(value=opts["layout"] if opts["layout"] in comic.LAYOUTS
+                                   else "Row"),
+            "columns": tk.IntVar(value=int(opts["columns"] or 2)),
+            "shape": tk.StringVar(value=opts["shape"] if opts["shape"] in comic.SHAPES
+                                  else "Portrait 3:4"),
+            "panel_width": tk.IntVar(value=int(opts["panel_width"] or 480)),
+            "gutter": tk.IntVar(value=int(opts["gutter"])),
+            "border": tk.IntVar(value=int(opts["border"])),
+            "caption_place": tk.StringVar(value=opts["caption_place"]
+                                          if opts["caption_place"] in comic.CAPTION_PLACES
+                                          else "Inside, top"),
+            "text_scale": tk.DoubleVar(value=float(opts["text_scale"] or 1.0)),
+            "font": tk.StringVar(value=opts["font"]),
+            "faces": tk.BooleanVar(value=opts["faces"]),
+        }
+        colors = {k: opts[k] for k in ("page_bg", "border_color", "caption_bg")}
+        title_var = tk.StringVar(value=title_text)
+
+        r0 = ttk.Frame(look)
+        r0.pack(fill="x", pady=2)
+        ttk.Label(r0, text="Title:").pack(side="left")
+        tooltip(ttk.Entry(r0, textvariable=title_var, width=40),
+                "Across the top of the strip — leave empty for none").pack(
+            side="left", padx=(6, 0), fill="x", expand=True)
+        r1 = ttk.Frame(look)
+        r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="Panels:").pack(side="left")
+        layout_box = ttk.Combobox(r1, textvariable=v["layout"], values=list(comic.LAYOUTS),
+                                  width=8, state="readonly")
+        layout_box.pack(side="left", padx=(6, 4))
+        cols_lbl = ttk.Label(r1, text="columns:")
+        cols_spin = ttk.Spinbox(r1, from_=1, to=6, width=3, textvariable=v["columns"])
+        ttk.Label(r1, text="Shape:").pack(side="left", padx=(10, 0))
+        ttk.Combobox(r1, textvariable=v["shape"], values=list(comic.SHAPES), width=19,
+                     state="readonly").pack(side="left", padx=(6, 0))
+        r2 = ttk.Frame(look)
+        r2.pack(fill="x", pady=2)
+        ttk.Label(r2, text="Panel width:").pack(side="left")
+        ttk.Spinbox(r2, from_=160, to=1600, increment=20, width=5,
+                    textvariable=v["panel_width"]).pack(side="left", padx=(6, 2))
+        ttk.Label(r2, text="px   Gap:").pack(side="left")
+        ttk.Spinbox(r2, from_=0, to=80, width=3, textvariable=v["gutter"]).pack(
+            side="left", padx=(6, 2))
+        ttk.Label(r2, text="Border:").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(r2, from_=0, to=20, width=3, textvariable=v["border"]).pack(
+            side="left", padx=(6, 2))
+        r3 = ttk.Frame(look)
+        r3.pack(fill="x", pady=2)
+        ttk.Label(r3, text="Captions:").pack(side="left")
+        ttk.Combobox(r3, textvariable=v["caption_place"], values=list(comic.CAPTION_PLACES),
+                     width=15, state="readonly").pack(side="left", padx=(6, 0))
+        ttk.Label(r3, text="Font:").pack(side="left", padx=(10, 0))
+        font_box = ttk.Combobox(r3, textvariable=v["font"], values=_font_list(), width=16)
+        font_box.pack(side="left", padx=(6, 0))
+        font_box.bind("<<ComboboxSelected>>", lambda _e: _schedule())
+        font_box.bind("<Return>", lambda _e: _schedule())
+        r4 = ttk.Frame(look)
+        r4.pack(fill="x", pady=2)
+        ttk.Label(r4, text="Text size:").pack(side="left")
+        ttk.Scale(r4, from_=0.5, to=2.0, variable=v["text_scale"], length=110).pack(
+            side="left", padx=(6, 10))
+        color_btns = {}
+
+        def _pick(key: str, title: str) -> None:
+            picked = colorchooser.askcolor(color=colors[key], title=title, parent=win)[1]
+            if picked:
+                colors[key] = picked
+                color_btns[key].config(bg=picked, activebackground=picked)
+                _schedule()
+        for key, label in (("page_bg", "Page"), ("border_color", "Lines"),
+                           ("caption_bg", "Caption box")):
+            ttk.Label(r4, text=label + ":").pack(side="left", padx=(4, 2))
+            color_btns[key] = tk.Button(r4, width=2, relief="groove", bg=colors[key],
+                                        activebackground=colors[key],
+                                        command=lambda k=key, t=label: _pick(k, t + " color"))
+            color_btns[key].pack(side="left")
+        tooltip(ttk.Checkbutton(look, text="Find faces: keep them in frame and point "
+                                           "bubbles at them", variable=v["faces"]),
+                "Crops each panel around the face and aims the speech bubble's\n"
+                "tail at it.").pack(anchor="w", pady=(4, 0))
+
+        # Preview on the right.
+        accent = themes.accent(self._theme_name)
+        holder = tk.Frame(right, width=520, height=520, bg=accent["canvas"])
+        holder.pack_propagate(False)   # a big preview mustn't grow the window
+        holder.pack(fill="both", expand=True)
+        preview = tk.Label(holder, bg=accent["canvas"], fg=accent["canvas_fg"])
+        preview.pack(fill="both", expand=True)
+        info = ttk.Label(right, style="Muted.TLabel", text="")
+        info.pack(anchor="w", pady=(6, 0))
+
+        def _options() -> dict:
+            o = {}
+            for k, var in v.items():
+                try:
+                    o[k] = var.get()
+                except (tk.TclError, ValueError):
+                    o[k] = opts[k]
+            o.update(colors)
+            o["columns"] = max(1, min(6, int(o["columns"])))
+            o["panel_width"] = max(160, min(1600, int(o["panel_width"])))
+            o["gutter"] = max(0, min(80, int(o["gutter"])))
+            o["border"] = max(0, min(20, int(o["border"])))
+            return o
+
+        def _layout_ui(*_a) -> None:
+            if v["layout"].get() == "Grid":
+                cols_lbl.pack(side="left", after=layout_box)
+                cols_spin.pack(side="left", padx=(4, 0), after=cols_lbl)
+            else:
+                cols_lbl.pack_forget()
+                cols_spin.pack_forget()
+
+        def _schedule(*_a) -> None:
+            if state["job"]:
+                win.after_cancel(state["job"])
+            state["job"] = win.after(400, _make_preview)
+
+        def _stop_play() -> None:
+            if state["play"]:
+                win.after_cancel(state["play"])
+                state["play"] = None
+
+        def _play() -> None:
+            state["play"] = None
+            if not win.winfo_exists() or not state["imgs"]:
+                return
+            i = state["i"] % len(state["imgs"])
+            preview.config(image=state["imgs"][i])
+            state["i"] = i + 1
+            if len(state["imgs"]) > 1:
+                state["play"] = win.after(max(20, state["durs"][i]), _play)
+
+        def _job(o: dict, preview_w: Optional[int] = None) -> tuple:
+            """(panels, sequences, options, font loader) for comic.render."""
+            _pull_text()
+            snap = [dict(p) for p in panels]
+            ro = dict(o, title=title_var.get().strip())
+            family = ro.pop("font")
+            faces_on = ro.pop("faces")
+            if preview_w:
+                # Same layout at preview scale: shrink the panels and gaps.
+                cols, _rows = comic.grid_shape(len(snap), ro["layout"], ro["columns"])
+                full_w = cols * (ro["panel_width"] + 2 * ro["border"]) + (cols + 1) * ro["gutter"]
+                k = min(1.0, preview_w / max(1, full_w))
+                ro["panel_width"] = max(60, int(ro["panel_width"] * k))
+                ro["gutter"] = int(round(ro["gutter"] * k))
+                ro["border"] = max(1 if ro["border"] else 0, int(round(ro["border"] * k)))
+
+            def fonts(size: int, bold: bool = False):
+                return _pil_font(family, max(6, int(size)), bold)
+            return snap, faces_on, ro, fonts
+
+        def _sequences(snap: list, faces_on: bool, max_side: int) -> list:
+            seqs = []
+            for p in snap:
+                seq = comic.load_panel_frames(p["path"], max_side)
+                seqs.append(seq)
+                p.pop("face", None)
+                p.pop("focus", None)
+                if faces_on:
+                    found = self._comic_face(p["path"])
+                    if found:
+                        iw, ih = seq[0][0].size
+                        x0, y0, x1, y1 = found
+                        p["face"] = (x0 * iw, y0 * ih, x1 * iw, y1 * ih)
+                        p["focus"] = ((x0 + x1) / 2, (y0 + y1) / 2)
+            return seqs
+
+        def _make_preview() -> None:
+            state["job"] = None
+            if not win.winfo_exists():
+                return
+            if not panels:
+                _stop_play()
+                state["imgs"] = []
+                preview.config(image="", text="Add pictures to see\nyour comic strip here")
+                info.config(text="")
+                save_btn.config(state="disabled")
+                open_btn.config(state="disabled")
+                return
+            save_btn.config(state="normal")
+            open_btn.config(state="normal")
+            o = _options()
+            pw = max(300, holder.winfo_width() - 10)
+            ph = max(240, holder.winfo_height() - 10)
+            snap, faces_on, ro, fonts = _job(o, preview_w=pw)
+            full = _job(o)[2]
+            state["gen"] += 1
+            gen = state["gen"]
+            info.config(text="Drawing…")
+
+            def _work() -> None:
+                try:
+                    seqs = _sequences(snap, faces_on, 700)
+                    frames, durs = comic.render(snap, seqs, ro, fonts)
+                    geo = comic.layout_geometry(snap, dict(comic.DEFAULTS, **full), fonts,
+                                                seqs[0][0][0].size)
+                    for f in frames:
+                        f.thumbnail((pw, ph), Image.LANCZOS)
+                    err = None
+                except Exception as e:
+                    log.exception("COMIC_PREVIEW_ERROR")
+                    frames, durs, geo, err = [], [], None, str(e)
+                self.root.after(0, lambda: _show(gen, frames, durs, geo, err))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _show(gen: int, frames: list, durs: list, geo, err) -> None:
+            if gen != state["gen"] or not win.winfo_exists():
+                return
+            if err:
+                info.config(text=f"Couldn't draw it: {err}")
+                return
+            imgs = [ImageTk.PhotoImage(f) for f in frames]
+            preview.config(image=imgs[0], text="")
+            state.update(imgs=imgs, durs=durs, i=0)
+            w, h = geo["size"]
+            kind = (f"animated, {len(frames)} frames, {sum(durs) / 1000:.1f}s"
+                    if len(frames) > 1 else "still")
+            info.config(text=f"{w}×{h} px · {kind}")
+            _stop_play()
+            _play()
+
+        def _render_full(progress) -> tuple:
+            snap, faces_on, ro, fonts = _job(_options())
+            seqs = _sequences(snap, faces_on, 1600)
+            return comic.render(snap, seqs, ro, fonts, progress)
+
+        def _remember() -> None:
+            o = _options()
+            recent_store.set_setting("comic", {k: o[k] for k in self._COMIC_OPT_KEYS})
+            self._comic_title = title_var.get()
+
+        def _run(to_path: Optional[str]) -> None:
+            """Make the full-size strip off the Tk thread; save it to to_path,
+            or into comics/ and open it as the picture."""
+            if state["busy"] or not panels:
+                return
+            state["busy"] = True
+            _remember()
+            for b in (save_btn, open_btn):
+                b.config(state="disabled")
+
+            def _progress(text: str) -> None:
+                self.root.after(0, lambda: info.config(text=text)
+                                if win.winfo_exists() else None)
+
+            def _work() -> None:
+                path, err = to_path, None
+                try:
+                    frames, durs = _render_full(_progress)
+                    _progress("Saving…")
+                    if path is None:
+                        stem = _safe_filename(title_var.get().strip() or "Comic strip")[:100]
+                        ext = ".webp" if len(frames) > 1 else ".png"
+                        os.makedirs(self._COMIC_DIR, exist_ok=True)
+                        path = os.path.join(self._COMIC_DIR, stem + ext)
+                        n = 2
+                        while os.path.exists(path):
+                            path = os.path.join(self._COMIC_DIR, f"{stem} ({n}){ext}")
+                            n += 1
+                    self._comic_save(path, frames, durs)
+                    log.info("COMIC_SAVED  %s  panels=%d frames=%d", os.path.basename(path),
+                             len(panels), len(frames))
+                except Exception as e:
+                    log.exception("COMIC_ERROR")
+                    err = f"Couldn't make the comic strip: {e}"
+                self.root.after(0, lambda: _done(path, err, to_path is None))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _done(path: Optional[str], err: Optional[str], open_it: bool) -> None:
+            state["busy"] = False
+            if win.winfo_exists():
+                for b in (save_btn, open_btn):
+                    b.config(state="normal")
+            if err:
+                messagebox.showerror("Comic Strip", err,
+                                     parent=win if win.winfo_exists() else self.root)
+                return
+            if open_it:
+                _close()
+                self._load_source(path, generated=True)
+                self._status.config(text=self._status.cget("text") + "  •  comic strip")
+            elif win.winfo_exists():
+                info.config(text=f"Saved {os.path.basename(path)}")
+
+        def _save_as() -> None:
+            _pull_text()
+            animated = any(self._comic_is_animated(p["path"]) for p in panels)
+            types = ([("GIF", "*.gif"), ("Animated WebP", "*.webp")] if animated else
+                     [("PNG", "*.png"), ("JPEG", "*.jpg"), ("WebP", "*.webp")])
+            path = filedialog.asksaveasfilename(
+                parent=win, title="Save the comic strip", filetypes=types,
+                defaultextension=types[0][1][1:],
+                initialfile=_safe_filename(title_var.get().strip() or "Comic strip"))
+            if path:
+                _run(path)
+
+        def _close() -> None:
+            _pull_text()
+            _remember()
+            state["gen"] += 1
+            _stop_play()
+            if state["job"]:
+                win.after_cancel(state["job"])
+            self._comic_win = None
+            win.destroy()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=1, column=0, columnspan=2, sticky="we", pady=(12, 0))
+        ttk.Label(btns, style="Muted.TLabel", wraplength=520, justify="left",
+                  text="Open in Caption Creator to add a title, watermark or more text, "
+                       "and to save or post it as usual.").pack(side="left")
+        ttk.Button(btns, text="Close", command=_close).pack(side="right")
+        save_btn = ttk.Button(btns, text="Save as…", command=_save_as)
+        save_btn.pack(side="right", padx=(0, 6))
+        open_btn = ttk.Button(btns, text="Open in Caption Creator", style="Accent.TButton",
+                              command=lambda: _run(None))
+        open_btn.pack(side="right", padx=(0, 6))
+
+        for var in v.values():
+            var.trace_add("write", _schedule)
+        title_var.trace_add("write", _schedule)
+        v["layout"].trace_add("write", _layout_ui)
+        holder.bind("<Configure>", lambda _e: _schedule())
+        win.protocol("WM_DELETE_WINDOW", _close)
+        _layout_ui()
+        _rebuild_rows()
+        _schedule()
+
+    @staticmethod
+    def _comic_new_panel(path: str) -> dict:
+        return {"path": path, "caption": "", "bubble": "", "bubble_place": "Auto"}
+
+    def _comic_face(self, path: str) -> Optional[tuple]:
+        """The largest face in a picture's first frame, as fractions
+        (remembered per file for the session)."""
+        cache = self.__dict__.setdefault("_comic_faces", {})
+        if path not in cache:
+            cache[path] = self._comic_find_face(path)
+        return cache[path]
+
+    @staticmethod
+    def _comic_find_face(path: str) -> Optional[tuple]:
+        try:
+            with Image.open(path) as im:
+                im.seek(0)
+                img = im.convert("RGB")
+            faces = web_lookup.find_faces(img)
+        except Exception:
+            return None
+        return tuple(faces[0]) if faces else None
+
+    @staticmethod
+    def _comic_is_animated(path: str) -> bool:
+        try:
+            with Image.open(path) as im:
+                return getattr(im, "n_frames", 1) > 1
+        except OSError:
+            return False
+
+    @staticmethod
+    def _comic_save(path: str, frames: list, durs: list) -> None:
+        ext = os.path.splitext(path)[1].lower()
+        if len(frames) == 1:
+            img = frames[0]
+            if ext in (".jpg", ".jpeg"):
+                img.save(path, quality=92)
+            elif ext == ".webp":
+                img.save(path, lossless=True)
+            else:
+                img.save(path)
+        elif ext == ".gif":
+            first = frames[0].quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+            rest = [f.quantize(palette=first, dither=Image.Dither.NONE) for f in frames[1:]]
+            first.save(path, save_all=True, append_images=rest, duration=durs, loop=0,
+                       optimize=False, disposal=1)
+        else:
+            animate.save_webp(path, frames, durs)
 
     # ComfyUI connection (AI video): server address and the user's own
     # API-format workflow, kept in recent.json ("comfy"); the workflow file
@@ -8146,7 +8793,7 @@ class CaptionApp:
         height (vertical layout, where cap_width acts as the panel height)."""
         if not self._dynamic_width_var.get() or not self._frames:
             return
-        layout = self._formats.get(self._format_var.get(), {}).get("layout", "horizontal")
+        layout = self._layout()
         fw, fh = self._frames[0].size
         src = fh if layout == "vertical" else fw
         self._width_var.set(int(round(src * 1.25)))
@@ -8178,8 +8825,7 @@ class CaptionApp:
     def _update_side_visibility(self) -> None:
         """Caption Side only applies to horizontal-layout formats — vertical
         formats always place the caption below the image."""
-        fmt_data = self._formats.get(self._format_var.get(), {})
-        if fmt_data.get("layout") == "vertical":
+        if self._layout() == "vertical":
             self._side_label.grid_remove()
             self._side_row.grid_remove()
         else:
@@ -9459,6 +10105,10 @@ class CaptionApp:
             if base.get("layout") == "overlay":
                 # The boxes' places and styles are the format's template.
                 base["text_boxes"] = [dict(b) for b in self._text_boxes]
+            elif self._vertical_var.get():
+                base["layout"] = "vertical"
+            else:
+                base.pop("layout", None)
         except tk.TclError:
             if not quiet:
                 messagebox.showerror("Invalid Settings",
@@ -9536,7 +10186,9 @@ class CaptionApp:
         self._auto_size_var.set(data.get("auto_size", False))
         self._align_var.set(data.get("align", "center"))
         self._side_var.set(data.get("caption_side", "right"))
-        self._update_side_visibility()
+        # A format saved vertical turns the switch on; others keep it as is.
+        if data.get("layout") == "vertical" and not self._vertical_var.get():
+            self._vertical_var.set(True)   # its trace refreshes too
         self._update_chat_mode_visibility()
         self._update_overlay_mode()
 
@@ -9545,12 +10197,7 @@ class CaptionApp:
         self._width_spin.config(state="disabled" if self._dynamic_width_var.get() else "normal")
         if "cap_panel_size" in data and not self._dynamic_width_var.get():
             self._width_var.set(data["cap_panel_size"])
-        if data.get("layout") == "vertical":
-            self._cap_size_label.config(text="Caption Height:")
-            self._dynamic_width_check.config(text="Dynamic Height (1.25× image height)")
-        else:
-            self._cap_size_label.config(text="Caption Width:")
-            self._dynamic_width_check.config(text="Dynamic Width (1.25× image width)")
+        self._update_orientation_ui()
 
         # Header
         hfont = data.get("header_font", "Arial")
@@ -9689,7 +10336,7 @@ class CaptionApp:
             shadow=fmt_data.get("shadow", False),
             align=self._align_var.get(),
             fmt=fmt,
-            layout=fmt_data.get("layout", "horizontal"),
+            layout=self._layout(),
             caption_side=self._side_var.get(),
             auto_size=self._auto_size_var.get(),
             frame_size=self._frames[0].size if self._frames else None,
@@ -10761,6 +11408,7 @@ class CaptionApp:
             recent.add_command(label="(none yet)", state="disabled")
         menu.add_cascade(label="Recent Files", menu=recent)
         menu.add_command(label="Create Animation…", command=self._create_animation_dialog)
+        menu.add_command(label="Comic Strip…", command=self._comic_dialog)
         menu.add_separator()
         menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
                          command=self._open_project)
@@ -11163,12 +11811,25 @@ class CaptionApp:
         self._tb_sel = 0 if self._text_boxes else None
         fmt = data.get("format") or self._format_var.get()
         settings = dict(data.get("format_settings") or {})
+        twin = fmt not in self._formats and _vertical_twin_base(fmt, self._formats)
+        if twin:   # an older project's "Standard (Vertical)" is Standard + Vertical
+            fmt = twin
+            if settings:
+                settings.update(name=fmt, layout="vertical")
+        if twin or (settings and settings.get("layout") != "overlay"):
+            self._vertical_var.set(bool(twin) or settings.get("layout") == "vertical")
         if settings:
             # Use the project's own snapshot of the format; if a format by
             # that name exists with different settings, keep both.
             if fmt in self._formats and _format_differs(self._formats[fmt], settings):
                 fmt = f"{fmt} (project)"
                 settings["name"] = fmt
+            elif fmt in self._formats:
+                # Same format: the switch carries the orientation, so the
+                # format itself keeps its own.
+                settings = dict(settings, layout=self._formats[fmt].get("layout"))
+                if settings["layout"] is None:
+                    del settings["layout"]
             self._formats[fmt] = settings
             self._fmt_combo.config(values=list(self._formats.keys()))
         for box in (self._header_text_box, self._footer_text_box):

@@ -63,6 +63,8 @@ animations/
 
 # the user's ComfyUI workflow for AI video (personal)
 comfyui/
+# comic strips made with File → Comic Strip (personal)
+comics/
 
 # Source art for tools/build_assets.py (see themes/CREDITS.md)
 tools/theme_art_src/
