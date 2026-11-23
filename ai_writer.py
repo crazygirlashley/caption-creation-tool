@@ -313,10 +313,34 @@ def looks_underage(img, settings: dict, cancel: Optional[threading.Event] = None
         {"type": "image_url", "image_url": {"url": image_data_url(img)}},
     ]}]
     reply = "".join(_stream_chat(messages, 400, dict(settings, model=model), cancel,
-                                 timeout=240, temperature=0.0)).strip().upper()
-    # Anything but a clear NO counts as a yes: better to refuse an adult's
-    # picture by mistake than to animate a minor's.
-    return not reply.startswith("NO")
+                                 timeout=240, temperature=0.0)).strip()
+    head = reply.upper()
+    if head.startswith("NO"):
+        return False
+    if head.startswith("YES"):
+        return True
+    # Small picture models (Moondream through Ollama) don't answer the
+    # question — they describe the picture. Judge the description then.
+    return description_suggests_minor(reply)
+
+
+_YOUTH_WORDS = re.compile(
+    r"\b(?:child|children|kid|kids|boy|boys|girl|girls|teen\w*|toddler\w*|bab(?:y|ies)|"
+    r"infant\w*|young\w*|little|youth\w*|student\w*|school\w*|minor|minors|juvenile\w*|"
+    r"adolescen\w*|preteen\w*|tween\w*|daughter|son)\b", re.I)
+_ADULT_WORDS = re.compile(r"\b(?:woman|women|man|men|lady|ladies|adult|adults|gentlem[ae]n)\b",
+                          re.I)
+
+
+def description_suggests_minor(text: str) -> bool:
+    """For a picture description that doesn't answer the age question:
+    adult only when it calls the person a woman, man or lady (or adult)
+    and nothing in it hints at youth. Anything unclear counts as a possible
+    minor — better to refuse an adult's picture by mistake than to accept a
+    minor's."""
+    if _YOUTH_WORDS.search(text) or content_rules.mentions_minor(text):
+        return True
+    return not _ADULT_WORDS.search(text)
 
 
 class _ThinkFilter:

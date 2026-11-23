@@ -152,6 +152,35 @@ class NoPictureTalkTests(unittest.TestCase):
                                                                           picture="Hair: red"))
 
 
+class AgeCheckFallbackTests(unittest.TestCase):
+    """Picture models that describe instead of answering YES/NO (Moondream
+    through Ollama): the description decides, strictly."""
+
+    def test_adult_only_when_clearly_described_as_one(self):
+        f = ai_writer.description_suggests_minor
+        self.assertFalse(f("A woman with red hair wearing lingerie poses on a bed."))
+        self.assertFalse(f("The image features a man in a suit."))
+        for text in ("A young woman in a bikini.", "A girl in a school uniform.",
+                     "A teenage boy.", "The image shows a person dancing.",
+                     "A man and his son.", ""):
+            self.assertTrue(f(text), text)
+
+    def test_looks_underage_uses_the_description(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            s = dict(ai_writer.DEFAULTS, model="w", vision_model="eyes",
+                     base_url=f"http://127.0.0.1:{server.server_address[1]}/v1")
+            img = Image.new("RGB", (32, 32))
+            for reply, expected in (("NO", False), ("Yes.", True),
+                                    ("The image features a woman in a red dress.", False),
+                                    ("The image features a girl on a swing.", True)):
+                _Handler.replies = [reply]
+                self.assertEqual(ai_writer.looks_underage(img, s), expected, reply)
+        finally:
+            server.shutdown()
+
+
 class MoreEroticTests(unittest.TestCase):
     """AI Edit → Make it more erotic."""
 
