@@ -113,6 +113,45 @@ class MatchPictureTests(unittest.TestCase):
         self.assertEqual(out, "She walked to school in jeans.")
 
 
+class NoPictureTalkTests(unittest.TestCase):
+    """AI writing never talks about the caption's picture."""
+
+    @staticmethod
+    def clean(text, step=5):
+        chunks = [text[i:i + step] for i in range(0, len(text), step)]
+        return "".join(ai_writer.no_picture_talk(iter(chunks)))
+
+    def test_phrase_is_cut_from_the_sentence(self):
+        self.assertEqual(self.clean("The woman in the caption's picture had emerged in all her "
+                                    "radiant beauty."),
+                         "The woman had emerged in all her radiant beauty.")
+        self.assertEqual(self.clean("Her hair, as pictured, was now platinum blonde."),
+                         "Her hair was now platinum blonde.")
+        self.assertEqual(self.clean("The woman shown in the image above stretched."),
+                         "The woman stretched.")
+
+    def test_sentence_about_the_picture_is_dropped(self):
+        self.assertEqual(self.clean("By morning he was gone. The caption's image shows a "
+                                    "stunning redhead. She smiled."),
+                         "By morning he was gone. She smiled.")
+        self.assertEqual(self.clean("This picture captures her new life.\n\nShe kissed him."),
+                         "\n\nShe kissed him.".lstrip(" "))
+
+    def test_photos_inside_the_story_stay(self):
+        for s in ("She looked at the photo on her desk and gasped.",
+                  "The picture on the wall showed her old self."):
+            self.assertEqual(self.clean(s), s)
+
+    def test_prompts_forbid_it(self):
+        self.assertIn(ai_writer.NO_PICTURE_TALK, ai_writer.SYSTEM_PROMPT)
+        self.assertIn(ai_writer.NO_PICTURE_TALK, ai_writer.EDIT_SYSTEM_PROMPT)
+        user = ai_writer.build_messages("He took the pill.", 60, "Red hair, green dress")[1]
+        self.assertNotIn("caption's picture", user["content"])
+        self.assertIn("never mention", user["content"])
+        self.assertNotIn("caption's picture", ai_writer.edit_instruction("match", 40,
+                                                                          picture="Hair: red"))
+
+
 class MoreEroticTests(unittest.TestCase):
     """AI Edit → Make it more erotic."""
 

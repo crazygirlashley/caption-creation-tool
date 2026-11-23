@@ -9,6 +9,7 @@ CaptionApp dialog and the tests share it.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,13 @@ LENGTHS = {
     "Very long (~350 words)": 350,
 }
 
+# The image is the reader's to look at; the story never talks about it.
+NO_PICTURE_TALK = (
+    "Never mention or refer to a picture, photo, image, caption or the reader looking at "
+    "anything — no \"the woman in the picture\", \"as pictured\", \"the caption's "
+    "image\". Describe the character directly, as part of the story's own world."
+)
+
 SYSTEM_PROMPT = (
     "You are a fiction writer for an adult caption-art community that makes "
     "TG (gender transformation) captions: an image paired with a short story "
@@ -59,8 +67,8 @@ SYSTEM_PROMPT = (
     "character's first-person POV). Keep the user's key beats, names and any "
     "quoted lines, ending on the line or twist the prompt gives. Aim for about "
     "{words} words. Output only the story text — no title, no preamble, no notes "
-    "or disclaimers, no markdown.\n\n" + content_rules.WRITING_RULES.replace("{", "{{")
-    .replace("}", "}}")
+    "or disclaimers, no markdown. " + NO_PICTURE_TALK + "\n\n"
+    + content_rules.WRITING_RULES.replace("{", "{{").replace("}", "}}")
 )
 
 
@@ -156,11 +164,13 @@ def build_messages(prompt: str, words: int, picture: str = "") -> list:
         note = ""
         if picture_may_show_minor(picture):
             picture = picture.strip()[len(content_rules.MINOR_MARK):].strip()
-            note = (" The person in the picture may be under 18, so the story must be "
+            note = (" The main character may be under 18, so the story must be "
                     "completely non-sexual.")
-        user = (f"The caption's picture shows: {picture.strip()}\n\n"
-                "Write the story to fit that picture — the person in it is the one "
-                f"the story is about, as they look by the end.{note}\n\n{user}")
+        user = ("Private notes for you, the writer — how the story's main character looks "
+                f"by the end:\n{picture.strip()}\n\n"
+                "Write the character to match these notes, in the story's own words. "
+                "The notes describe a picture the reader sees beside the story; never "
+                f"mention that picture, or any picture, photo or image.{note}\n\n{user}")
     return [
         {"role": "system", "content": SYSTEM_PROMPT.format(words=words)},
         {"role": "user", "content": user},
@@ -354,7 +364,8 @@ EDIT_SYSTEM_PROMPT = (
     "panel. Revise the text the user sends as instructed: {instruction} "
     "Unless the instruction says otherwise, keep the point of view, tense, "
     "names, any quoted dialogue, emoji and the ending line. Output only the revised "
-    "text — no title, preamble, notes, quotation marks around it, or markdown.\n\n"
+    "text — no title, preamble, notes, quotation marks around it, or markdown. "
+    + NO_PICTURE_TALK + "\n\n"
     + content_rules.WRITING_RULES.replace("{", "{{").replace("}", "}}")
 )
 
@@ -380,14 +391,13 @@ EDIT_ACTIONS = {
               "is an adult."),
     # {picture} is describe_appearance()'s list for the caption's picture.
     "match": ("Match the picture (clothes, hair…)",
-              "The story's character must end up looking exactly like the person in the "
-              "caption's picture, who looks like this:\n{picture}\n"
+              "The story's character must end up looking exactly like this:\n{picture}\n"
               "Find every description of the character's appearance as they are at the end "
               "of the story — after any transformation — and correct each detail that "
-              "contradicts the picture: clothing and its colors, hair color and style, eye "
-              "color, skin, body, makeup, shoes and accessories. Replace the wrong detail "
-              "with what the picture shows, in the story's own voice, and where the ending "
-              "barely describes them, work in one or two details from the picture. Leave "
+              "contradicts that description: clothing and its colors, hair color and style, "
+              "eye color, skin, body, makeup, shoes and accessories. Replace the wrong detail "
+              "with the right one, in the story's own voice, and where the ending barely "
+              "describes them, work in one or two of those details. Leave "
               "descriptions of how they looked before the change as they are, and ignore "
               "anything marked \"not visible\". Change nothing else: keep the plot, wording, "
               "names, dialogue, the length (about {words} words) and the final line."),
@@ -408,6 +418,83 @@ def edit_instruction(action: str, words: int, custom: str = "", picture: str = "
     return EDIT_ACTIONS[action][1].format(words=words)
 
 
+# Talk about the caption's picture that a model may still slip into the
+# story ("The woman in the caption's picture had emerged..."). Phrases are
+# cut out of their sentence; a sentence that is about the picture itself is
+# dropped. Story mentions of photos ("she looked at the photo") stay.
+_PICTURE_WHERE = (r"(?:above|here|below|beside)")
+_PICTURE_CORE = (
+    r"(?:(?:shown|seen|depicted|pictured|featured|visible)\s+)?(?:in|from|of|on)\s+"
+    r"(?:the|this|that|our)\s+(?:caption(?:'s|s)?|attached|accompanying|above|reference|"
+    r"caption\s+art)\s+(?:picture|photo|photograph|image|pic|art)"
+    r"(?:\s+" + _PICTURE_WHERE + r")?"
+    r"|(?:(?:shown|seen|depicted|pictured|visible)\s+)?in\s+(?:the|this)\s+image"
+    r"(?:\s+" + _PICTURE_WHERE + r")?"
+    r"|(?:as\s+)?pictured(?:\s+" + _PICTURE_WHERE + r")?"
+)
+# ", as pictured," — set off by commas on both sides: the commas go too.
+_PICTURE_ASIDE = re.compile(r",\s*\b(?:" + _PICTURE_CORE + r")\b\s*,", re.I)
+_PICTURE_PHRASE = re.compile(r",?\s*\b(?:" + _PICTURE_CORE + r")\b", re.I)
+_PICTURE_SENTENCE = re.compile(
+    r"\b(?:caption(?:'s)?\s+(?:picture|photo|image)|the\s+(?:picture|photo|image|photograph)\s+"
+    r"(?:shows|showed|depicts|depicted|captures|captured)|in\s+the\s+caption\b|"
+    r"this\s+(?:picture|photo|image)\b|as\s+(?:shown|seen)\s+(?:above|here))",
+    re.I)
+_SENTENCE_END = re.compile(r"[.!?…][\"”’')\]]*(?=\s)|\n")
+
+
+def _clean_sentence(sentence: str) -> str:
+    cleaned = _PICTURE_PHRASE.sub("", _PICTURE_ASIDE.sub("", sentence))
+    if _PICTURE_SENTENCE.search(cleaned):
+        # Keep its line break, if it ended one, so paragraphs don't merge.
+        return "\n" if sentence.endswith("\n") else ""
+    if cleaned != sentence:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?…])", r"\1", cleaned)
+        # Restore the leading space a removal at the start may have eaten.
+        if sentence[:1].isspace() and not cleaned[:1].isspace():
+            cleaned = sentence[:len(sentence) - len(sentence.lstrip())] + cleaned
+    return cleaned
+
+
+def no_picture_talk(chunks: Iterator[str]) -> Iterator[str]:
+    """Pass story text through sentence by sentence (as it streams), with
+    any talk about the caption's picture taken out."""
+    buf = ""
+    started = False
+
+    def _emit(text: str) -> str:
+        nonlocal started
+        if not started:
+            # A dropped opening sentence mustn't leave the story starting
+            # with a space.
+            text = text.lstrip(" \t")
+            started = bool(text)
+        return text
+
+    for chunk in chunks:
+        buf += chunk
+        last = None
+        for m in _SENTENCE_END.finditer(buf):
+            last = m
+        if last is None:
+            continue
+        ready, buf = buf[:last.end()], buf[last.end():]
+        out, pos = [], 0
+        for m in _SENTENCE_END.finditer(ready):
+            out.append(_clean_sentence(ready[pos:m.end()]))
+            pos = m.end()
+        if ready[pos:]:
+            out.append(_clean_sentence(ready[pos:]))
+        text = _emit("".join(out))
+        if text:
+            yield text
+    if buf:
+        text = _emit(_clean_sentence(buf))
+        if text:
+            yield text
+
+
 def stream_edit(text: str, instruction: str, words: int, settings: dict,
                 cancel: Optional[threading.Event] = None,
                 minor_context: bool = False) -> Iterator[str]:
@@ -425,9 +512,10 @@ def stream_edit(text: str, instruction: str, words: int, settings: dict,
         {"role": "user", "content": text.strip()},
     ]
     temperature = 0.3 if any(k in instruction for k in _COOL_EDITS) else None
-    yield from _guarded(_stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
-                                     settings, cancel, temperature=temperature),
-                        minor_context)
+    yield from no_picture_talk(_guarded(
+        _stream_chat(messages, int(max(words, len(text.split())) * 2.5) + 200,
+                     settings, cancel, temperature=temperature),
+        minor_context))
 
 
 # ---------------------------------------------------------------------------
@@ -545,9 +633,9 @@ def stream_story(prompt: str, words: int, settings: dict,
     sexual request is refused and a reply that turns sexual is stopped."""
     minor = picture_may_show_minor(picture)
     check_request(prompt, picture, minor_context=minor)
-    yield from _guarded(_stream_chat(build_messages(prompt, words, picture),
+    yield from no_picture_talk(_guarded(_stream_chat(build_messages(prompt, words, picture),
                                      int(words * 2.5) + 200, settings, cancel,
-                                     timeout=timeout), minor_context=minor)
+                                     timeout=timeout), minor_context=minor))
 
 
 def _stream_chat(messages: list, max_tokens: int, settings: dict,
