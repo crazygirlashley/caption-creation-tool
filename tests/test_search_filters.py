@@ -144,7 +144,7 @@ class MatureSourceTests(unittest.TestCase):
                                      "teen"}
         self.assertEqual(web_lookup._porngifs_tags_for("redhead maid"), ["ginger", "maid"])
         self.assertEqual(web_lookup._porngifs_tags_for("blondes"), ["blonde"])
-        self.assertEqual(web_lookup._porngifs_tags_for("jesse jane"), [])   # a real person
+        self.assertEqual(web_lookup._porngifs_tags_for("jesse jane"), [])   # a big name
         self.assertEqual(web_lookup._porngifs_tags_for("teen"), [])
 
     def test_porngifs_results(self):
@@ -181,16 +181,21 @@ class MatureSourceTests(unittest.TestCase):
         self.assertEqual([(i["url"], i["gif"]) for i in items],
                          [("https://m/A.mp4", True), ("https://m/D-large.jpg", False)])
 
-    def test_pornpics_galleries_skip_named_people(self):
+    def test_pornpics_galleries_skip_teens_and_celebrities_only(self):
         web_lookup._SESSION.get = lambda url, **k: _FakeResp(data=[
             {"desc": "European girls with model-like bodies pose naked outdoors 123",
              "g_url": "https://www.pornpics.com/galleries/a-1/", "t_url": "https://c/1.jpg"},
             {"desc": "Redheaded teen Megan Murkovski poses 456",
              "g_url": "https://www.pornpics.com/galleries/b-2/", "t_url": "https://c/2.jpg"},
+            {"desc": "Curvy amateur Emma Magnolia strips 789",
+             "g_url": "https://www.pornpics.com/galleries/c-3/", "t_url": "https://c/3.jpg"},
+            {"desc": "Taylor Swift lookalike poses 999",
+             "g_url": "https://www.pornpics.com/galleries/d-4/", "t_url": "https://c/4.jpg"},
         ])
         posts = web_lookup._search_pornpics("redhead", 1)
         self.assertEqual([p["title"] for p in posts],
-                         ["European girls with model-like bodies pose naked outdoors"])
+                         ["European girls with model-like bodies pose naked outdoors",
+                          "Curvy amateur Emma Magnolia strips"])
         html = ('<a class="rel-link" href="https://cdni.pornpics.com/1280/x/1.jpg"></a>'
                 '<a class="rel-link" href="https://cdni.pornpics.com/1280/x/2.jpg"></a>'
                 '<div id="tiles"><img data-src="https://cdni.pornpics.com/460/x/1.jpg">'

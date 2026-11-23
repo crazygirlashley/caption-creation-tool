@@ -41,6 +41,7 @@ import os
 import re
 import tempfile
 import threading
+import unicodedata
 import urllib.parse
 from typing import Optional
 
@@ -117,57 +118,20 @@ _ATTRIBUTE_CATEGORIES = (
     _CLOTHING_WORDS,
 )
 
-# Barnorama titles are all rendered in Title Case, so capitalization can't
-# distinguish a real name from an ordinary headline word — "The Girls Turning
-# an Ordinary Wednesday" is every bit as capitalized as "Emily Ratajkowski
-# Exposes...". A hand-curated stoplist of "generic headline vocabulary" was
-# tried first and false-positived on ordinary site content its sample hadn't
-# covered (e.g. flagged "40 Times Actors Transformed Themselves Beyond
-# Recognition" as a name, because "Recognition" wasn't in the list). Real
-# dictionaries fix that: _CELEBRITY_STOPWORDS is a ~370k-word English
-# wordlist (assets/english_words.txt) and _CELEBRITY_GIVEN_NAMES is real
-# US given-name data filtered to reasonably common names (assets/
-# given_names.txt) — see _load_word_set(). _is_celebrity_title() flags a
-# title on either of two signals:
-#   1. any word of 3+ letters that isn't in the English dictionary at all —
-#      catches distinctive surnames like "Ratajkowski" or "Qualley" outright.
-#   2. a recognized given name immediately followed by another non-stopword
-#      word — catches "<First> <Last>..." pairs where both names happen to
-#      also be ordinary dictionary words (e.g. "Dakota Johnson", "Maya Jama").
-# Verified against a live sample of 39 real Barnorama titles (both celebrity
-# posts and generic listicles): 11/12 recall, 0 false positives. The one
-# miss was "Ice Spice" — a title using only mononym/stage names, which
-# aren't in a given-names dataset and aren't distinctive enough to be
-# missing from the dictionary either.
-#
-# AcidCow surfaced a third case neither signal above catches: compilation
-# posts like "Famous Actresses At The Beginning Of Their Careers" or
-# "Childhood Photos Of Celebrities" — real photos of real celebrities, but
-# the title names no one specifically, so there's no name pair to find. A
-# plain topic-word check (_CELEBRITY_TOPIC_WORDS) covers this a lot more
-# reliably than either wordlist signal, at the cost of also dropping
-# Barnorama's "17 Celebrities That Were A Proper Challenge For These
-# Average Folks" — a post that isn't actually about real celebrities, but
-# does *say* "celebrities", which is what was asked to be filtered.
+# Big-name celebrities are never offered (the user's rule: ordinary people,
+# models and performers are fine; famous names are not). Two signals:
+#   1. the title names someone on the bundled celebrity list
+#      (assets/celebrities.txt, ~2,800 names built from Wikidata by
+#      tools/build_celebrities.py: actors, singers, models, presenters,
+#      YouTubers, star athletes, major politicians and the biggest-name adult
+#      performers — people covered by many Wikipedia editions);
+#   2. the title is about celebrities as a topic ("Famous Actresses At The
+#      Beginning Of Their Careers"), which names no one — _CELEBRITY_TOPIC_WORDS.
+# (Earlier, any personal name counted, which also dropped every performer
+# gallery on the porn sites.)
 _CELEBRITY_TOPIC_WORDS = {
     "celebrity", "celebrities", "celeb", "celebs", "famous", "hollywood",
     "actress", "actresses",
-}
-_CELEBRITY_NAME_AMBIGUOUS = {"will", "may", "mark", "art", "grant"}
-_CELEBRITY_STOPWORDS = {
-    "a", "an", "the", "and", "or", "but", "so", "nor", "for", "yet", "of",
-    "in", "on", "at", "to", "from", "with", "without", "into", "onto",
-    "out", "over", "under", "up", "down", "off", "near", "before", "after",
-    "again", "further", "once", "here", "there", "why", "how", "both",
-    "each", "few", "more", "most", "other", "some", "such", "only", "own",
-    "same", "too", "very", "can", "will", "just", "should", "now", "is",
-    "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "having", "do", "does", "did", "doing", "this", "that", "these",
-    "those", "who", "whom", "which", "what", "when", "where", "while",
-    "as", "if", "than", "then", "because", "until", "no", "not",
-    "nothing", "all", "any", "her", "his", "its", "my", "your", "our",
-    "their", "them", "they", "he", "she", "it", "i", "we", "you", "me",
-    "him", "us", "itself", "themselves", "every", "never", "may", "mark",
 }
 
 
@@ -224,36 +188,30 @@ def _load_word_set(filename: str) -> frozenset:
         return frozenset()
 
 
-_CELEBRITY_DICTIONARY = _load_word_set("english_words.txt")
-_CELEBRITY_GIVEN_NAMES = (
-    _load_word_set("given_names.txt") - _CELEBRITY_NAME_AMBIGUOUS
-)
-_CELEBRITY_BRAND_EXCLUDE = {"barno", "nyfw", "weblinks", "selfie"}
+_CELEBRITY_NAMES = frozenset(n for n in _load_word_set("celebrities.txt")
+                             if not n.startswith("#"))
+_CELEBRITY_MAX_WORDS = max((len(n.split()) for n in _CELEBRITY_NAMES), default=1)
+
+
+def _name_words(text: str) -> list:
+    """Lowercase ASCII words, as the celebrity list is written ("Beyoncé's"
+    -> ["beyonce", "s"])."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    return re.findall(r"[a-z0-9]+", text.replace("'", " "))
 
 
 def _is_celebrity_title(title: str) -> bool:
-    """True if title looks like it names a real person — see the block
-    comment above _CELEBRITY_NAME_AMBIGUOUS for the two signals used. If
-    the bundled wordlists failed to load, this always returns False rather
-    than filtering every result."""
-    if not _CELEBRITY_DICTIONARY:
-        return False
-    words = re.findall(r"[A-Za-z]+", title)
-    lowered = [w.lower() for w in words]
-
-    if any(lw in _CELEBRITY_TOPIC_WORDS for lw in lowered):
+    """True if title names a big-name celebrity (on the bundled list) or is
+    about celebrities as a topic. Other names — models, adult performers,
+    ordinary people — are fine."""
+    words = _name_words(title)
+    if any(w in _CELEBRITY_TOPIC_WORDS for w in words):
         return True
-
-    for lw in lowered:
-        if (len(lw) >= 3 and lw not in _CELEBRITY_DICTIONARY
-                and lw not in _CELEBRITY_BRAND_EXCLUDE):
-            return True
-
-    for lw, lw2 in zip(lowered, lowered[1:]):
-        if (lw in _CELEBRITY_GIVEN_NAMES and len(lw2) >= 2
-                and lw2 not in _CELEBRITY_STOPWORDS):
-            return True
-
+    for n in range(1, min(_CELEBRITY_MAX_WORDS, len(words)) + 1):
+        for i in range(len(words) - n + 1):
+            if " ".join(words[i:i + n]) in _CELEBRITY_NAMES:
+                return True
     return False
 
 
@@ -578,8 +536,7 @@ def _porngifs_tags_for(query: str) -> list:
             else:
                 continue
             break
-    # Many of its tags are performers' names; like everywhere else here,
-    # real people aren't searched for.
+    # Some of its tags are names; big-name celebrities aren't searched for.
     return [t for t in picked if not content_rules.mentions_minor(t)
             and not _is_celebrity_title(t)][:2]
 
@@ -618,8 +575,8 @@ def _search_porngifs(query: str, page: int) -> list:
 # redgifs.com (mature): GET /v2/auth/temporary gives a token (kept until it
 # stops working), then /v2/gifs/search?query=… returns up to 40 clips with
 # tags; each is an MP4 (urls.hd), with a JPEG thumbnail. Clips tagged as
-# drawn (hentai, anime...) or with words for minors are skipped, as are tags
-# that name a performer.
+# drawn (hentai, anime...) or with words for minors are skipped, as are
+# clips tagged with a big-name celebrity.
 #
 # pornpics.com (mature): /search/srch.php?q=…&offset=… answers JSON galleries
 # ({"desc", "g_url", "t_url"}); a gallery page links its full-size pictures
@@ -673,7 +630,7 @@ def _search_redgifs(query: str, page: int) -> list:
         text = " ".join(tags + [str(g.get("description") or "")])
         if (not url or not thumb or _REDGIFS_SKIP_TAGS.search(text)
                 or content_rules.mentions_minor(text) or _is_minor_title(text)
-                or any(_is_celebrity_title(t) for t in tags if " " in t)):
+                or _is_celebrity_title(text)):
             continue
         # Most are clips (MP4, opened like a GIF); some posts are pictures.
         items.append({"url": url, "thumb": thumb,
@@ -688,11 +645,9 @@ def _search_redgifs(query: str, page: int) -> list:
 
 def _search_pornpics(query: str, page: int) -> list:
     resp = _SESSION.get(_PORNPICS + "/search/srch.php", timeout=_TIMEOUT,
-                        # Most galleries name their performer and are skipped
-                        # (real people), so ask for three times as many.
                         params={"q": query.strip().lower(), "lang": "en",
-                                "limit": _PORNPICS_PER_PAGE * 3,
-                                "offset": (page - 1) * _PORNPICS_PER_PAGE * 3},
+                                "limit": _PORNPICS_PER_PAGE,
+                                "offset": (page - 1) * _PORNPICS_PER_PAGE},
                         headers={"Referer": _PORNPICS + "/"})
     resp.raise_for_status()
     data = resp.json()
@@ -796,8 +751,8 @@ def search(query: str, page: int = 1) -> list:
     on no results (or a request/parse failure — callers can't tell the
     difference, which is fine here: both just mean "nothing to show" for
     that source), and a failing source never blocks the other one's
-    results. Results whose title names or references a real person (see
-    _is_celebrity_title) are dropped rather than returned."""
+    results. Results whose title names a big-name celebrity or is about
+    celebrities (see _is_celebrity_title) are dropped rather than returned."""
     results = []
     for batch in search_stream(query, page):
         results.extend(batch)
