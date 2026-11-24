@@ -3054,7 +3054,7 @@ _GIF_SIZE_SAMPLE_FRAMES = 24
 
 
 def _sampled_gif_bytes(source_frames: list, kwargs: dict, durations, fps: float,
-                       gif_colors: Optional[int], total: int) -> int:
+                       gif_colors: Optional[int], total: int, dither: bool = False) -> int:
     """Approximate exported GIF size from the first few source frames.
 
     A GIF is one full frame followed by deltas, so bytes don't scale
@@ -3063,12 +3063,13 @@ def _sampled_gif_bytes(source_frames: list, kwargs: dict, durations, fps: float,
     sample = source_frames[:_GIF_SIZE_SAMPLE_FRAMES]
     comps = [build_composite(f, **kwargs, frame_index=i) for i, f in enumerate(sample)]
     sample_durations = durations[:len(comps)] if durations else None
-    all_bytes = _estimate_anim_bytes(comps, False, fps, sample_durations, gif_colors)
+    all_bytes = _estimate_anim_bytes(comps, False, fps, sample_durations, gif_colors,
+                                     dither=dither)
     if total <= len(comps) or len(comps) < 2:
         return round(all_bytes / max(1, len(comps)) * total)
     first_bytes = _estimate_anim_bytes(comps[:1], False, fps,
                                        sample_durations[:1] if sample_durations else None,
-                                       gif_colors)
+                                       gif_colors, dither=dither)
     per_frame = (all_bytes - first_bytes) / (len(comps) - 1)
     return round(first_bytes + per_frame * (total - 1))
 
@@ -3079,7 +3080,7 @@ def _mp4_as_gif_bytes(source_frames: list, kwargs: dict, fps: float, total: int)
     step = max(1, math.ceil(fps / _GIF_MAX_FPS))
     kept = source_frames[::step]
     return _sampled_gif_bytes(kept, kwargs, None, fps / step, None,
-                              math.ceil(total / step))
+                              math.ceil(total / step), dither=True)
 
 
 def _default_output_pct(fw: int, fh: int, cap_width: int, layout: str) -> int:
@@ -3099,7 +3100,8 @@ class _EstimateCancelled(Exception):
 
 def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
                           gif_colors: Optional[int] = None,
-                          cancel: Optional[threading.Event] = None) -> int:
+                          cancel: Optional[threading.Event] = None,
+                          dither: bool = False) -> int:
     """Encode already-composited frames with the same writer settings
     _export_worker_main uses, to a throwaway temp file, and return its size.
     Slow enough (a real GIF/MP4 encode) that callers must run this off the
@@ -3127,10 +3129,11 @@ def _estimate_anim_bytes(frames: list, as_mp4: bool, fps: float, durations,
             # Only affects the estimate number, not the in-memory frames or
             # the on-screen preview — see _redraw()/self._cache.
             duration = durations if durations else 1000.0 / fps
-            # Only GIF sources get a GIF estimate (as_mp4 follows the source
-            # type), so match the worker's no-dither setting for them.
+            # Match the export: GIF sources aren't re-dithered, video sources
+            # (dither=True) are — dithering roughly doubles a video GIF's
+            # size, so estimating without it fit videos at twice the cap.
             samples = [frames[i] for i in _gif_sample_indices(len(frames))]
-            _write_gif(tmp_path, _checked(), samples, duration, gif_colors, dither=False)
+            _write_gif(tmp_path, _checked(), samples, duration, gif_colors, dither=dither)
         return os.path.getsize(tmp_path)
     finally:
         try:
@@ -12557,6 +12560,7 @@ class CaptionApp:
         self._size_est_label.config(text=f"Finding settings that fit under {cap}…")
 
         deferred_path, deferred_kind = self._deferred_path, self._deferred_kind
+        is_video = bool(self._is_video)   # the export dithers video sources
         first, last = self._trim_range()
         speed = self._speed()
         step0 = self._frame_step()
@@ -12584,16 +12588,22 @@ class CaptionApp:
                     if len(src) >= n_src:
                         break
                     src.append(f)
-                src_durations = _retime_delays(_file_delays(deferred_path)[first:last + 1],
-                                               speed)
+                # A video has no per-frame delays (PIL can't open it); it's
+                # timed by its fps, as the export does.
+                src_durations = (None if deferred_kind == "mp4" else
+                                 _retime_delays(_file_delays(deferred_path)[first:last + 1],
+                                                speed))
 
             def size_at(pct: int, colors: int, step: int = step0, frames_n: int = count) -> int:
                 kwargs, _ = _resolve_composite_kwargs(
                     dict(raw, output_override=True, output_size_pct=pct))
                 durs = _merge_delays(src_durations, step) if src_durations else None
+                if durs is None:
+                    # fps-timed: the export also drops frames above GIF's 50fps.
+                    step *= max(1, math.ceil(fps / step / _GIF_MAX_FPS))
                 return _sampled_gif_bytes(src[::step], kwargs, durs, fps / step,
                                           colors if colors < 256 else None,
-                                          math.ceil(frames_n / step))
+                                          math.ceil(frames_n / step), dither=is_video)
 
             hi = current_pct
             if hi is None:
