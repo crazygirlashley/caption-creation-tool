@@ -42,6 +42,7 @@ import comic
 import content_rules
 import da_client
 import recent_store
+import used_media
 import spellcheck
 import wallpaper
 from ui_widgets import Placeholder, ToggleSwitch, tooltip
@@ -595,6 +596,19 @@ def _wl_badge_gif(img: Image.Image) -> Image.Image:
     w = d.textbbox((0, 0), "GIF", font=font)[2] + 8
     d.rectangle((2, 2, 2 + w, 17), fill=(20, 20, 20))
     d.text((6, 3), "GIF", font=font, fill=(255, 255, 255))
+    return img
+
+
+def _wl_badge_used(img: Image.Image) -> Image.Image:
+    """Stamp a "USED" tag (bottom-left) on a preview of a picture already
+    used in a saved caption — shown when "Hide used" is off."""
+    img = img.copy()
+    d = ImageDraw.Draw(img)
+    font = _pil_font("Arial", 11, bold=True)
+    w = d.textbbox((0, 0), "USED", font=font)[2] + 8
+    y = img.height - 17
+    d.rectangle((2, y, 2 + w, y + 15), fill=(192, 57, 43))
+    d.text((6, y + 1), "USED", font=font, fill=(255, 255, 255))
     return img
 
 
@@ -3197,6 +3211,7 @@ class CaptionApp:
         # None for a locally opened file, and cleared whenever one replaces
         # an online source (see _load_source).
         self._image_source_url: Optional[str] = None
+        self._image_file_url: Optional[str] = None
         self._single_frame_var = tk.BooleanVar(value=False)
         self._anim_id: Optional[str] = None
         self._anim_idx: int = 0
@@ -3432,7 +3447,8 @@ class CaptionApp:
                 "Open an image, GIF or MP4  (Ctrl+O)\nTip: you can also drag files onto the window"
                 ).pack(side="left", padx=4)
         tooltip(ttk.Button(bar, text="🔎  Find Online…", command=self._web_lookup),
-                "Search Barnorama, AcidCow and sex.com for a picture to caption"
+                "Search the web for a picture or GIF to caption\n"
+                "(gallery sites, Wikimedia Commons and, with Mature on, adult sites)"
                 ).pack(side="left", padx=4)
         tooltip(ttk.Button(bar, text="💾  Save…", style="Accent.TButton", command=self._save),
                 "Export the captioned image, GIF or MP4  (Ctrl+S)").pack(side="left", padx=4)
@@ -3810,7 +3826,7 @@ class CaptionApp:
         self._align_label.grid(row=r, column=0, sticky="w", pady=4)
         self._align_row = ttk.Frame(f)
         self._align_row.grid(row=r, column=1, sticky="w", padx=6)
-        for label, value in (("←", "left"), ("↔", "center"), ("→", "right")):
+        for label, value in (("Left", "left"), ("Center", "center"), ("Right", "right")):
             ttk.Radiobutton(self._align_row, text=label, variable=self._align_var,
                             value=value).pack(side="left", padx=2)
         r += 1
@@ -4403,9 +4419,10 @@ class CaptionApp:
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(row, text="Align:").pack(side="left")
-        for label, value in (("←", "left"), ("↔", "center"), ("→", "right")):
-            ttk.Radiobutton(row, text=label, variable=v["align"], value=value).pack(
-                side="left", padx=2)
+        for label, value, tip in (("←", "left", "Align left"), ("↔", "center", "Center"),
+                                  ("→", "right", "Align right")):
+            tooltip(ttk.Radiobutton(row, text=label, variable=v["align"], value=value),
+                    tip).pack(side="left", padx=2)
         r += 1
         row = ttk.Frame(f)
         row.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
@@ -9660,7 +9677,8 @@ class CaptionApp:
         self._load_source(path)
 
     def _load_source(self, path: str, *, is_temp_download: bool = False,
-                      source_url: Optional[str] = None, generated: bool = False) -> None:
+                      source_url: Optional[str] = None, generated: bool = False,
+                      image_url: Optional[str] = None) -> None:
         """Load path (any file on disk — a local pick from _open(), or a
         temp file downloaded by _web_lookup()) as the current source image/
         GIF/video, replacing whatever was previously loaded. source_url is
@@ -9678,6 +9696,8 @@ class CaptionApp:
                 pass
         self._temp_source_path = path if is_temp_download else None
         self._image_source_url = source_url if is_temp_download else None
+        # The picture file's own URL (Find Online), for the used-media log.
+        self._image_file_url = image_url if is_temp_download else None
 
         self._stop_anim()
         self._build_cancel.set()
@@ -9777,6 +9797,8 @@ class CaptionApp:
             self._wl_single_var = tk.BooleanVar(value=True)
             self._wl_notext_var = tk.BooleanVar(
                 value=bool(recent_store.get_setting("wl_no_text", True)))
+            self._wl_hide_used_var = tk.BooleanVar(
+                value=bool(recent_store.get_setting("wl_hide_used", True)))
         # Load the face and text detectors now (~1s) rather than on the first preview.
         _WL_PREVIEW_POOL.submit(web_lookup.count_faces, Image.new("RGB", (64, 64)))
         _WL_PREVIEW_POOL.submit(web_lookup.has_text, Image.new("RGB", (64, 64)))
@@ -9815,6 +9837,16 @@ class CaptionApp:
                 "Hide pictures that already have text on them — captions, meme text,\n"
                 "big watermarks — so you get a clean base for your own caption.\n"
                 "A small corner watermark is allowed.").pack(side="left", padx=(10, 0))
+
+        def _hide_used_changed() -> None:
+            recent_store.set_setting("wl_hide_used", self._wl_hide_used_var.get())
+            self._wl_apply_filter_all()
+        tooltip(ttk.Checkbutton(search_row, text="Hide used", variable=self._wl_hide_used_var,
+                                command=_hide_used_changed),
+                "Hide pictures and GIFs you've already used in a saved or exported\n"
+                "caption — matched by link, and by the picture itself, so a copy on\n"
+                "another site is caught too. Off: they show with a red USED tag.").pack(
+            side="left", padx=(10, 0))
         if not hasattr(self, "_wl_gif_var"):
             self._wl_gif_var = tk.BooleanVar(
                 value=bool(recent_store.get_setting("wl_gifs_only", False)))
@@ -10127,17 +10159,24 @@ class CaptionApp:
 
     @staticmethod
     def _wl_make_preview(item: dict) -> tuple:
-        """Pool job: (PIL thumbnail, face count or None, has text or None)."""
+        """Pool job: (PIL thumbnail, face count or None, has text or None,
+        already used in a saved caption)."""
         img, faces, text = web_lookup.load_preview(item)
+        try:
+            used = used_media.is_used(item["url"], img)
+        except Exception:
+            used = False
         if item["gif"]:
             img = _wl_badge_gif(img)
-        return img, faces, text
+        if used:
+            img = _wl_badge_used(img)
+        return img, faces, text, used
 
     def _wl_on_preview(self, fut, cell: dict, block: dict, token: object) -> None:
         if not self._wl_search_alive(token) or not cell["btn"].winfo_exists():
             return
         try:
-            img, faces, text = fut.result()
+            img, faces, text, used = fut.result()
         except Exception:
             cell["loaded"] = True
             cell["faces"] = -1  # failed to load: never shown
@@ -10148,6 +10187,7 @@ class CaptionApp:
         cell["loaded"] = True
         cell["faces"] = faces
         cell["text"] = text
+        cell["used"] = used
         self._wl_layout_block(block)
 
     def _wl_cell_visible(self, cell: dict) -> bool:
@@ -10155,6 +10195,8 @@ class CaptionApp:
             return False
         if not cell["loaded"]:
             return True
+        if self._wl_hide_used_var.get() and cell.get("used"):
+            return False
         if self._wl_notext_var.get() and cell.get("text"):
             return False
         if self._wl_single_var.get() and cell["faces"] is not None:
@@ -10162,19 +10204,23 @@ class CaptionApp:
         return True
 
     def _wl_hidden_note(self, cells: list) -> str:
-        """Why some loaded pictures are hidden, e.g. "3 have text, 2 not a
-        single person" ("" if none are)."""
-        texted = single = 0
+        """Why some loaded pictures are hidden, e.g. "3 with text, 2 not a
+        single person, 1 already used" ("" if none are)."""
+        texted = single = used = 0
         for c in cells:
             if not c["loaded"] or c["faces"] == -1 or self._wl_cell_visible(c):
                 continue
-            if self._wl_notext_var.get() and c.get("text"):
+            if self._wl_hide_used_var.get() and c.get("used"):
+                used += 1
+            elif self._wl_notext_var.get() and c.get("text"):
                 texted += 1
             else:
                 single += 1
         parts = ([f"{texted} with text"] if texted else []) + (
-            [f"{single} not a single person"] if single else [])
-        return f"{texted + single} hidden ({', '.join(parts)})" if parts else ""
+            [f"{single} not a single person"] if single else []) + (
+            [f"{used} already used"] if used else [])
+        total = texted + single + used
+        return f"{total} hidden ({', '.join(parts)})" if parts else ""
 
     def _wl_layout_block(self, block: dict) -> None:
         """(Re)pack a post's strip: the first _WL_MAX_IMAGES_PER_POST
@@ -10263,12 +10309,13 @@ class CaptionApp:
             if not gallery.winfo_exists() or not cell["btn"].winfo_exists():
                 return
             try:
-                img, faces, text = fut.result()
+                img, faces, text, used = fut.result()
                 photo = ImageTk.PhotoImage(img)
                 cell["btn"].config(image=photo, text="", width=0, height=0)
                 thumbs.append(photo)
                 cell["faces"] = faces
                 cell["text"] = text
+                cell["used"] = used
             except Exception:
                 cell["faces"] = -1
             cell["loaded"] = True
@@ -10285,10 +10332,13 @@ class CaptionApp:
         opts_row = ttk.Frame(gallery)
         opts_row.pack(side="top", anchor="e", before=status)
         for text, var in (("No text", self._wl_notext_var),
-                          ("Single person only", self._wl_single_var)):
+                          ("Single person only", self._wl_single_var),
+                          ("Hide used", self._wl_hide_used_var)):
             ttk.Checkbutton(opts_row, text=text, variable=var,
                             command=lambda: (recent_store.set_setting(
                                 "wl_no_text", self._wl_notext_var.get()),
+                                recent_store.set_setting(
+                                "wl_hide_used", self._wl_hide_used_var.get()),
                                 _relayout(), self._wl_apply_filter_all())).pack(
                 side="left", padx=(0, 8))
         _relayout()
@@ -10320,12 +10370,13 @@ class CaptionApp:
                 log.exception("WEB_LOOKUP_DOWNLOAD_ERROR")
                 self.root.after(0, lambda e=exc: self._wl_on_download_done(None, e, post_url))
                 return
-            self.root.after(0, lambda p=path: self._wl_on_download_done(p, None, post_url))
+            self.root.after(0, lambda p=path: self._wl_on_download_done(p, None, post_url, url))
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _wl_on_download_done(self, path: Optional[str], exc: Optional[Exception],
-                              post_url: Optional[str] = None) -> None:
+                              post_url: Optional[str] = None,
+                              image_url: Optional[str] = None) -> None:
         if not self._wl_win or not self._wl_win.winfo_exists():
             return
         if exc is not None:
@@ -10342,7 +10393,8 @@ class CaptionApp:
         win = self._wl_win
         self._wl_win = None
         win.destroy()
-        self._load_source(path, is_temp_download=True, source_url=post_url)
+        self._load_source(path, is_temp_download=True, source_url=post_url,
+                          image_url=image_url)
 
     def _export_fps(self) -> float:
         """FPS to use when encoding an MP4 — the source video's fps if known,
@@ -10471,6 +10523,7 @@ class CaptionApp:
                 self._export_in_progress = False
                 self._status.config(text=base_status)
                 log.info("FILE_SAVE  %s", os.path.basename(path))
+                self._record_used(path)
                 msg = f"Saved:\n{path}" + self._write_story_file(path)
                 kind = "video" if path.lower().endswith(".mp4") else "gif"
                 over_msg = _over_site_limit_msg(os.path.getsize(path), site, kind)
@@ -10513,6 +10566,7 @@ class CaptionApp:
             return
 
         log.info("FILE_SAVE  %s", os.path.basename(path))
+        self._record_used(path)
         msg = f"Saved:\n{path}"
         if notes:
             msg += f"\n\nTo fit {site}'s limits: " + ", ".join(notes) + "."
@@ -10521,6 +10575,25 @@ class CaptionApp:
         if over_msg:
             msg += f"\n\n⚠ {over_msg}"
         messagebox.showinfo("Saved", msg)
+
+    def _record_used(self, output: str) -> None:
+        """Log the current picture as used (Find Online's "Hide used"):
+        its source URL when it came from Find Online, and its fingerprint
+        either way, so a picture opened from disk counts too."""
+        frame = self._frames[0] if self._frames else None
+        url = self._image_file_url or self._image_source_url
+        if frame is None and not url:
+            return
+        found_on = self._image_source_url or self._source_path or ""
+        title = os.path.splitext(os.path.basename(output))[0]
+
+        def _work() -> None:
+            try:
+                used_media.record(url, frame, found_on=found_on, title=title,
+                                  output_file=output)
+            except Exception:
+                log.exception("USED_MEDIA_RECORD_ERROR")
+        threading.Thread(target=_work, daemon=True).start()
 
     def _write_story_file(self, path: str) -> str:
         """Long story mode: save the full story beside the export (for the
@@ -11643,6 +11716,7 @@ class CaptionApp:
 
             def _on_export_success() -> None:
                 self._status.config(text=base_status)
+                self._record_used(f"DeviantArt: {title}")
                 if self._confirm_oversized_upload(tmp_path):
                     self._start_da_upload(client_id, tmp_path, title, description)
 
@@ -12197,6 +12271,7 @@ class CaptionApp:
                 "source": os.path.abspath(source) if source else "",
                 "source_rel": rel,
                 "source_url": getattr(self, "_image_source_url", None),
+                "image_url": getattr(self, "_image_file_url", None),
                 "format": fmt,
                 "format_settings": settings,
                 "caption": self._text_box.get("1.0", "end-1c"),
@@ -12284,6 +12359,7 @@ class CaptionApp:
         if self._source_path != source:
             return  # load failed or was cancelled; it already said why
         self._image_source_url = data.get("source_url")
+        self._image_file_url = data.get("image_url")
         ba = data.get("before_after") or {}
         before = ba.get("path") or ""
         if before and not os.path.isfile(before):

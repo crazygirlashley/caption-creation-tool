@@ -330,6 +330,19 @@ def _apply_layout_styles(style: ttk.Style, c: Optional[dict]) -> None:
                         font=(_ui_family(), UI_FONT_SIZE, "bold"))
         style.configure("Card.TCheckbutton", background=c["panel"], foreground=c["fg"])
         style.map("Card.TCheckbutton", background=[("active", c["panel"])])
+        # clam draws an unticked box / unselected radio as a solid white
+        # square/dot and a selected radio as a ring, which on a dark theme
+        # reads backwards ("on" looks off). Off is an empty field-colored
+        # box; on fills with the accent.
+        for name in ("TCheckbutton", "Card.TCheckbutton", "TRadiobutton"):
+            style.configure(name, indicatorbackground=c["input_bg"],
+                            indicatorforeground=a["accent_fg"],
+                            upperbordercolor=c["muted_fg"], lowerbordercolor=c["muted_fg"])
+            style.map(name,
+                      indicatorbackground=[("disabled", c["bg"]), ("selected", a["accent"]),
+                                           ("pressed", c["hover"])],
+                      upperbordercolor=[("selected", a["accent"])],
+                      lowerbordercolor=[("selected", a["accent"])])
         style.configure("TButton", focuscolor=c["border"], focusthickness=1)
         style.configure("TProgressbar", background=a["accent"], troughcolor=c["input_bg"],
                         bordercolor=c["border"], lightcolor=a["accent"], darkcolor=a["accent"])
