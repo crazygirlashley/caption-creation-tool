@@ -30,11 +30,87 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 
 ![Find Online search results](docs/screenshots/05-find-online.png)
 
+**Standard format** — picture on the left, styled text panel on the right:
+
+![Standard format](docs/screenshots/07-standard-format.png)
+
+**Themed formats** — Goth, Bimbo, Sissy, Magic and Hypno, each with its own fonts, colors, panel pattern, title and tagline:
+
+![The five themed formats](docs/screenshots/26-themed-formats.png)
+
+**Text Message format** — the caption as a phone chat, with emoji:
+
+![Text Message format](docs/screenshots/08-text-message-format.png)
+
+**Text Boxes format** — Photoshop-style text boxes placed right on the picture, with box styles, outlines, backgrounds and layout tools:
+
+![Text Boxes format](docs/screenshots/09-text-boxes-format.png)
+
+**Inline styling** — `*italic*`, `**bold**` and "dialogue in its own color":
+
+![Inline styling and dialogue color](docs/screenshots/13-inline-styling.png)
+
+**Before & after** — a "before" picture beside (or above) the "after" one (Image tab):
+
+![Before and after](docs/screenshots/10-before-and-after.png)
+
+**Image framing and censor boxes** — zoom and pan the picture, and blur, pixelate or bar out parts of it (Image tab):
+
+![Censor box and framing](docs/screenshots/11-censor-and-framing.png)
+
+**Watermark** — an image and/or text watermark ("@yourname"), any corner, with opacity:
+
+![Watermark tab](docs/screenshots/12-watermark-and-text-watermark.png)
+
+**Animated GIFs and videos** — trim frames, change speed, keep every Nth frame, Output Size Override, GIF compression and a live size estimate:
+
+![GIF controls](docs/screenshots/14-gif-trim-speed-size.png)
+
+**Fit under 80 MB** — finds settings that fit DeviantArt's limit, and offers to drop frames or shorten when nothing else will:
+
+![Fit under 80 MB choice](docs/screenshots/24-fit-under-80mb.png)
+
+**Long story** — the full story goes in the DeviantArt description; choose what goes on the picture:
+
+![Long story: text on the image](docs/screenshots/16-long-story-text-on-image.png)
+
+**Comic Strip** — several pictures as a strip or page, with captions and speech bubbles placed by face:
+
+![Comic Strip](docs/screenshots/17-comic-strip.png)
+
+**Create Animation** — bring a still picture to life, change one picture into another, or describe it and let the AI plan it:
+
+![Create Animation](docs/screenshots/18-create-animation.png)
+
+**Spell check & grammar hints** — as you type, in the Editor and caption boxes:
+
+![Spell check](docs/screenshots/25-spell-check.png)
+
+**AI writer settings** — runs on your own computer (Ollama, LM Studio, KoboldCpp, …), with an optional picture model:
+
+![AI writer settings](docs/screenshots/23-ai-writer-settings.png)
+
+**Send to DeviantArt** — title, description, tags, mature rating, gallery folder and AI flag, straight from the app:
+
+![Send to DeviantArt](docs/screenshots/21-send-to-deviantart.png)
+
+**Series** — number your parts and title them automatically:
+
+![Series](docs/screenshots/22-series.png)
+
+**Theme editor** — make your own theme, with its own colors and background picture:
+
+![Theme editor](docs/screenshots/19-theme-editor.png)
+
+**What's new** — shown once after each update:
+
+![What's new window](docs/screenshots/20-whats-new.png)
+
 **Themes** — the eight themes that ship with the app (Settings → Theme), or make your own:
 
 ![The app in each built-in theme](docs/screenshots/06-themes.png)
 
-<sub>Example photos: [*Summer dress*](https://commons.wikimedia.org/wiki/File:Summer_dress_(5634765615).jpg) by USAID Africa Bureau (public domain); [*Woman in a red yukata in Gion, Kyoto*](https://commons.wikimedia.org/wiki/File:Portrait_photograph_of_a_walking_woman_wearing_a_red_yukata_with_an_oil-paper_umbrella,_in_Gion,_Kyoto,_Japan.jpg) by Basile Morin ([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)). The captions are made-up examples.</sub>
+<sub>Example photos: [*Curly hair and freckles man*](https://commons.wikimedia.org/wiki/File:Curly_hair_and_freckles_man_(Unsplash).jpg) (Unsplash, CC0); [*Summer dress*](https://commons.wikimedia.org/wiki/File:Summer_dress_(5634765615).jpg) by USAID Africa Bureau (public domain); [*Woman in a red yukata in Gion, Kyoto*](https://commons.wikimedia.org/wiki/File:Portrait_photograph_of_a_walking_woman_wearing_a_red_yukata_with_an_oil-paper_umbrella,_in_Gion,_Kyoto,_Japan.jpg) by Basile Morin ([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)). The captions are made-up examples.</sub>
 
 ---
 
