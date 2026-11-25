@@ -253,5 +253,35 @@ class MoreEroticTests(unittest.TestCase):
         self.assertEqual(out, "Jenny, 15, walked home from school.")
 
 
+class XChangeAndLengthTests(unittest.TestCase):
+    def test_lengths_match_real_caption_stories(self):
+        self.assertEqual(ai_writer.LENGTHS["Long (~500 words)"], 500)
+        self.assertGreaterEqual(ai_writer.LENGTHS["Very long (1000+ words)"], 1000)
+
+    def test_xchange_story_gets_the_guide_and_the_pill_rules(self):
+        user = ai_writer.build_messages("Kyle gets caught catcalling.", 500,
+                                        xchange="X-Tra Strength")[1]["content"]
+        self.assertIn("This is an X-Change caption", user)
+        self.assertIn('"X-Change X-Tra Strength"', user)
+        self.assertIn("30 days", user)
+        self.assertTrue(user.endswith("Kyle gets caught catcalling."))
+
+    def test_no_xchange_by_default(self):
+        user = ai_writer.build_messages("He took a pill.", 120)[1]["content"]
+        self.assertNotIn("X-Change", user)
+
+    def test_titles_name_the_variant(self):
+        titles = {k: v[0] for k, v in ai_writer.XCHANGE_VARIANTS.items()}
+        self.assertEqual(titles["Basic"], "X-Change")
+        self.assertEqual(titles["Plus"], "X-Change Plus")
+        self.assertEqual(titles["X-Tra Strength"], "X-Change X-Tra Strength")
+
+    def test_story_is_one_block(self):
+        out = "".join(ai_writer.one_block(iter(["First.\n\nSecond ", "line.\n", "\nEnd."])))
+        self.assertEqual(out, "First. Second line. End.")
+        system = ai_writer.build_messages("x", 60)[0]["content"]
+        self.assertIn("no paragraph breaks", system)
+
+
 if __name__ == "__main__":
     unittest.main()

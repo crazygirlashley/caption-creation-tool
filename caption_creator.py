@@ -6363,7 +6363,7 @@ class CaptionApp:
         opts = ttk.Frame(body)
         opts.grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Label(opts, text="Length:").pack(side="left")
-        length_var = tk.StringVar(value=getattr(self, "_ai_last_length", "Medium (~120 words)"))
+        length_var = tk.StringVar(value=getattr(self, "_ai_last_length", "Long (~500 words)"))
         ttk.Combobox(opts, textvariable=length_var, state="readonly", width=20,
                      values=list(ai_writer.LENGTHS)).pack(side="left", padx=(6, 14))
         ttk.Label(opts, text="Style:").pack(side="left")
@@ -6379,10 +6379,25 @@ class CaptionApp:
         ttk.Radiobutton(opts, text="Add to end", value="append",
                         variable=mode_var).pack(side="left", padx=(6, 0))
 
+        # X-Change: write it as an X-Change pill story, for a given variant.
+        xc_row = ttk.Frame(body)
+        xc_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(xc_row, text="X-Change pill:").pack(side="left")
+        xc_default = (getattr(self, "_ai_last_xchange", "Basic")
+                      if self._format_var.get() == "X-Change" else "None")
+        xc_var = tk.StringVar(value=xc_default)
+        tooltip(ttk.Combobox(xc_row, textvariable=xc_var, state="readonly", width=15,
+                             values=["None"] + list(ai_writer.XCHANGE_VARIANTS)),
+                "Write an X-Change pill story: the AI knows how they go and uses\n"
+                "that pill's rules (Basic 24 hours, Lite a few hours, Plus and its\n"
+                "fine print, X-Tra Strength 30 days, Weekly 7 days, Bimbo, Breeder).\n"
+                "In the X-Change format, the title changes to the pill's name.").pack(
+            side="left", padx=(6, 0))
+
         # The picture: a vision model describes it (editable) and the story
         # is written to fit.
         pic = ttk.Frame(body)
-        pic.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        pic.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         pic.columnconfigure(0, weight=1)
         look_var = tk.BooleanVar(value=bool(self._frames) and getattr(
             self, "_ai_look", bool(settings.get("vision_model"))))
@@ -6411,7 +6426,7 @@ class CaptionApp:
         look_var.trace_add("write", _sync_pic_row)
 
         model_label = ttk.Label(body, foreground="#888")
-        model_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        model_label.grid(row=5, column=0, sticky="w", pady=(8, 0))
 
         def _show_models() -> None:
             text = f"Model: {settings['model']}"
@@ -6426,12 +6441,12 @@ class CaptionApp:
                 settings.update(new)
                 _show_models()
         ttk.Button(body, text="Settings…", command=_change_settings).grid(
-            row=4, column=1, sticky="e", pady=(8, 0))
+            row=5, column=1, sticky="e", pady=(8, 0))
 
         status = ttk.Label(body, text="", foreground="#888", wraplength=460)
-        status.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         btns = ttk.Frame(body)
-        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
         gen_btn = ttk.Button(btns, text="Write")
         stop_btn = ttk.Button(btns, text="Stop", state="disabled")
         ttk.Button(btns, text="Close", command=lambda: _close()).pack(side="right")
@@ -6449,6 +6464,13 @@ class CaptionApp:
         def _finish(err: Optional[str], cancelled: bool, blocked: bool = False) -> None:
             state["cancel"] = None
             target = state.get("target") or self._text_box
+            if (not err and not blocked and state.get("xchange")
+                    and self._format_var.get() == "X-Change"):
+                # The X-Change title names the pill: "X-Change Plus", ...
+                self._header_text_box.delete("1.0", "end")
+                self._header_text_box.insert(
+                    "1.0", ai_writer.XCHANGE_VARIANTS[state["xchange"]][0])
+                self._safe_refresh()
             if target.winfo_exists():
                 if blocked:
                     # Take back whatever of the blocked reply was written
@@ -6556,7 +6578,11 @@ class CaptionApp:
                     _describe(then=_generate)
                     return
                 self._ai_pic_desc = (self._ai_picture_key(), picture)
-            words = ai_writer.LENGTHS.get(length_var.get(), 120)
+            words = ai_writer.LENGTHS.get(length_var.get(), 500)
+            xchange = xc_var.get() if xc_var.get() in ai_writer.XCHANGE_VARIANTS else ""
+            state["xchange"] = xchange
+            if xchange:
+                self._ai_last_xchange = xchange
             # The whole run (clear + every streamed chunk) is one undo step,
             # written into whichever caption editor is showing.
             target = self._text_target()
@@ -6578,7 +6604,7 @@ class CaptionApp:
                 err, blocked = None, False
                 try:
                     for chunk in ai_writer.stream_story(prompt, words, settings, cancel,
-                                                        picture=picture):
+                                                        picture=picture, xchange=xchange):
                         self.root.after(0, lambda c=chunk: _append(c))
                 except ai_writer.ContentBlocked as e:
                     err, blocked = str(e), True

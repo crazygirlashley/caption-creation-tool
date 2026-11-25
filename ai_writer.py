@@ -45,14 +45,52 @@ DEFAULTS = {
     "style": "Smutty & casual",
 }
 
-# label -> approximate word target. Caption panels hold a paragraph or
-# three; longer stories are better suited to the DA description.
+# label -> approximate word target. Full TG caption stories usually run
+# 500-1000+ words (the caption panel grows to fit them).
 LENGTHS = {
-    "Short (~60 words)": 60,
-    "Medium (~120 words)": 120,
-    "Long (~200 words)": 200,
-    "Very long (~350 words)": 350,
+    "Very short (~60 words)": 60,
+    "Short (~150 words)": 150,
+    "Medium (~300 words)": 300,
+    "Long (~500 words)": 500,
+    "Very long (1000+ words)": 1100,
 }
+
+# X-Change: the pill universe of a whole genre of TG captions. Each variant
+# is (the caption title, its rules). Durations follow the community's usual
+# lore; the user's prompt can always override them.
+XCHANGE_VARIANTS = {
+    "Basic": ("X-Change",
+              "X-Change Basic: lasts 24 hours, then she changes back."),
+    "Lite": ("X-Change Lite",
+             "X-Change Lite: a mild dose that wears off after a few hours."),
+    "Plus": ("X-Change Plus",
+             "X-Change Plus: lasts 24 hours and makes her extra sensitive and eager, but the "
+             "fine print says that if she gets creampied and knocked up while it's active, "
+             "she stays a woman until the baby comes — effectively stuck."),
+    "X-Tra Strength": ("X-Change X-Tra Strength",
+                       "X-Change X-Tra Strength: lasts 30 days."),
+    "Weekly": ("X-Change Weekly",
+               "X-Change Weekly: lasts 7 days."),
+    "Bimbo": ("X-Change Bimbo",
+              "X-Change Bimbo: makes her a ditzy, giggly, horny bimbo bombshell — thinking "
+              "gets hard, attention feels amazing, and she forgets things she used to know."),
+    "Breeder": ("X-Change Breeder",
+                "X-Change Breeder: makes her extremely fertile and needy; if she gets "
+                "pregnant while it's active, the change is permanent."),
+}
+
+XCHANGE_GUIDE = (
+    "This is an X-Change caption. In its world X-Change is a legal, over-the-counter "
+    "pill that turns a man into a woman within minutes, and everyone knows about it. "
+    "X-Change stories usually go like this: set up who the guy is and why he ends up "
+    "taking the pill — punishment, revenge, a prank, a dare, money or curiosity; he's "
+    "often tricked or made to take it. Name the pill by its full name, \"{title}\". "
+    "Describe the fast change in his body. After the change, call her she/her. Her new "
+    "body is extra sensitive and she gets turned on easily, and the story builds to her "
+    "first sexual experiences as a woman. The pill's rules matter and often drive the "
+    "twist (the fine print, a refill, a choice to stay). End on a punchy last line. "
+    "This pill's rules: {rules}"
+)
 
 # How the story reads. Captions are read fast, by everyone: the default is
 # the plain, dirty-minded voice typical of TG captions, not literary prose.
@@ -85,7 +123,8 @@ SYSTEM_PROMPT = (
     "point of view and tense the prompt asks for (default: the main "
     "character's first-person POV). {style} Keep the user's key beats, names and any "
     "quoted lines, ending on the line or twist the prompt gives. Aim for about "
-    "{words} words. Output only the story text — no title, no preamble, no notes "
+    "{words} words, written as one continuous block of text with no paragraph breaks. "
+    "Output only the story text — no title, no preamble, no notes "
     "or disclaimers, no markdown. " + NO_PICTURE_TALK + "\n\n"
     + content_rules.WRITING_RULES.replace("{", "{{").replace("}", "}}")
 )
@@ -176,10 +215,14 @@ def _unreachable_msg(base_url: str) -> str:
 
 
 def build_messages(prompt: str, words: int, picture: str = "",
-                   style: str = DEFAULT_STYLE) -> list:
+                   style: str = DEFAULT_STYLE, xchange: str = "") -> list:
     """`picture` is a description of the caption's image, if there is one,
-    so the story can match who and what is in it. `style`: a key of STYLES."""
+    so the story can match who and what is in it. `style`: a key of STYLES.
+    `xchange`: a key of XCHANGE_VARIANTS to write an X-Change story."""
     user = prompt.strip()
+    if xchange in XCHANGE_VARIANTS:
+        title, rules = XCHANGE_VARIANTS[xchange]
+        user = XCHANGE_GUIDE.format(title=title, rules=rules) + "\n\n" + user
     if picture.strip():
         note = ""
         if picture_may_show_minor(picture):
@@ -672,18 +715,37 @@ def suggest_searches(story: str, settings: dict, n: int = 6,
     return out[:n]
 
 
+def one_block(chunks: Iterator[str]) -> Iterator[str]:
+    """Stories are one block of text: paragraph breaks become spaces."""
+    last = ""
+    for chunk in chunks:
+        chunk = chunk.replace("\r", "")
+        out = ""
+        for ch in chunk:
+            if ch == "\n":
+                ch = " "
+            if ch == " " and (last == " " or (not out and not last)):
+                continue
+            out += ch
+            last = ch
+        if out:
+            yield out
+
+
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
-                 timeout: float = 300.0, picture: str = "") -> Iterator[str]:
+                 timeout: float = 300.0, picture: str = "",
+                 xchange: str = "") -> Iterator[str]:
     """Yield the story text as it streams from POST /chat/completions. A
     picture flagged as maybe showing a minor keeps the story non-sexual: a
     sexual request is refused and a reply that turns sexual is stopped."""
     minor = picture_may_show_minor(picture)
     check_request(prompt, picture, minor_context=minor)
     style = settings.get("style") or DEFAULT_STYLE
-    yield from no_picture_talk(_guarded(_stream_chat(build_messages(prompt, words, picture, style),
-                                     int(words * 2.5) + 200, settings, cancel,
-                                     timeout=timeout), minor_context=minor))
+    messages = build_messages(prompt, words, picture, style, xchange)
+    yield from one_block(no_picture_talk(_guarded(
+        _stream_chat(messages, int(words * 2.5) + 200, settings, cancel, timeout=timeout),
+        minor_context=minor)))
 
 
 def _stream_chat(messages: list, max_tokens: int, settings: dict,
