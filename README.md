@@ -8,18 +8,48 @@ A Windows desktop app for creating X-Change-style captioned images, animated GIF
 
 ---
 
+## Screenshots
+
+**Caption Builder** — a picture with its caption panel (a *cga*-style format, panel color picked from the picture):
+
+![Caption Builder with a cga-style caption](docs/screenshots/01-caption-builder-cga.png)
+
+**X-Change format** — title and tagline on the picture, pill presets, and a wide picture captioned below (Vertical):
+
+![X-Change caption in the Caption Builder](docs/screenshots/02-caption-builder-xchange.png)
+
+**Editor** — a full-width writing view with the AI writing tools and a live preview:
+
+![Editor with the AI writing panel](docs/screenshots/03-editor-ai-writing.png)
+
+**Write with AI** — story length (from ~60 to 1000+ words), writing style, and an **X-Change pill** choice that writes a proper X-Change story for that pill:
+
+![Write with AI dialog](docs/screenshots/04-write-with-ai.png)
+
+**Find Online** — search for a picture or GIF to caption, with Single person only, No text and Hide used filters (Mature off here):
+
+![Find Online search results](docs/screenshots/05-find-online.png)
+
+**Themes** — the eight themes that ship with the app (Settings → Theme), or make your own:
+
+![The app in each built-in theme](docs/screenshots/06-themes.png)
+
+<sub>Example photos: [*Summer dress*](https://commons.wikimedia.org/wiki/File:Summer_dress_(5634765615).jpg) by USAID Africa Bureau (public domain); [*Woman in a red yukata in Gion, Kyoto*](https://commons.wikimedia.org/wiki/File:Portrait_photograph_of_a_walking_woman_wearing_a_red_yukata_with_an_oil-paper_umbrella,_in_Gion,_Kyoto,_Japan.jpg) by Basile Morin ([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)). The captions are made-up examples.</sub>
+
+---
+
 ## Features
 
 - **App background** — an image or animated GIF behind the Editor and the Caption Builder, whose panels float on it as cards (the preview window itself stays plain so it doesn't compete with your image), **fit to the window** or **tiled** as a repeating pattern. Themes can bring their own (Bimbo: animated lipstick kisses), and in **⚙ Settings → Background…** each theme remembers its own choice: the theme's background, **your own picture or GIF** (with **size** and **dim** sliders and an option to pause animation; copied into `backgrounds/` so it keeps working if the original moves), or none
 - **Editor and Caption Builder views** — the toolbar's **✍ Editor / 🖼 Caption Builder** toggle switches between a focused writing view and the image builder. The Editor is a full-width writing space for the caption story with the AI tools as one-click buttons (write from a prompt, Smooth & polish, Shorten to fit, Add more detail, Fix spelling & grammar, custom instruction), spell check, a live word count that says whether the text fits beside the image at a readable size (text at least **20 px** tall in the exported image — exports are viewed at full size, so it's an absolute size; change it with **Readable text size** in the Editor's sidebar), and a small live preview of the caption on the image. Both views edit the same caption; the app reopens in whichever you used last
 - **Standard format** — image on the left, styled text panel on the right
-- **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling
+- **X-Change format** — adds title (top-left overlay), tagline (bottom-left overlay), and pill color presets matching real X-Change Maker styling; the title names the pill ("X-Change", "X-Change Plus", "X-Change X-Tra Strength"…), and it, the tagline and the watermark scale with the picture so they look the same on a small GIF and a full-size 1080p clip
 - **Text Message format** — renders the caption as a phone-style chat: build a list of messages, mark each as sent by you or the other person, reorder them, and toggle your bubbles between iMessage Blue and SMS Green
 - **Pill presets** — Pink, Blue, and Purple with matching background and stroke colors
 - **Caption panel** — auto-fit text sizing (measured at the final output resolution, so fitted text never spills past the panel; words too long for the panel, like URLs, wrap mid-word), fractional font sizes in 0.25 steps (any value can be typed), left/center/right alignment, bold, stroke; choose from every font installed on your system. Caption text is drawn at full output resolution rather than upscaled with the image, so it stays sharp on small sources
 - **Caption side** — for horizontal-layout formats, place the caption panel to the left or right of the image (defaults to right); hidden for vertical-layout formats, which always caption below the image
 - **Save/Save As formats** — tweak any format's settings and save them under the same name or as a brand-new format; new formats you create are personal and stay out of version control by default
-- **Title & tagline sizes** — accept fractional sizes (0.5 steps, any value can be typed). **Scale title & tagline with image** (Header or Footer tab, saved with the format; off by default) treats the sizes as meant for a 300px-tall image and scales them to the real one, so they keep the same proportion on a small GIF and a large photo — the footer-linked watermark follows
+- **Title & tagline sizes** — accept fractional sizes (0.5 steps, any value can be typed). **Scale title & tagline with image** (Header or Footer tab, saved with the format; off by default) treats the sizes as meant for a 400×300 image and scales them to the real one (by its relatively smaller side, so a tall, narrow clip doesn't get a giant title), so they keep the same proportion on a small GIF and a large photo; a title that would still be wider than the picture shrinks to fit, and a tagline shrinks before it wraps — the footer-linked watermark follows
 - **X-Change text effects** — drop shadow and stroke on all overlaid text; defaults to Tahoma Bold for the caption body and Aardvark Cafe for the title and tagline (optional install)
 - **Watermark** — auto-loads a single image from the `watermark/` folder; scales to 2× the footer font size when the footer is enabled, or, while the footer is off, to 1/6 of the image's height (**Auto**, the default — the watermark keeps the same proportions on any size source). Typing a height into the Watermark Height field switches Auto off and keeps that manual size; re-check Auto to go back to scaling with the image
 - **Watermark position & opacity** — put the watermark in any corner of the image (Watermark tab → Position) and fade it (Opacity, 10–100%); the title and tagline move aside so they never sit on top of it
@@ -171,8 +201,12 @@ Double-click `run.bat`. It uses `python` from your system PATH, so no editing ne
 **✍ AI Write…** (Caption Builder, under the caption box) / **Write a story from a prompt…** (Editor) turns a prompt into a caption
 story and streams it straight into the caption text — e.g. *"TG story, first
 person POV of a man waking up from hypnosis to find his sister feminized him,
-ending on her line: …"*. Pick a length (~60 to ~350 words), and whether it
-replaces the caption or is added to the end; edit the result freely, or
+ending on her line: …"*. Pick a length — Very short (~60), Short (~150), Medium (~300),
+Long (~500, the default) or Very long (1000+ words) — and whether it
+replaces the caption or is added to the end (stories come out as one block of
+text); pick an **X-Change pill** (Basic, Lite, Plus, X-Tra Strength, Weekly,
+Bimbo, Breeder) to have it write a proper X-Change story using that pill's
+rules — in the X-Change format the title then changes to the pill's name; edit the result freely, or
 **Write** again for another take (Ctrl+Enter in the prompt box also writes).
 
 It runs on **your own computer** with an open-source model, so it will write

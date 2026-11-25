@@ -220,6 +220,33 @@ def _app_version() -> str:
 
 # Release notes for the "What's new" window: version -> [(section, [(name, text)])].
 _WHATS_NEW = {
+    "1.2.0": [
+        ("AI writing", [
+            ("X-Change stories", "Write with AI has an X-Change pill choice — Basic, Lite, Plus, "
+             "X-Tra Strength, Weekly, Bimbo, Breeder. It writes a proper X-Change story with "
+             "that pill's rules, and in the X-Change format the title becomes the pill's name"),
+            ("Longer stories", "lengths now go Very short (~60), Short (~150), Medium (~300), "
+             "Long (~500) and Very long (1000+ words), and stories come out as one block of text"),
+            ("Plain voice", "stories default to the plain, smutty voice of typical TG captions; "
+             "pick Steamy romance or Literary under Style"),
+        ]),
+        ("Find Online", [
+            ("Hide used", "pictures and GIFs you've already used in a saved or exported "
+             "caption are hidden — matched by link and by the picture itself, so a copy on "
+             "another site is caught too. Turn it off to see them tagged USED"),
+        ]),
+        ("Captions", [
+            ("Titles that fit", "the title, tagline and watermark scale with the picture, so "
+             "they look the same on a small GIF and a full-size clip; a title that's too wide "
+             "shrinks to fit"),
+            ("Fit under 80 MB", "now works on big videos opened as a single-frame preview, and "
+             "GIF size estimates for videos are accurate"),
+        ]),
+        ("Look", [
+            ("Clearer switches", "checkboxes and radio buttons show on/off clearly on dark "
+             "themes"),
+        ]),
+    ],
     "1.1.1": [
         ("Find Online", [
             ("No text", "a new filter (on by default) hides pictures that already have text "
