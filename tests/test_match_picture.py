@@ -259,22 +259,41 @@ class XChangeAndLengthTests(unittest.TestCase):
         self.assertGreaterEqual(ai_writer.LENGTHS["Very long (1000+ words)"], 1000)
 
     def test_xchange_story_gets_the_guide_and_the_pill_rules(self):
+        pill = {"color": "Pink", "duration": "X-Tra Strength", "flavor": ""}
         user = ai_writer.build_messages("Kyle gets caught catcalling.", 500,
-                                        xchange="X-Tra Strength")[1]["content"]
+                                        xchange=pill)[1]["content"]
         self.assertIn("This is an X-Change caption", user)
         self.assertIn('"X-Change X-Tra Strength"', user)
         self.assertIn("30 days", user)
+        self.assertIn("12 back to back", user)
         self.assertTrue(user.endswith("Kyle gets caught catcalling."))
+
+    def test_wiki_rules(self):
+        # Plus is permanent from the start; Basic can't get you pregnant.
+        self.assertIn("permanent from the moment", ai_writer.XCHANGE_DURATIONS["Plus"])
+        self.assertIn("impossible to get pregnant", ai_writer.XCHANGE_DURATIONS["Basic"])
+        self.assertNotIn("Lite", ai_writer.XCHANGE_DURATIONS)
+        self.assertEqual(set(ai_writer.XCHANGE_COLORS), {"Pink", "Blue", "Purple"})
+
+    def test_flavor_and_color_reach_the_writer(self):
+        pill = {"color": "Blue", "duration": "Basic", "flavor": "Leash"}
+        user = ai_writer.build_messages("x", 300, xchange=pill)[1]["content"]
+        self.assertIn("woman into a man", user)
+        self.assertIn("100 meters", user)
+        self.assertIn("call him he/him", user)
 
     def test_no_xchange_by_default(self):
         user = ai_writer.build_messages("He took a pill.", 120)[1]["content"]
         self.assertNotIn("X-Change", user)
 
-    def test_titles_name_the_variant(self):
-        titles = {k: v[0] for k, v in ai_writer.XCHANGE_VARIANTS.items()}
-        self.assertEqual(titles["Basic"], "X-Change")
-        self.assertEqual(titles["Plus"], "X-Change Plus")
-        self.assertEqual(titles["X-Tra Strength"], "X-Change X-Tra Strength")
+    def test_titles_name_the_pill(self):
+        t = ai_writer.xchange_title
+        self.assertEqual(t({"color": "Pink", "duration": "Basic", "flavor": ""}), "X-Change")
+        self.assertEqual(t({"color": "Pink", "duration": "Plus", "flavor": ""}), "X-Change Plus")
+        self.assertEqual(t({"color": "Pink", "duration": "X-Tra Strength", "flavor": ""}),
+                         "X-Change X-Tra Strength")
+        self.assertEqual(t({"color": "Pink", "duration": "Basic", "flavor": "Bimbo"}),
+                         "X-Change Bimbo")
 
     def test_story_is_one_block(self):
         out = "".join(ai_writer.one_block(iter(["First.\n\nSecond ", "line.\n", "\nEnd."])))

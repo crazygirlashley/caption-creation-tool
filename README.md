@@ -280,9 +280,12 @@ person POV of a man waking up from hypnosis to find his sister feminized him,
 ending on her line: …"*. Pick a length — Very short (~60), Short (~150), Medium (~300),
 Long (~500, the default) or Very long (1000+ words) — and whether it
 replaces the caption or is added to the end (stories come out as one block of
-text); pick an **X-Change pill** (Basic, Lite, Plus, X-Tra Strength, Weekly,
-Bimbo, Breeder) to have it write a proper X-Change story using that pill's
-rules — in the X-Change format the title then changes to the pill's name; edit the result freely, or
+text); pick an **X-Change pill** — color (Pink, Blue, Purple), duration
+(Basic, X-Tra Strength, Plus) and an optional flavor (Bimbo, Compliant,
+Continue, Leash, Breeder and the rest of the X-Change wiki's list) — to have
+it write a proper X-Change story that follows that pill's rules; in the
+X-Change format the title then becomes the pill's name ("X-Change Plus
+Bimbo") and the pill color's preset is applied; edit the result freely, or
 **Write** again for another take (Ctrl+Enter in the prompt box also writes).
 
 It runs on **your own computer** with an open-source model, so it will write

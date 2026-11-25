@@ -55,42 +55,113 @@ LENGTHS = {
     "Very long (1000+ words)": 1100,
 }
 
-# X-Change: the pill universe of a whole genre of TG captions. Each variant
-# is (the caption title, its rules). Durations follow the community's usual
-# lore; the user's prompt can always override them.
-XCHANGE_VARIANTS = {
-    "Basic": ("X-Change",
-              "X-Change Basic: lasts 24 hours, then she changes back."),
-    "Lite": ("X-Change Lite",
-             "X-Change Lite: a mild dose that wears off after a few hours."),
-    "Plus": ("X-Change Plus",
-             "X-Change Plus: lasts 24 hours and makes her extra sensitive and eager, but the "
-             "fine print says that if she gets creampied and knocked up while it's active, "
-             "she stays a woman until the baby comes — effectively stuck."),
-    "X-Tra Strength": ("X-Change X-Tra Strength",
-                       "X-Change X-Tra Strength: lasts 30 days."),
-    "Weekly": ("X-Change Weekly",
-               "X-Change Weekly: lasts 7 days."),
-    "Bimbo": ("X-Change Bimbo",
-              "X-Change Bimbo: makes her a ditzy, giggly, horny bimbo bombshell — thinking "
-              "gets hard, attention feels amazing, and she forgets things she used to know."),
-    "Breeder": ("X-Change Breeder",
-                "X-Change Breeder: makes her extremely fertile and needy; if she gets "
-                "pregnant while it's active, the change is permanent."),
+# X-Change: the pill universe of a whole genre of TG captions, as the
+# X-Change community wiki describes it. A pill is Color + Duration + Flavor.
+XCHANGE_COLORS = {
+    "Pink": ("man", "woman", "a Pink pill turns a man into a woman"),
+    "Blue": ("woman", "man", "a Blue pill turns a woman into a man"),
+    "Purple": ("person", "person", "a Purple pill is mix and match — any combination of "
+               "gender and sex, like a woman with a penis or a man with a vagina"),
+}
+XCHANGE_DURATIONS = {
+    "Basic": ("X-Change Basic, the affordable hallmark pill: it lasts 24 hours or less, then "
+              "you turn back. It's impossible to get pregnant on Basic, and it protects "
+              "against STDs."),
+    "X-Tra Strength": ("X-Change X-Tra Strength, more expensive: it lasts about 30 days. "
+                       "Pregnancy is possible but very unlikely — and if it happens, the "
+                       "change is permanent. Taking 12 back to back without a break also "
+                       "makes it permanent."),
+    "Plus": ("X-Change Plus, the very expensive deluxe pill: the change is permanent from "
+             "the moment it's taken, with no way to turn back. You're indistinguishable "
+             "from anyone else of that gender, pros and cons included."),
+}
+# Flavors add an effect on top of the duration (the wiki leaves the details
+# to each author). "" = none.
+XCHANGE_FLAVORS = {
+    "Bimbo": "you become a hypersexualized, ditzy bombshell version of the new gender",
+    "Candy": "kissing and bodily fluids are vastly improved and can taste like candy",
+    "Choice": ("they come in linked pairs — the first pill changes you, only its paired "
+               "pill changes you back, so losing it means you're stuck"),
+    "Clone": "a special order (usually needs DNA) that turns you into one specific person",
+    "Compliant": "you do whatever you're told while it lasts",
+    "Continue": ("every orgasm extends the duration (a 24-hour pill gets another 24 hours); "
+                 "too many and it becomes permanent"),
+    "Cum-Cure": "you only turn back after swallowing a creamy load",
+    "Custom": "a one-off pill that does something unique — whatever the story needs",
+    "Denial": "you still get horny, but you can't climax while it lasts",
+    "Drain": "the more you cum, the dumber you get, until it wears off",
+    "Dreamwalker": "no physical change — a lucid dream as the new gender",
+    "Forget": "once the change is done you don't remember taking it; you think you've always been this way",
+    "Knock-Off": "a cheap, unofficial copy with severe side effects",
+    "Leash": ("for 7 days you're bonded to the first person you see after changing: past "
+              "100 meters from them you get anxious, past 500 meters sick and dizzy, and "
+              "being near them feels more and more comforting"),
+    "Match": "a special order linked to one person — you can only climax with them",
+    "Oral": "you enjoy using your mouth on things far more",
+    "Passion": "especially powerful orgasms",
+    "Psyche": "another personality controls your body while it lasts",
+    "Quota": "you turn back only after sleeping with a set number of people",
+    "Resistance": "every orgasm has a chance of making the change permanent",
+    "Swell": "you gain a lot of extra weight along with the change",
+    "Synthetic": ("you become a living silicone sex doll — heightened sensitivity, fully "
+                  "conscious, but unable to move"),
+    "Synthetic Plus": ("an upgraded Synthetic with limited movement and extra-stimulating "
+                       "muscles; conscious, but you can't fully hold up your own weight"),
+    "Wearable": "clothing or items infused with X-Change; the change lasts while you wear them",
+    "Breeder": ("(needs a vagina) greatly increased fertility; getting pregnant makes the "
+                "change permanent"),
+    "Surrogate": "(needs a vagina) you can get pregnant, and turn back afterwards",
+    "X-Tend": ("(needs a vagina) a week-long pill: take a creampie from someone bigger than "
+               "you were and don't orgasm all week, and your cock comes back bigger — but "
+               "cum even once and it comes back smaller"),
+    "Bull": "(needs a penis) greatly increased potency",
+    "Sissy": "(needs a penis) you can only get hard or climax through anal sex",
 }
 
-XCHANGE_GUIDE = (
-    "This is an X-Change caption. In its world X-Change is a legal, over-the-counter "
-    "pill that turns a man into a woman within minutes, and everyone knows about it. "
-    "X-Change stories usually go like this: set up who the guy is and why he ends up "
-    "taking the pill — punishment, revenge, a prank, a dare, money or curiosity; he's "
-    "often tricked or made to take it. Name the pill by its full name, \"{title}\". "
-    "Describe the fast change in his body. After the change, call her she/her. Her new "
-    "body is extra sensitive and she gets turned on easily, and the story builds to her "
-    "first sexual experiences as a woman. The pill's rules matter and often drive the "
-    "twist (the fine print, a refill, a choice to stay). End on a punchy last line. "
-    "This pill's rules: {rules}"
-)
+
+def xchange_title(pill: dict) -> str:
+    """The caption title for a pill: "X-Change", "X-Change Plus",
+    "X-Change X-Tra Strength Bimbo"... (Basic is just "X-Change")."""
+    parts = ["X-Change"]
+    if pill.get("duration") and pill["duration"] != "Basic":
+        parts.append(pill["duration"])
+    if pill.get("flavor"):
+        parts.append(pill["flavor"])
+    return " ".join(parts)
+
+
+def xchange_guide(pill: dict) -> str:
+    """What the writer needs to know to write this pill's X-Change story."""
+    color = pill.get("color") or "Pink"
+    before, after, color_rule = XCHANGE_COLORS.get(color, XCHANGE_COLORS["Pink"])
+    duration = pill.get("duration") or "Basic"
+    flavor = pill.get("flavor") or ""
+    title = xchange_title(dict(pill, color=color, duration=duration))
+    if color == "Pink":
+        who = ("set up who the guy is and why he ends up taking the pill — punishment, "
+               "revenge, a prank, a dare, money or curiosity; he's often tricked or made "
+               "to take it. Describe the fast change in his body. After the change, call "
+               "her she/her. Her new body is extra sensitive and she gets turned on easily, "
+               "and the story builds to her first sexual experiences as a woman.")
+    elif color == "Blue":
+        who = ("set up who she is and why she ends up taking the pill. Describe the fast "
+               "change in her body. After the change, call him he/him, and the story builds "
+               "to his first experiences as a man.")
+    else:
+        who = ("set up who takes the pill and why, describe the exact mix of body they end "
+               "up with, and build to their first experiences with it.")
+    rules = (f"X-Change pills change your body within seconds; {color_rule}. "
+             f"This one is {XCHANGE_DURATIONS[duration]}")
+    if flavor:
+        rules += f" Its flavor is {flavor}: {XCHANGE_FLAVORS.get(flavor, flavor)}."
+    return (
+        "This is an X-Change caption. In its world X-Change is a legal, over-the-counter "
+        "pill everyone knows about. X-Change stories usually go like this: " + who +
+        f" Name the pill by its full name, \"{title}\". The pill's rules matter and often "
+        "drive the twist. End on a punchy last line. Follow these rules exactly and don't "
+        "invent different ones: " + rules
+    )
+
 
 # How the story reads. Captions are read fast, by everyone: the default is
 # the plain, dirty-minded voice typical of TG captions, not literary prose.
@@ -215,14 +286,14 @@ def _unreachable_msg(base_url: str) -> str:
 
 
 def build_messages(prompt: str, words: int, picture: str = "",
-                   style: str = DEFAULT_STYLE, xchange: str = "") -> list:
+                   style: str = DEFAULT_STYLE, xchange: Optional[dict] = None) -> list:
     """`picture` is a description of the caption's image, if there is one,
     so the story can match who and what is in it. `style`: a key of STYLES.
-    `xchange`: a key of XCHANGE_VARIANTS to write an X-Change story."""
+    `xchange`: a pill ({"color", "duration", "flavor"}) to write an X-Change
+    story about."""
     user = prompt.strip()
-    if xchange in XCHANGE_VARIANTS:
-        title, rules = XCHANGE_VARIANTS[xchange]
-        user = XCHANGE_GUIDE.format(title=title, rules=rules) + "\n\n" + user
+    if xchange:
+        user = xchange_guide(xchange) + "\n\n" + user
     if picture.strip():
         note = ""
         if picture_may_show_minor(picture):
@@ -735,7 +806,7 @@ def one_block(chunks: Iterator[str]) -> Iterator[str]:
 def stream_story(prompt: str, words: int, settings: dict,
                  cancel: Optional[threading.Event] = None,
                  timeout: float = 300.0, picture: str = "",
-                 xchange: str = "") -> Iterator[str]:
+                 xchange: Optional[dict] = None) -> Iterator[str]:
     """Yield the story text as it streams from POST /chat/completions. A
     picture flagged as maybe showing a minor keeps the story non-sexual: a
     sexual request is refused and a reply that turns sexual is stopped."""

@@ -222,9 +222,11 @@ def _app_version() -> str:
 _WHATS_NEW = {
     "1.2.0": [
         ("AI writing", [
-            ("X-Change stories", "Write with AI has an X-Change pill choice — Basic, Lite, Plus, "
-             "X-Tra Strength, Weekly, Bimbo, Breeder. It writes a proper X-Change story with "
-             "that pill's rules, and in the X-Change format the title becomes the pill's name"),
+            ("X-Change stories", "Write with AI has an X-Change pill choice — color (Pink, Blue, "
+             "Purple), duration (Basic, X-Tra Strength, Plus) and flavor (Bimbo, Compliant, "
+             "Continue, Leash, Breeder and more, from the X-Change wiki). It writes a proper "
+             "X-Change story with that pill's rules, and in the X-Change format the title "
+             "becomes the pill's name"),
             ("Longer stories", "lengths now go Very short (~60), Short (~150), Medium (~300), "
              "Long (~500) and Very long (1000+ words), and stories come out as one block of text"),
             ("Plain voice", "stories default to the plain, smutty voice of typical TG captions; "
@@ -6406,20 +6408,40 @@ class CaptionApp:
         ttk.Radiobutton(opts, text="Add to end", value="append",
                         variable=mode_var).pack(side="left", padx=(6, 0))
 
-        # X-Change: write it as an X-Change pill story, for a given variant.
+        # X-Change: write it as an X-Change pill story. A pill is Color +
+        # Duration + Flavor, with the rules from the X-Change wiki.
         xc_row = ttk.Frame(body)
         xc_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        last = getattr(self, "_ai_last_xchange", None) or {
+            "color": "Pink", "duration": "Basic", "flavor": ""}
+        in_xc = self._format_var.get() == "X-Change"
         ttk.Label(xc_row, text="X-Change pill:").pack(side="left")
-        xc_default = (getattr(self, "_ai_last_xchange", "Basic")
-                      if self._format_var.get() == "X-Change" else "None")
-        xc_var = tk.StringVar(value=xc_default)
-        tooltip(ttk.Combobox(xc_row, textvariable=xc_var, state="readonly", width=15,
-                             values=["None"] + list(ai_writer.XCHANGE_VARIANTS)),
-                "Write an X-Change pill story: the AI knows how they go and uses\n"
-                "that pill's rules (Basic 24 hours, Lite a few hours, Plus and its\n"
-                "fine print, X-Tra Strength 30 days, Weekly 7 days, Bimbo, Breeder).\n"
-                "In the X-Change format, the title changes to the pill's name.").pack(
+        xc_color = tk.StringVar(value=last["color"] if in_xc else "None")
+        xc_duration = tk.StringVar(value=last["duration"])
+        xc_flavor = tk.StringVar(value=last["flavor"] or "None")
+        color_box = ttk.Combobox(xc_row, textvariable=xc_color, state="readonly", width=7,
+                                 values=["None"] + list(ai_writer.XCHANGE_COLORS))
+        tooltip(color_box, "Write an X-Change pill story. Pink: man to woman.\n"
+                           "Blue: woman to man. Purple: mix and match.").pack(
             side="left", padx=(6, 0))
+        dur_box = ttk.Combobox(xc_row, textvariable=xc_duration, state="readonly", width=13,
+                               values=list(ai_writer.XCHANGE_DURATIONS))
+        tooltip(dur_box, "Basic: 24 hours or less, no pregnancy.\n"
+                         "X-Tra Strength: about 30 days (pregnancy or 12 in a row = permanent).\n"
+                         "Plus: permanent.").pack(side="left", padx=(4, 0))
+        flavor_box = ttk.Combobox(xc_row, textvariable=xc_flavor, state="readonly", width=14,
+                                  values=["None"] + list(ai_writer.XCHANGE_FLAVORS))
+        tooltip(flavor_box, "An extra effect on top (Bimbo, Compliant, Continue, Leash,\n"
+                            "Breeder...). The AI is told what each one does. In the\n"
+                            "X-Change format the title becomes the pill's name, e.g.\n"
+                            "\"X-Change Plus Bimbo\".").pack(side="left", padx=(4, 0))
+
+        def _sync_xc(*_a) -> None:
+            on = xc_color.get() in ai_writer.XCHANGE_COLORS
+            for b in (dur_box, flavor_box):
+                b.config(state="readonly" if on else "disabled")
+        xc_color.trace_add("write", _sync_xc)
+        _sync_xc()
 
         # The picture: a vision model describes it (editable) and the story
         # is written to fit.
@@ -6493,10 +6515,13 @@ class CaptionApp:
             target = state.get("target") or self._text_box
             if (not err and not blocked and state.get("xchange")
                     and self._format_var.get() == "X-Change"):
-                # The X-Change title names the pill: "X-Change Plus", ...
+                # The X-Change title names the pill ("X-Change Plus Bimbo"),
+                # and the panel takes that pill color's preset.
+                pill = state["xchange"]
                 self._header_text_box.delete("1.0", "end")
-                self._header_text_box.insert(
-                    "1.0", ai_writer.XCHANGE_VARIANTS[state["xchange"]][0])
+                self._header_text_box.insert("1.0", ai_writer.xchange_title(pill))
+                if pill["color"] in _PILL_PRESETS:
+                    self._apply_preset(*_PILL_PRESETS[pill["color"]])
                 self._safe_refresh()
             if target.winfo_exists():
                 if blocked:
@@ -6606,10 +6631,13 @@ class CaptionApp:
                     return
                 self._ai_pic_desc = (self._ai_picture_key(), picture)
             words = ai_writer.LENGTHS.get(length_var.get(), 500)
-            xchange = xc_var.get() if xc_var.get() in ai_writer.XCHANGE_VARIANTS else ""
-            state["xchange"] = xchange
-            if xchange:
+            xchange = None
+            if xc_color.get() in ai_writer.XCHANGE_COLORS:
+                flavor = xc_flavor.get()
+                xchange = {"color": xc_color.get(), "duration": xc_duration.get(),
+                           "flavor": flavor if flavor in ai_writer.XCHANGE_FLAVORS else ""}
                 self._ai_last_xchange = xchange
+            state["xchange"] = xchange
             # The whole run (clear + every streamed chunk) is one undo step,
             # written into whichever caption editor is showing.
             target = self._text_target()
