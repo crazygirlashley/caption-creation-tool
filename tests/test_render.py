@@ -161,12 +161,30 @@ class OverlayScaleTests(unittest.TestCase):
 
     def test_scaled_sizes_follow_image_height(self):
         small = self._kwargs((350, 150), scale_overlays=True)
-        big = self._kwargs((1500, 1200), scale_overlays=True)
+        big = self._kwargs((1800, 1200), scale_overlays=True)
         self.assertAlmostEqual(small["header_size"], 28.5 * 150 / cc._OVERLAY_REF_H)
         self.assertAlmostEqual(big["footer_size"], 16 * 1200 / cc._OVERLAY_REF_H)
         self.assertEqual(big["watermark_height"], round(32 * 1200 / cc._OVERLAY_REF_H))
         # Same proportion of the image height on both:
         self.assertAlmostEqual(small["header_size"] / 150, big["header_size"] / 1200)
+
+    def test_tall_picture_scales_by_width(self):
+        # A 1080x1920 clip: sized by its width, not its height, so the
+        # title isn't six times too big for the picture.
+        tall = self._kwargs((1080, 1920), scale_overlays=True)
+        self.assertAlmostEqual(tall["header_size"], 28.5 * 1080 / cc._OVERLAY_REF_W)
+
+    def test_title_wider_than_picture_shrinks_to_fit(self):
+        frame = Image.new("RGBA", (300, 400), "black")
+        kw = dict(cap_width=200, page_bg="#000000", font_family="Arial", font_size=20,
+                  font_color="#ffffff", padding=10, header_text="X-Change X-Tra Strength",
+                  header_font="Arial", header_size=80)
+        img = cc.build_composite(frame, text="", **kw).convert("L")
+        out = np.asarray(img)
+        pic_w = round(300 * img.height / 400)        # picture's width in the output
+        top = out[: img.height // 4]
+        self.assertGreater(top[:, :pic_w].max(), 128)                  # title drawn...
+        self.assertLess(top[:, pic_w + 2:].max(), 60)                  # ...and none spills off
 
 
 class EmojiTests(unittest.TestCase):

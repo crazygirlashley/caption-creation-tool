@@ -507,6 +507,10 @@ _EDITOR_MAX_TEXT_W = 860
 # Image height the title/tagline sizes are meant for when "Scale title &
 # tagline with image" is on.
 _OVERLAY_REF_H = 300
+# ...and _OVERLAY_REF_W px wide (a 4:3 frame). Scaling uses whichever side
+# is relatively smaller, so a tall, narrow picture doesn't get a title
+# sized for its height that runs off its sides.
+_OVERLAY_REF_W = 400
 
 # Auto watermark height (footer off, Auto checked): this fraction of the
 # image's height, so the watermark keeps the same proportions on a 242px GIF
@@ -1352,13 +1356,14 @@ def _resolve_composite_kwargs(raw: dict) -> tuple:
     else:
         size = raw["field_size"]
 
-    # "Scale title & tagline with image": sizes are for an image
-    # _OVERLAY_REF_H px tall and grow/shrink with the real one, so they keep
-    # the same proportion on any source. The footer-linked watermark (2x
-    # footer size) follows along.
+    # "Scale title & tagline with image": sizes are for a 400x300 image and
+    # grow/shrink with the real one (by its relatively smaller side), so they
+    # keep the same proportion on any source. The footer-linked watermark
+    # (2x footer size) follows along.
     overlay_k = 1.0
     if raw.get("scale_overlays") and raw.get("frame_size"):
-        overlay_k = raw["frame_size"][1] / _OVERLAY_REF_H
+        ofw, ofh = raw["frame_size"]
+        overlay_k = min(ofw / _OVERLAY_REF_W, ofh / _OVERLAY_REF_H)
     footer_size = raw["footer_size"] * overlay_k
     watermark_height = raw["watermark_height"]
     if raw["footer_enabled"] and overlay_k != 1.0:
@@ -2588,6 +2593,12 @@ def build_composite(
                           else (stroke_width, stroke_color))
             avail_w = footer_end - wm_right
             if avail_w > _px(20):
+                # Too wide for one line: shrink (to 60% at most) before wrapping.
+                widest = max(_text_w(txt_draw, ln, fnt)
+                             for ln in footer_text.strip().splitlines() or [""])
+                if widest > avail_w:
+                    fnt = _pil_font(footer_font, max(1, int(footer_size *
+                                                             max(0.6, avail_w / widest))))
                 lines = _wrap_lines(footer_text.strip(), fnt, avail_w, txt_draw)
                 line_h = txt_draw.textbbox((0, 0), "Ag", font=fnt)[3] + _px(2)
                 block_h = len(lines) * line_h
@@ -2603,6 +2614,12 @@ def build_composite(
         # Title text overlaid at top-left corner of image
         if header_text.strip():
             fnt = _pil_font(header_font, header_size)
+            # A title wider than the picture shrinks to fit instead of
+            # running off its edge.
+            avail_h = image_x + fw - margin - header_x
+            title_w = max(_text_w(txt_draw, ln, fnt) for ln in header_text.strip().splitlines())
+            if avail_h > 0 and title_w > avail_h:
+                fnt = _pil_font(header_font, max(1, int(header_size * avail_h / title_w)))
             h_sw, h_sc = ((header_outline[0], header_outline[1]) if header_outline
                           else (stroke_width, stroke_color))
             _draw_text_overlay(txt_draw, (header_x, margin), header_text.strip(), fnt,

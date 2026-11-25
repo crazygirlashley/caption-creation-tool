@@ -15,9 +15,10 @@
   "header_enabled": true,
   "header_text": "X-Change",
   "header_font": "Aardvark Cafe",
-  "header_size": 28,
+  "header_size": 36,
   "footer_enabled": true,
   "footer_text": "Fast Acting, Gender Swapping Pill",
   "footer_font": "Aardvark Cafe",
-  "footer_size": 16
+  "footer_size": 20.5,
+  "scale_overlays": true
 }
